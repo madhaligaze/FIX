@@ -714,19 +714,129 @@ async def ingest_depth_stream(request: DepthStreamRequest):
 
 
 def _get_session_voxels_payload(session_id: str) -> Dict[str, Any]:
-    """Единый payload занятых вокселей для мобильной визуализации."""
-    if not BRAIN_V3_AVAILABLE:
-        return {"voxels": [], "resolution": 0.1, "available": False}
-
+    """Единый payload вокселей для мобильной визуализации (Eye of AI)."""
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(404, "Сессия не найдена")
 
-    vw = session.scene_context.voxel_world
-    if vw is None:
-        return {"voxels": [], "resolution": 0.1, "message": "Depth map ещё не загружен"}
+    scene_context = session.scene_context
+    voxel_world = scene_context.ensure_voxel_world() if BRAIN_V3_AVAILABLE else None
 
-    return vw.to_ar_mesh()
+    if voxel_world is None:
+        return {
+            "status": "OK",
+            "voxels": [],
+            "bounds": {"min": [-5.0, -1.0, -5.0], "max": [5.0, 4.0, 5.0]},
+            "resolution": 0.25,
+            "total_count": 0,
+            "message": "VoxelWorld недоступен",
+        }
+
+    if scene_context.point_cloud:
+        pc_points = []
+        for point in scene_context.point_cloud:
+            if isinstance(point, dict):
+                pc_points.append([
+                    float(point.get("x", 0.0)),
+                    float(point.get("y", 0.0)),
+                    float(point.get("z", 0.0)),
+                ])
+            elif isinstance(point, (list, tuple)) and len(point) >= 3:
+                pc_points.append([float(point[0]), float(point[1]), float(point[2])])
+        if pc_points:
+            voxel_world.add_point_cloud(pc_points)
+
+    voxels_data: List[Dict[str, Any]] = []
+
+    type_to_name = {
+        voxel_world.FLOOR: "ground",
+        voxel_world.OCCUPIED: "obstacle",
+        voxel_world.PIPE: "obstacle",
+        voxel_world.WALL: "obstacle",
+    }
+    type_to_color = {
+        "obstacle": "red",
+        "structure": "blue",
+        "ground": "gray",
+        "available": "green",
+        "forbidden": "yellow",
+    }
+    type_to_alpha = {
+        "obstacle": 0.7,
+        "structure": 0.5,
+        "ground": 0.3,
+        "available": 0.3,
+        "forbidden": 0.5,
+    }
+
+    for voxel_key in voxel_world.occupied:
+        vtype = voxel_world._types.get(voxel_key, voxel_world.OCCUPIED)
+        type_name = type_to_name.get(vtype, "available")
+        x, y, z = (
+            voxel_key[0] * voxel_world.resolution,
+            voxel_key[1] * voxel_world.resolution,
+            voxel_key[2] * voxel_world.resolution,
+        )
+        voxels_data.append(
+            {
+                "position": [x, y, z],
+                "type": type_name,
+                "color": type_to_color[type_name],
+                "alpha": type_to_alpha[type_name],
+            }
+        )
+
+    for element in session.current_structure:
+        start = element.get("start", {}) or {}
+        end = element.get("end", {}) or {}
+        sx, sy, sz = float(start.get("x", 0.0)), float(start.get("y", 0.0)), float(start.get("z", 0.0))
+        ex, ey, ez = float(end.get("x", 0.0)), float(end.get("y", 0.0)), float(end.get("z", 0.0))
+        voxels_data.append(
+            {
+                "position": [(sx + ex) / 2.0, (sy + ey) / 2.0, (sz + ez) / 2.0],
+                "type": "structure",
+                "color": type_to_color["structure"],
+                "alpha": type_to_alpha["structure"],
+            }
+        )
+
+    metadata = getattr(session, "metadata", {}) or {}
+    forbidden_zones = metadata.get("forbidden_zones", []) if isinstance(metadata, dict) else []
+    for zone in forbidden_zones:
+        center = zone.get("center", [0.0, 0.0, 0.0])
+        radius = float(zone.get("radius", 1.0))
+        if not (isinstance(center, list) and len(center) >= 3):
+            center = [0.0, 0.0, 0.0]
+
+        voxels_data.append(
+            {
+                "position": [float(center[0]), float(center[1]), float(center[2])],
+                "type": "forbidden",
+                "color": type_to_color["forbidden"],
+                "alpha": type_to_alpha["forbidden"],
+                "radius": radius,
+            }
+        )
+
+    points_for_bounds = [v["position"] for v in voxels_data if isinstance(v.get("position"), list) and len(v["position"]) >= 3]
+    if points_for_bounds:
+        xs = [p[0] for p in points_for_bounds]
+        ys = [p[1] for p in points_for_bounds]
+        zs = [p[2] for p in points_for_bounds]
+        bounds = {
+            "min": [min(xs), min(ys), min(zs)],
+            "max": [max(xs), max(ys), max(zs)],
+        }
+    else:
+        bounds = {"min": [-5.0, -1.0, -5.0], "max": [5.0, 4.0, 5.0]}
+
+    return {
+        "status": "OK",
+        "voxels": voxels_data,
+        "bounds": bounds,
+        "resolution": voxel_world.resolution,
+        "total_count": len(voxels_data),
+    }
 
 
 @app.get("/session/{session_id}/voxel_map")
@@ -735,8 +845,8 @@ async def get_voxel_map(session_id: str):
 
 
 @app.get("/session/voxels/{session_id}")
-async def get_session_voxels(session_id: str):
-    """Список занятых вокселей для AR-оверлея на телефоне."""
+async def get_voxel_visualization(session_id: str):
+    """Вернуть визуализацию вокселей для отладки и режима Eye of AI."""
     return _get_session_voxels_payload(session_id)
 
 
