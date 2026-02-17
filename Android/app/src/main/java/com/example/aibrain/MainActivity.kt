@@ -38,6 +38,7 @@ import com.example.aibrain.scene.SceneBuilder
 import com.example.aibrain.scene.LightingSetup
 import io.github.sceneview.ar.ArSceneView
 import com.google.android.material.snackbar.Snackbar
+import com.google.android.material.floatingactionbutton.FloatingActionButton
 import kotlinx.coroutines.*
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
@@ -45,6 +46,8 @@ import kotlin.math.min
 import com.example.aibrain.measurement.ARRuler
 import com.example.aibrain.measurement.MeasurementType
 import com.example.aibrain.measurement.Measurement
+import com.example.aibrain.visualization.VoxelData
+import com.example.aibrain.visualization.VoxelVisualizer
 
 /**
  * ⚡⚡⚡ ФИНАЛЬНАЯ ВЕРСИЯ MainActivity ⚡⚡⚡
@@ -118,6 +121,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnExport: Button
     private lateinit var btnSettings: Button
     private lateinit var btnRulerMode: Button
+    private lateinit var fabEyeOfAI: FloatingActionButton
+    private lateinit var voxelLegend: LinearLayout
 
     // Панели
     private lateinit var controlPanel: LinearLayout
@@ -169,6 +174,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnUndo: Button
     private lateinit var btnRedo: Button
     private var hasRedZones = false
+    private lateinit var voxelVisualizer: VoxelVisualizer
+    private var currentVoxelData: List<VoxelData>? = null
+    private var eyeOfAIActive = false
 
     // ══════════════════════════════════════════════════════════════════════
     // СОСТОЯНИЕ - AR RULER
@@ -216,6 +224,7 @@ class MainActivity : AppCompatActivity() {
         }
         viewModel = StructureViewModel(api)
         soundManager = SoundManager(this)
+        voxelVisualizer = VoxelVisualizer(sceneView.scene, sceneView, lifecycleScope)
 
         lifecycleScope.launch {
             viewModel.structureState.collect { state ->
@@ -275,6 +284,8 @@ class MainActivity : AppCompatActivity() {
         btnExport = findViewById(R.id.btn_export)
         btnSettings = findViewById(R.id.btn_settings)
         btnRulerMode = findViewById(R.id.btn_ruler_mode)
+        fabEyeOfAI = findViewById(R.id.fab_eye_of_ai)
+        voxelLegend = findViewById(R.id.voxel_legend)
 
         // Панели
         controlPanel = findViewById(R.id.control_panel)
@@ -357,6 +368,7 @@ class MainActivity : AppCompatActivity() {
         btnSaveSession.setOnClickListener { onSaveSessionClicked() }
         btnExport.setOnClickListener { onExportClicked() }
         btnSettings.setOnClickListener { onSettingsClicked() }
+        fabEyeOfAI.setOnClickListener { toggleEyeOfAI() }
         btnRulerMode.setOnClickListener { toggleRulerMode() }
 
         // AR Ruler
@@ -404,6 +416,9 @@ class MainActivity : AppCompatActivity() {
         }
         if (::soundManager.isInitialized) {
             soundManager.release()
+        }
+        if (::voxelVisualizer.isInitialized) {
+            voxelVisualizer.hideVoxels()
         }
 
         hideLoadingDialog()
@@ -1050,6 +1065,57 @@ class MainActivity : AppCompatActivity() {
 
     private fun hideLoadingIndicator() = Unit
 
+
+
+    private fun toggleEyeOfAI() {
+        if (eyeOfAIActive) {
+            voxelVisualizer.hideVoxels()
+            voxelLegend.visibility = View.GONE
+            fabEyeOfAI.setImageResource(R.drawable.ic_eye)
+            eyeOfAIActive = false
+            soundManager.play(SoundType.WHOOSH, volume = 0.3f, pitch = 0.8f)
+            return
+        }
+
+        val sessionId = currentSessionId
+        if (sessionId.isNullOrBlank()) {
+            showError("Сессия не активна. Сначала нажмите START")
+            return
+        }
+
+        showLoadingDialog("Загрузка вокселей...")
+        lifecycleScope.launch {
+            try {
+                val response = api.getVoxels(sessionId)
+                if (response.isSuccessful && response.body() != null) {
+                    val voxelResponse = response.body()!!
+                    currentVoxelData = voxelResponse.voxels.map { v ->
+                        VoxelData(
+                            position = v.position,
+                            type = v.type,
+                            color = v.color,
+                            alpha = v.alpha.toFloat(),
+                            size = voxelResponse.resolution.toFloat(),
+                            radius = v.radius
+                        )
+                    }
+
+                    voxelVisualizer.showVoxels(currentVoxelData!!)
+                    voxelLegend.visibility = View.VISIBLE
+                    fabEyeOfAI.setImageResource(R.drawable.ic_eye_off)
+                    eyeOfAIActive = true
+                    soundManager.play(SoundType.WHOOSH, volume = 0.5f, pitch = 1.5f)
+                    showToast("👁️ Теперь вы видите глазами ИИ! Вокселей: ${voxelResponse.total_count}")
+                } else {
+                    showError("Не удалось загрузить воксели")
+                }
+            } catch (e: Exception) {
+                showError("Ошибка загрузки Eye of AI: ${e.message}")
+            } finally {
+                hideLoadingDialog()
+            }
+        }
+    }
 
     private fun showLoadingDialog(message: String) {
         hideLoadingDialog()

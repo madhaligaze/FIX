@@ -46,6 +46,11 @@ interface ApiService {
 
     @GET("/health")
     suspend fun healthCheck(): Response<HealthResponse>
+
+    @GET("/session/voxels/{session_id}")
+    suspend fun getVoxels(
+        @Path("session_id") sessionId: String
+    ): Response<VoxelResponse>
 }
 
 // ── Ответ /session/start ──────────────────────────────────────────────────────
@@ -154,4 +159,26 @@ data class PreviewResponse(
     val would_collapse: List<String>,
     val collapse_count: Int,
     val warning: String
+)
+
+
+data class VoxelResponse(
+    val status: String,
+    val voxels: List<VoxelItem>,
+    val bounds: Bounds,
+    val resolution: Double,
+    val total_count: Int
+)
+
+data class VoxelItem(
+    val position: List<Float>,
+    val type: String,
+    val color: String,
+    val alpha: Double,
+    val radius: Float? = null
+)
+
+data class Bounds(
+    val min: List<Float>,
+    val max: List<Float>
 )
