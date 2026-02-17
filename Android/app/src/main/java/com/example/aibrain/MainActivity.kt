@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.Looper
+import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
@@ -31,6 +32,7 @@ import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.Node
 import com.google.ar.sceneform.math.Vector3
 import com.google.ar.sceneform.rendering.Color as SceneColor
+import com.example.aibrain.assets.ModelAssets
 import com.example.aibrain.scene.PhysicsAnimator
 import com.example.aibrain.scene.SceneBuilder
 import com.example.aibrain.scene.LightingSetup
@@ -175,6 +177,7 @@ class MainActivity : AppCompatActivity() {
     private var currentMeasurementType = MeasurementType.LINEAR
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var loadingDialog: AlertDialog? = null
 
     private val api = Retrofit.Builder()
         .baseUrl("http://100.119.60.35:8000/")
@@ -195,8 +198,21 @@ class MainActivity : AppCompatActivity() {
         setupClickListeners()
         initializeRuler()
         sceneBuilder = SceneBuilder(sceneView.scene)
-        sceneBuilder.preloadModels()
         physicsAnimator = PhysicsAnimator(sceneView, sceneBuilder)
+
+        showLoadingDialog("Загрузка моделей...")
+        lifecycleScope.launch {
+            val result = ModelAssets.loadAll(this@MainActivity)
+            result.onSuccess {
+                hideLoadingDialog()
+                Log.d("ModelAssets", "✅ Все модели загружены успешно")
+            }
+            result.onFailure { error ->
+                hideLoadingDialog()
+                Log.e("ModelAssets", "❌ Ошибка загрузки моделей: ${error.message}")
+                showError("Не удалось загрузить 3D модели. Используется упрощенный режим.")
+            }
+        }
         viewModel = StructureViewModel(api)
         soundManager = SoundManager(this)
 
@@ -388,6 +404,9 @@ class MainActivity : AppCompatActivity() {
         if (::soundManager.isInitialized) {
             soundManager.release()
         }
+
+        hideLoadingDialog()
+        ModelAssets.clear()
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1025,6 +1044,22 @@ class MainActivity : AppCompatActivity() {
     private fun showLoadingIndicator() = showHint("⏳ Обновление структуры...")
 
     private fun hideLoadingIndicator() = Unit
+
+
+    private fun showLoadingDialog(message: String) {
+        hideLoadingDialog()
+        loadingDialog = AlertDialog.Builder(this)
+            .setTitle("Подождите")
+            .setMessage(message)
+            .setCancelable(false)
+            .create()
+        loadingDialog?.show()
+    }
+
+    private fun hideLoadingDialog() {
+        loadingDialog?.dismiss()
+        loadingDialog = null
+    }
 
     private fun showError(message: String) {
         showHint("❌ $message")
