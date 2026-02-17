@@ -5,6 +5,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+# Stage 9: reproducible world snapshots
+try:
+    from modules.world_snapshot import (
+        DEFAULT_SNAPSHOT_DIR,
+        compute_revision as compute_snapshot_revision,
+        save_snapshot as save_world_snapshot,
+        list_snapshots as list_world_snapshots,
+        load_snapshot as load_world_snapshot,
+    )
+except Exception:  # pragma: no cover
+    DEFAULT_SNAPSHOT_DIR = "/tmp/ai_brain_snapshots"
+    compute_snapshot_revision = None
+    save_world_snapshot = None
+    list_world_snapshots = None
+    load_world_snapshot = None
+
 from modules.session_state import LockInfo, SessionState, compute_world_revision
 
 
@@ -314,6 +330,82 @@ class Session:
             "total_objects_detected": self.total_objects_detected,
         }
 
+    # ── Stage 9: world snapshot (reproducibility) ─────────────────────────
+
+    def commit_world_snapshot(
+        self,
+        base_dir: str = DEFAULT_SNAPSHOT_DIR,
+        reason: str = "auto",
+        revision: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist a reproducible snapshot of current world model.
+
+        Stores: session context + sparse voxel world.
+        Returns snapshot metadata (revision, counts, created_at) or None.
+        """
+        if save_world_snapshot is None:
+            return None
+        try:
+            session_dict = self.to_dict()
+            voxel_world = self.scene_context.ensure_voxel_world()
+            if revision is None and compute_snapshot_revision is not None:
+                revision = compute_snapshot_revision(session_dict)
+            meta = save_world_snapshot(
+                session_dict=session_dict,
+                voxel_world=voxel_world,
+                base_dir=base_dir,
+                revision=revision,
+                reason=reason,
+            )
+            return meta
+        except Exception:
+            return None
+
+    def list_world_snapshots(self, base_dir: str = DEFAULT_SNAPSHOT_DIR) -> List[Dict[str, Any]]:
+        if list_world_snapshots is None:
+            return []
+        try:
+            return list_world_snapshots(self.session_id, base_dir=base_dir)
+        except Exception:
+            return []
+
+    def restore_world_snapshot(
+        self,
+        revision: str,
+        base_dir: str = DEFAULT_SNAPSHOT_DIR,
+    ) -> bool:
+        """Restore snapshot into this in-memory session.
+
+        WARNING: overwrites scene_context, frames (truncated), and voxel world.
+        """
+        if load_world_snapshot is None:
+            return False
+        try:
+            session_dict, voxel_world = load_world_snapshot(self.session_id, revision, base_dir=base_dir)
+            if not session_dict:
+                return False
+            restored = Session.from_dict(session_dict)
+            # Overwrite fields (keep same object reference)
+            self.created_at = restored.created_at
+            self.updated_at = restored.updated_at
+            self.last_activity = restored.last_activity
+            self.status = restored.status
+            self.frames = restored.frames
+            self.scene_context = restored.scene_context
+            if voxel_world is not None:
+                self.scene_context.voxel_world = voxel_world
+            self.generated_variants = restored.generated_variants
+            self.current_structure = restored.current_structure
+            self.structure_history = restored.structure_history
+            self.user_anchors = restored.user_anchors
+            self.total_frames_processed = restored.total_frames_processed
+            self.total_objects_detected = restored.total_objects_detected
+            self._structural_graph = None
+            self._touch()
+            return True
+        except Exception:
+            return False
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "session_id": self.session_id,
@@ -509,6 +601,36 @@ class SessionManager:
         if not session:
             return {}
         return session.to_dict()
+
+    # ── Stage 9: snapshot API helpers ─────────────────────────────────────
+
+    def commit_snapshot(self, session_id: str, base_dir: str = DEFAULT_SNAPSHOT_DIR, reason: str = "manual") -> Dict[str, Any]:
+        session = self.get_session(session_id)
+        if not session:
+            return {}
+        meta = session.commit_world_snapshot(base_dir=base_dir, reason=reason)
+        return meta or {}
+
+    def list_snapshots(self, session_id: str, base_dir: str = DEFAULT_SNAPSHOT_DIR) -> List[Dict[str, Any]]:
+        session = self.get_session(session_id)
+        if not session:
+            # allow listing even if session not loaded in RAM
+            if list_world_snapshots is None:
+                return []
+            try:
+                return list_world_snapshots(session_id, base_dir=base_dir)
+            except Exception:
+                return []
+        return session.list_world_snapshots(base_dir=base_dir)
+
+    def restore_snapshot(self, session_id: str, revision: str, base_dir: str = DEFAULT_SNAPSHOT_DIR) -> bool:
+        session = self.get_session(session_id)
+        if not session:
+            return False
+        ok = session.restore_world_snapshot(revision=revision, base_dir=base_dir)
+        if ok:
+            self.auto_save_session(session_id)
+        return ok
 
     def save_to_disk(self, session: Session) -> bool:
         return session.save_to_disk(str(self.base_dir))
