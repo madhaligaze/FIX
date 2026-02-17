@@ -32,6 +32,18 @@ interface ApiService {
         @Path("session_id") sessionId: String
     ): Response<ModelingResponse>
 
+    @POST("/session/update/{session_id}")
+    suspend fun updateStructure(
+        @Path("session_id") sessionId: String,
+        @Body action: UpdateAction
+    ): Response<UpdateResponse>
+
+    @POST("/session/preview_remove/{session_id}")
+    suspend fun previewRemove(
+        @Path("session_id") sessionId: String,
+        @Query("element_id") elementId: String
+    ): Response<PreviewResponse>
+
     @GET("/health")
     suspend fun healthCheck(): Response<HealthResponse>
 }
@@ -104,4 +116,42 @@ data class HealthResponse(
     val status: String,
     val version: String,
     val modules: Map<String, Boolean>?
+)
+
+// ── Запрос/ответ для /session/update ───────────────────────────────────────
+data class UpdateAction(
+    val action: String,
+    val element_id: String? = null,
+    val element_data: ScaffoldElement? = null
+)
+
+data class UpdateResponse(
+    val status: String,
+    val is_stable: Boolean,
+    val physics_status: String,
+    val heatmap: List<HeatmapItem>,
+    val affected_elements: List<String>,
+    val collapsed: CollapsedData,
+    val processing_time_ms: Int
+)
+
+data class HeatmapItem(
+    val id: String,
+    val color: String,
+    val load_ratio: Double
+)
+
+data class CollapsedData(
+    val nodes: List<String>,
+    val elements: List<String>
+)
+
+// ── Ответ для /session/preview_remove ──────────────────────────────────────
+data class PreviewResponse(
+    val status: String,
+    val element_id: String,
+    val is_critical: Boolean,
+    val would_collapse: List<String>,
+    val collapse_count: Int,
+    val warning: String
 )
