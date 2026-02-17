@@ -217,20 +217,22 @@ class VoxelWorld:
         known = float(len(self.occupied) + len(self.free))
         unknown = max(0.0, total - known)
         coverage = (known / total) if total > 0 else 0.0
-        unknown_pct = (unknown / total) if total > 0 else 1.0
+        holes = (unknown / total) if total > 0 else 1.0
         return {
             "bounds_total_voxels": total,
             "known_voxels": known,
             "unknown_voxels": unknown,
             "coverage": coverage,
-            "unknown": unknown_pct,
+            "holes": holes,
+            # Backward-compatible alias.
+            "unknown": holes,
         }
 
     def get_quality_metrics(self) -> Dict[str, float]:
         coverage = self.get_coverage_metrics()
         return {
             "coverage_pct": coverage["coverage"],
-            "unknown_pct": coverage["unknown"],
+            "unknown_pct": coverage["holes"],
             "last_depth_stats": self.get_last_depth_stats(),
             **coverage,
         }
