@@ -31,6 +31,7 @@ class SceneContext:
         self.point_cloud: List[Dict[str, Any]] = []
         self.obstacles: List[Dict[str, Any]] = []
         self.voxel_world = None
+        self.tsdf_integrator = None
 
     def ensure_voxel_world(self):
         if self.voxel_world is None:
@@ -41,6 +42,16 @@ class SceneContext:
             except Exception:
                 self.voxel_world = None
         return self.voxel_world
+
+    def ensure_tsdf_integrator(self):
+        if self.tsdf_integrator is None:
+            try:
+                from modules.tsdf_integrator import TSDFIntegrator
+
+                self.tsdf_integrator = TSDFIntegrator()
+            except Exception:
+                self.tsdf_integrator = None
+        return self.tsdf_integrator
 
     def ingest_frame(self, frame: CameraFrame) -> None:
         if frame.ar_points:
