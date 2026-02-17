@@ -10,7 +10,7 @@ Main FastAPI Server - AI Brain Backend
 ✓ BuilderFixed - генератор с валидацией
 ✓ SessionManager - контекст всей сцены
 """
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response
 from pydantic import BaseModel, Field
@@ -372,8 +372,8 @@ class StreamFrameRequest(BaseModel):
 
     session_id: str
 
-    # Legacy: base64 encoded image (jpeg/png)
-    frame_base64: str
+    # Legacy fallback: base64 encoded image (jpeg/png). Prefer /session/frame multipart upload.
+    frame_base64: Optional[str] = None
 
     # Legacy: optional (Android used to send only position)
     camera_position: Optional[Dict] = None
@@ -502,8 +502,9 @@ class FramePacketRequest(BaseModel):
     frame_id: str
     timestamp: Optional[float] = None
 
-    # RGB image (base64-encoded bytes, jpeg/png)
-    rgb_base64: str
+    # Legacy fallback: RGB image (base64-encoded bytes, jpeg/png).
+    # Preferred transport: multipart/form-data with binary file part "rgb_file".
+    rgb_base64: Optional[str] = None
 
     # Image size
     width: int
@@ -671,6 +672,15 @@ async def start_session(request: SessionStartRequest):
 
 
 
+def _decode_maybe_base64(value: Optional[str], field_name: str) -> Optional[bytes]:
+    if not value:
+        return None
+    try:
+        return base64.b64decode(value)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Ошибка декодирования {field_name}") from exc
+
+
 @app.post("/session/frame")
 async def ingest_frame_packet(request: FramePacketRequest):
     """
@@ -686,12 +696,14 @@ async def ingest_frame_packet(request: FramePacketRequest):
         if not session:
             raise HTTPException(status_code=404, detail="Сессия не найдена")
 
-        # Decode RGB
-        rgb_bytes = base64.b64decode(request.rgb_base64)
+        # Decode RGB (legacy JSON base64 transport)
+        rgb_bytes = _decode_maybe_base64(request.rgb_base64, "rgb_base64")
+        if rgb_bytes is None:
+            raise HTTPException(status_code=422, detail="rgb_base64 is required for JSON /session/frame. Use /session/frame/upload for binary multipart transport.")
 
         # Decode optional depth/conf
-        depth_bytes = base64.b64decode(request.depth_base64) if request.depth_base64 else None
-        conf_bytes = base64.b64decode(request.confidence_base64) if request.confidence_base64 else None
+        depth_bytes = _decode_maybe_base64(request.depth_base64, "depth_base64")
+        conf_bytes = _decode_maybe_base64(request.confidence_base64, "confidence_base64")
 
         # Ensure world models
         voxel_world = session.scene_context.ensure_voxel_world()
@@ -894,6 +906,74 @@ async def ingest_frame_packet(request: FramePacketRequest):
         logger.error(f"/session/frame error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/session/frame/upload")
+async def ingest_frame_packet_upload(
+    session_id: str = Form(...),
+    frame_id: str = Form(...),
+    width: int = Form(...),
+    height: int = Form(...),
+    fx: float = Form(...),
+    fy: float = Form(...),
+    cx_px: float = Form(...),
+    cy_px: float = Form(...),
+    pose_world_from_camera: str = Form(...),
+    timestamp: Optional[float] = Form(None),
+    depth_scale: float = Form(1000.0),
+    enable_vision: bool = Form(True),
+    point_cloud_json: Optional[str] = Form(None),
+    rgb_file: UploadFile = File(...),
+    depth_file: Optional[UploadFile] = File(None),
+    confidence_file: Optional[UploadFile] = File(None),
+):
+    """Binary upload endpoint: multipart/form-data for frame transport without base64 inflation."""
+    try:
+        pose = json.loads(pose_world_from_camera)
+        if not isinstance(pose, list):
+            raise ValueError("pose_world_from_camera must be JSON list")
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="Invalid pose_world_from_camera JSON") from exc
+
+    point_cloud = []
+    if point_cloud_json:
+        try:
+            payload = json.loads(point_cloud_json)
+            if isinstance(payload, list):
+                point_cloud = payload
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="Invalid point_cloud_json") from exc
+
+    rgb_bytes = await rgb_file.read()
+    if not rgb_bytes:
+        raise HTTPException(status_code=422, detail="rgb_file is empty")
+
+    depth_bytes = await depth_file.read() if depth_file is not None else None
+    conf_bytes = await confidence_file.read() if confidence_file is not None else None
+
+    request = FramePacketRequest(
+        session_id=session_id,
+        frame_id=frame_id,
+        timestamp=timestamp,
+        rgb_base64=base64.b64encode(rgb_bytes).decode("ascii"),
+        width=int(width),
+        height=int(height),
+        fx=float(fx),
+        fy=float(fy),
+        cx_px=float(cx_px),
+        cy_px=float(cy_px),
+        pose_world_from_camera=pose,
+        depth_base64=base64.b64encode(depth_bytes).decode("ascii") if depth_bytes else None,
+        depth_scale=float(depth_scale),
+        confidence_base64=base64.b64encode(conf_bytes).decode("ascii") if conf_bytes else None,
+        point_cloud=point_cloud,
+        enable_vision=bool(enable_vision),
+    )
+
+    out = await ingest_frame_packet(request)
+    if isinstance(out, dict):
+        out["transport"] = "multipart"
+    return out
 
 
 @app.post("/session/scan_plan")
