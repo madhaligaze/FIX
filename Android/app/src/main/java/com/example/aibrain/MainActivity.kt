@@ -3,6 +3,7 @@ package com.example.aibrain
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.content.Context
+import android.content.SharedPreferences
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
@@ -17,6 +18,7 @@ import android.view.View
 import android.view.animation.AlphaAnimation
 import android.view.animation.Animation
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -40,6 +42,7 @@ import io.github.sceneview.ar.ArSceneView
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import kotlinx.coroutines.*
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import kotlin.math.min
@@ -88,6 +91,8 @@ class MainActivity : AppCompatActivity() {
         private const val STREAM_INTERVAL_MS = 1_000L
         private const val MIN_POINTS_FOR_MODEL = 2
         private const val MAX_POINTS = 20
+        private const val PREFS_NAME = "app_settings"
+        private const val PREF_SERVER_BASE_URL = "server_base_url"
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -188,11 +193,8 @@ class MainActivity : AppCompatActivity() {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var loadingDialog: AlertDialog? = null
 
-    private val api = Retrofit.Builder()
-        .baseUrl(BuildConfig.BACKEND_BASE_URL)
-        .addConverterFactory(GsonConverterFactory.create())
-        .build()
-        .create(ApiService::class.java)
+    private lateinit var settingsPrefs: SharedPreferences
+    private lateinit var api: ApiService
 
     // ══════════════════════════════════════════════════════════════════════
     // LIFECYCLE
@@ -201,6 +203,9 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        settingsPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        rebuildApiClient()
 
         initViews()
         setupARScene()
@@ -570,7 +575,68 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onSettingsClicked() {
-        Toast.makeText(this, "⚙️ Настройки (в разработке)", Toast.LENGTH_SHORT).show()
+        val currentBaseUrl = getCurrentServerUrl()
+        val input = EditText(this).apply {
+            hint = "http://192.168.1.10:8000/"
+            setSingleLine()
+            setText(currentBaseUrl)
+            setSelection(text.length)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("⚙️ Настройки сервера")
+            .setMessage("Укажите IP/URL backend сервера. Пример: http://192.168.1.10:8000/")
+            .setView(input)
+            .setPositiveButton("Сохранить") { _, _ ->
+                val normalizedUrl = normalizeBaseUrl(input.text.toString())
+                if (normalizedUrl == null) {
+                    showError("Неверный URL сервера")
+                    return@setPositiveButton
+                }
+
+                settingsPrefs.edit().putString(PREF_SERVER_BASE_URL, normalizedUrl).apply()
+                rebuildApiClient()
+                showHint("✓ Сервер обновлен: $normalizedUrl")
+            }
+            .setNeutralButton("По умолчанию") { _, _ ->
+                settingsPrefs.edit().remove(PREF_SERVER_BASE_URL).apply()
+                rebuildApiClient()
+                showHint("✓ Восстановлен сервер по умолчанию: ${getCurrentServerUrl()}")
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun rebuildApiClient() {
+        val baseUrl = getCurrentServerUrl()
+        api = Retrofit.Builder()
+            .baseUrl(baseUrl)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(ApiService::class.java)
+
+        if (::viewModel.isInitialized) {
+            viewModel.updateApiService(api)
+        }
+    }
+
+    private fun getCurrentServerUrl(): String {
+        val saved = settingsPrefs.getString(PREF_SERVER_BASE_URL, null)
+        return normalizeBaseUrl(saved) ?: BuildConfig.BACKEND_BASE_URL
+    }
+
+    private fun normalizeBaseUrl(raw: String?): String? {
+        val value = raw?.trim().orEmpty()
+        if (value.isBlank()) return null
+
+        val withScheme = if (value.startsWith("http://") || value.startsWith("https://")) {
+            value
+        } else {
+            "http://$value"
+        }
+
+        val withTrailingSlash = if (withScheme.endsWith('/')) withScheme else "$withScheme/"
+        return withTrailingSlash.toHttpUrlOrNull()?.toString()
     }
 
     // ══════════════════════════════════════════════════════════════════════
