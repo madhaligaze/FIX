@@ -107,6 +107,9 @@ class Session:
         self.total_frames_processed = 0
         self.total_objects_detected = 0
         self._structural_graph = None
+        self.world_locked = False
+        self.locked_mesh_version: Optional[int] = None
+        self.mesh_version = 0
 
     def _touch(self) -> None:
         now = time.time()
@@ -119,8 +122,16 @@ class Session:
         if frame.ar_points:
             self.user_anchors.extend(frame.ar_points)
         self.total_frames_processed += 1
+        self.mesh_version += 1
         self.total_objects_detected += len(frame.detected_objects)
         self._touch()
+
+    def lock_world(self) -> int:
+        """Freeze current geometry snapshot version for planning stage."""
+        self.world_locked = True
+        self.locked_mesh_version = self.mesh_version
+        self._touch()
+        return self.locked_mesh_version
 
     def add_variant(self, variant: Dict[str, Any]) -> None:
         self.generated_variants.append(variant)
@@ -239,6 +250,9 @@ class Session:
                 "status": self.status,
                 "total_frames_processed": self.total_frames_processed,
                 "total_objects_detected": self.total_objects_detected,
+                "world_locked": self.world_locked,
+                "locked_mesh_version": self.locked_mesh_version,
+                "mesh_version": self.mesh_version,
             }
             with open(session_dir / "metadata.json", "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -285,6 +299,9 @@ class Session:
             session.status = metadata.get("status", "ACTIVE")
             session.total_frames_processed = metadata.get("total_frames_processed", 0)
             session.total_objects_detected = metadata.get("total_objects_detected", 0)
+            session.world_locked = metadata.get("world_locked", False)
+            session.locked_mesh_version = metadata.get("locked_mesh_version")
+            session.mesh_version = metadata.get("mesh_version", session.mesh_version)
 
             structure_file = session_dir / "current_structure.json"
             if structure_file.exists():
