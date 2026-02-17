@@ -51,37 +51,55 @@ def _rotate_y(v: np.ndarray, angle_rad: float) -> np.ndarray:
 
 
 def _cluster_points_grid(points: List[Dict[str, Any]], cell_m: float = 0.8) -> List[Dict[str, Any]]:
-    """Cluster points by coarse 3D grid."""
+    """Cluster points by coarse 3D grid with NumPy grouping."""
     if not points:
         return []
 
-    buckets: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = {}
+    raw_pts: List[List[float]] = []
+    severities: List[float] = []
+    reasons: List[str] = []
+
     for s in points:
         p = s.get("point") or s
         if not isinstance(p, dict):
             continue
-        x, y, z = float(p.get("x", 0.0)), float(p.get("y", 0.0)), float(p.get("z", 0.0))
-        key = (int(math.floor(x / cell_m)), int(math.floor(y / cell_m)), int(math.floor(z / cell_m)))
-        buckets.setdefault(key, []).append(s)
+        raw_pts.append([float(p.get("x", 0.0)), float(p.get("y", 0.0)), float(p.get("z", 0.0))])
+        severities.append(float(s.get("severity", 0.5)))
+        reasons.append(str(s.get("reason", "unknown")))
+
+    if not raw_pts:
+        return []
+
+    pts = np.asarray(raw_pts, dtype=np.float64)
+    sev = np.asarray(severities, dtype=np.float64)
+    keys = np.floor(pts / float(cell_m)).astype(np.int64)
+
+    unique_keys, inverse = np.unique(keys, axis=0, return_inverse=True)
+    counts = np.bincount(inverse)
+    sev_sums = np.bincount(inverse, weights=sev)
+
+    centers = np.zeros((unique_keys.shape[0], 3), dtype=np.float64)
+    np.add.at(centers, inverse, pts)
+    centers /= counts[:, None]
 
     clusters: List[Dict[str, Any]] = []
-    for items in buckets.values():
-        pts = np.stack([_vec3((it.get("point") or it)) for it in items], axis=0)
-        center = np.mean(pts, axis=0)
+    for i in range(unique_keys.shape[0]):
+        idxs = np.where(inverse == i)[0]
+        reason_counts: Dict[str, int] = {}
+        for idx in idxs:
+            r = reasons[int(idx)]
+            reason_counts[r] = reason_counts.get(r, 0) + 1
 
-        severity = float(np.mean([float(it.get("severity", 0.5)) for it in items]))
-        reasons: Dict[str, int] = {}
-        for it in items:
-            r = str(it.get("reason", "unknown"))
-            reasons[r] = reasons.get(r, 0) + 1
-
+        count = int(counts[i])
+        severity = float(sev_sums[i] / max(count, 1))
+        center = centers[i]
         clusters.append(
             {
                 "center": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])},
-                "count": len(items),
+                "count": count,
                 "severity": severity,
-                "reasons": reasons,
-                "priority": float(len(items)) * (0.5 + severity),
+                "reasons": reason_counts,
+                "priority": float(count) * (0.5 + severity),
             }
         )
 

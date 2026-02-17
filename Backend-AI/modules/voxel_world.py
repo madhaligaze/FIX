@@ -98,26 +98,51 @@ class VoxelWorld:
         return count
 
     def mark_box(self, center: Dict, dims: Dict, vtype: int = OCCUPIED) -> int:
-        """Fill an approximate box region as OCCUPIED."""
+        """Fill an approximate box region as OCCUPIED (vectorized grid generation)."""
         cx, cy, cz = float(center["x"]), float(center["y"]), float(center["z"])
         hw = float(dims.get("width", 0.2)) / 2
         hd = float(dims.get("depth", 0.2)) / 2
         hh = float(dims.get("height", 0.5)) / 2
         r = self.resolution
 
+        xs = np.arange(cx - hw, cx + hw + r, r, dtype=np.float64)
+        ys = np.arange(cy - hd, cy + hd + r, r, dtype=np.float64)
+        zs = np.arange(cz - hh, cz + hh + r, r, dtype=np.float64)
+        if xs.size == 0 or ys.size == 0 or zs.size == 0:
+            return 0
+
+        xx, yy, zz = np.meshgrid(xs, ys, zs, indexing="ij")
+        coords = np.stack(
+            [
+                np.floor(xx / r).astype(np.int64),
+                np.floor(yy / r).astype(np.int64),
+                np.floor(zz / r).astype(np.int64),
+            ],
+            axis=-1,
+        ).reshape(-1, 3)
+
+        if coords.size == 0:
+            return 0
+
+        mn = np.array(self._to_grid(*self.bounds_min), dtype=np.int64)
+        mx = np.array(self._to_grid(*self.bounds_max), dtype=np.int64)
+        in_bounds = np.all((coords >= mn) & (coords <= mx), axis=1)
+        if not np.any(in_bounds):
+            return 0
+
+        coords = np.unique(coords[in_bounds], axis=0)
+
         count = 0
-        for x in np.arange(cx - hw, cx + hw + r, r):
-            for y in np.arange(cy - hd, cy + hd + r, r):
-                for z in np.arange(cz - hh, cz + hh + r, r):
-                    coord = self._to_grid(x, y, z)
-                    if not self._in_bounds_idx(coord):
-                        continue
-                    if coord not in self.occupied:
-                        self.occupied.add(coord)
-                        self.free.discard(coord)
-                        self._types[coord] = vtype
-                        self._grid[coord] = vtype
-                        count += 1
+        for c in coords:
+            coord = (int(c[0]), int(c[1]), int(c[2]))
+            if coord in self.occupied:
+                continue
+            self.occupied.add(coord)
+            self.free.discard(coord)
+            self._types[coord] = vtype
+            self._grid[coord] = vtype
+            count += 1
+
         return count
 
     def ingest_yolo_detections(self, detections: List[Dict], fallback_depth: float = 2.0) -> None:

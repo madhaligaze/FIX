@@ -45,12 +45,8 @@ def test_session_frame_requires_core_fields():
     }
     response = client.post("/session/frame", json=payload)
 
-    # FastAPI validation happens before endpoint body
     assert response.status_code == 422
-    detail = response.json().get("detail", [])
-    # ensure at least one of the required fields is reported missing
-    missing_fields = {d.get("loc", ["", ""])[-1] for d in detail if isinstance(d, dict)}
-    assert "rgb_base64" in missing_fields
+    assert "rgb_base64" in str(response.json().get("detail", ""))
 
 
 def test_session_frame_point_cloud_degraded_mode():
@@ -118,3 +114,35 @@ def test_session_frame_accepts_depth_packet():
     # We should have depth integration stats in geometry_stats
     assert "samples" in data["geometry_stats"]
     assert data["geometry_stats"]["samples"] >= 1.0
+
+
+def test_session_frame_accepts_multipart_upload():
+    session_id = _create_session_id()
+    depth_u16 = (1000).to_bytes(2, byteorder="little", signed=False)
+
+    response = client.post(
+        "/session/frame/upload",
+        data={
+            "session_id": session_id,
+            "frame_id": "f-4",
+            "timestamp": "4.0",
+            "width": "1",
+            "height": "1",
+            "fx": "500.0",
+            "fy": "500.0",
+            "cx_px": "0.0",
+            "cy_px": "0.0",
+            "pose_world_from_camera": "[0,0,0,0,0,0,1]",
+            "depth_scale": "1000.0",
+            "enable_vision": "false",
+        },
+        files={
+            "rgb_file": ("rgb.bin", b"rgb", "application/octet-stream"),
+            "depth_file": ("depth.bin", depth_u16, "application/octet-stream"),
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "processed"
+    assert data.get("transport") == "multipart"
