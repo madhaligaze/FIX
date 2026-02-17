@@ -28,6 +28,9 @@ class SceneContext:
         self.anchor_points: List[Dict[str, Any]] = []
         self.all_ar_points: List[Dict[str, Any]] = []
         self.all_detected_objects: List[Dict[str, Any]] = []
+        # Stage 2: stable world objects
+        self.world_objects: List[Dict[str, Any]] = []
+        self._perception_backend = None
         self.point_cloud: List[Dict[str, Any]] = []
         self.obstacles: List[Dict[str, Any]] = []
         self.voxel_world = None
@@ -53,6 +56,18 @@ class SceneContext:
                 self.tsdf_integrator = None
         return self.tsdf_integrator
 
+    def ensure_perception_backend(self):
+        """Creates PerceptionBackend (Stage 2) and seeds it from stored world_objects."""
+        if self._perception_backend is None:
+            try:
+                from modules.perception_backend import PerceptionBackend
+
+                self._perception_backend = PerceptionBackend()
+                self._perception_backend.seed_from_scene(self)
+            except Exception:
+                self._perception_backend = None
+        return self._perception_backend
+
     def ingest_frame(self, frame: CameraFrame) -> None:
         if frame.ar_points:
             self.anchor_points.extend(frame.ar_points)
@@ -68,6 +83,7 @@ class SceneContext:
             "anchors": len(self.anchor_points),
             "ar_points": len(self.all_ar_points),
             "detected_objects": len(self.all_detected_objects),
+            "world_objects": len(self.world_objects),
             "point_cloud_points": len(self.point_cloud),
         }
 
@@ -76,6 +92,7 @@ class SceneContext:
             "anchor_points": self.anchor_points,
             "all_ar_points": self.all_ar_points,
             "all_detected_objects": self.all_detected_objects,
+            "world_objects": self.world_objects,
             "point_cloud": self.point_cloud,
             "obstacles": self.obstacles,
         }
@@ -86,6 +103,7 @@ class SceneContext:
         ctx.anchor_points = data.get("anchor_points", [])
         ctx.all_ar_points = data.get("all_ar_points", [])
         ctx.all_detected_objects = data.get("all_detected_objects", [])
+        ctx.world_objects = data.get("world_objects", [])
         ctx.point_cloud = data.get("point_cloud", [])
         ctx.obstacles = data.get("obstacles", [])
         return ctx
