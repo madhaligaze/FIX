@@ -258,7 +258,7 @@ class ExportBOMRequest(BaseModel):
 # ─── v3.0 Models ────────────────────────────────────────────────────────────
 
 class DepthStreamRequest(BaseModel):
-    """Стриминг карты глубины с ARCore Depth API"""
+    """Стриминг карты глубины с ARCore Depth API."""
 
     session_id: str
     depth_base64: str
@@ -269,6 +269,10 @@ class DepthStreamRequest(BaseModel):
     cx_px: float = 320.0
     cy_px: float = 240.0
     camera_pose: List[float] = [0, 0, 0, 0, 0, 0, 1]
+    depth_scale: float = 1000.0
+    confidence_base64: Optional[str] = None
+    confidence_threshold: int = 1
+    pixel_step: int = 4
 
 
 class StructureModifyRequest(BaseModel):
@@ -732,10 +736,17 @@ async def ingest_depth_stream(request: DepthStreamRequest):
     except Exception as exc:
         raise HTTPException(400, "Ошибка декодирования depth_base64") from exc
 
+    conf_bytes = None
+    if request.confidence_base64:
+        try:
+            conf_bytes = base64.b64decode(request.confidence_base64)
+        except Exception as exc:
+            raise HTTPException(400, "Ошибка декодирования confidence_base64") from exc
+
     voxel_world = session.scene_context.ensure_voxel_world()
     normalized_pose = _normalize_camera_pose(request.camera_pose)
 
-    added = voxel_world.ingest_depth_map(
+    stats = voxel_world.ingest_depth_map(
         depth_bytes=depth_bytes,
         width=request.width,
         height=request.height,
@@ -744,15 +755,52 @@ async def ingest_depth_stream(request: DepthStreamRequest):
         cx_px=request.cx_px,
         cy_px=request.cy_px,
         camera_pose=normalized_pose,
+        depth_scale=request.depth_scale,
+        confidence_bytes=conf_bytes,
+        confidence_threshold=request.confidence_threshold,
+        pixel_step=request.pixel_step,
     )
 
+    tsdf = session.scene_context.ensure_tsdf_integrator()
+    tsdf_integrated = False
+    if tsdf is not None and getattr(tsdf, "available", False):
+        import numpy as _np
+
+        d = _np.frombuffer(depth_bytes, dtype=_np.uint16).reshape(request.height, request.width)
+        depth_m = d.astype(_np.float32) / float(request.depth_scale)
+        pose7 = (
+            float(normalized_pose[0]),
+            float(normalized_pose[1]),
+            float(normalized_pose[2]),
+            float(normalized_pose[3]),
+            float(normalized_pose[4]),
+            float(normalized_pose[5]),
+            float(normalized_pose[6]),
+        )
+        tsdf_integrated = bool(
+            tsdf.integrate_depth(
+                depth_m=depth_m,
+                fx=request.fx,
+                fy=request.fy,
+                cx=request.cx_px,
+                cy=request.cy_px,
+                pose_world_from_camera_7=pose7,
+            )
+        )
+
+    quality = voxel_world.get_quality_metrics()
+
     return {
-        "status": "voxels_updated",
-        "added_voxels": added,
-        "total_voxels": voxel_world.total_voxels,
+        "status": "world_updated",
         "camera_pose": normalized_pose,
         "depth_payload_bytes": len(depth_bytes),
-        "message": f"Добавлено {added} вокселей. ИИ видит пространство.",
+        "depth_scale": request.depth_scale,
+        "depth_stats": stats,
+        "quality": quality,
+        "total_occupied_voxels": voxel_world.total_voxels,
+        "total_known_voxels": voxel_world.total_known_voxels,
+        "tsdf_integrated": tsdf_integrated,
+        "message": "Depth интегрирован: FREE/OCCUPIED обновлены, UNKNOWN уменьшен (консервативный режим).",
     }
 
 
