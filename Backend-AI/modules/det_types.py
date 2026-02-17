@@ -64,6 +64,16 @@ class WorldObject:
     observed_frames: List[str] = field(default_factory=list)
     status: str = "TENTATIVE"  # CONFIRMED / TENTATIVE / HYPOTHESIS
 
+    # Stage 3: engineering reconstruction (not fantasy)
+    # Visible part in parametric space (for cylinders/boxes): usually {"t0":..,"t1":..,"p0":[...],"p1":[...]}
+    observable_segment: Optional[Dict[str, Any]] = None
+    # Candidate extensions beyond visible segment. Each item holds stop_reason and confidence.
+    extension_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    # Evidence that an end really terminates (cap/flange/abrupt density drop)
+    termination_evidence: Dict[str, Any] = field(default_factory=dict)
+    # If any hypothesis hits UNKNOWN: planning should be conservative and request re-scan.
+    needs_scan: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -74,4 +84,8 @@ class WorldObject:
             "confidence": self.confidence,
             "observed_frames": list(self.observed_frames),
             "status": self.status,
+            "observable_segment": self.observable_segment,
+            "extension_hypotheses": list(self.extension_hypotheses),
+            "termination_evidence": dict(self.termination_evidence or {}),
+            "needs_scan": bool(self.needs_scan),
         }

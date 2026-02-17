@@ -498,6 +498,7 @@ async def ingest_frame_packet(request: FramePacketRequest):
 
         # Perception pipeline
         det2d, det3d, world_objects = [], [], []
+        scan_suggestions = []
         pb = session.scene_context.ensure_perception_backend()
         if pb is not None:
             out = pb.process_frame(
@@ -520,6 +521,7 @@ async def ingest_frame_packet(request: FramePacketRequest):
             det2d = out.get("det2d", [])
             det3d = out.get("det3d", [])
             world_objects = out.get("world_objects", [])
+            scan_suggestions = out.get("scan_suggestions", [])
 
             # Persist stable objects in scene_context
             session.scene_context.world_objects = world_objects
@@ -554,6 +556,7 @@ async def ingest_frame_packet(request: FramePacketRequest):
             "world_objects": world_objects,
             "geometry_stats": geom_stats,
             "mesh_info": mesh_info,
+            "scan_suggestions": scan_suggestions,
         }
 
     except HTTPException:
@@ -671,6 +674,7 @@ async def generate_variants(request: GenerateRequest):
                 voxel_world=voxel_world,
                 ledger_len=request.target_dimensions.get('ledger_len', 1.09),
                 standard_h=request.target_dimensions.get('standard_h', 2.07),
+                world_objects=getattr(session.scene_context, 'world_objects', None),
             )
             target_dict = {
                 "x": request.target_point.x,
