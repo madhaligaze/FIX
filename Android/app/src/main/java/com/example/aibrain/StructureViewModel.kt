@@ -42,9 +42,15 @@ class StructureViewModel(
             snapshots.subList(currentSnapshotIndex + 1, snapshots.size).clear()
         }
 
+        val copiedElements = elements.map { it.copy() }
+        val previousSnapshot = snapshots.lastOrNull()
+        if (previousSnapshot != null && previousSnapshot.elements == copiedElements) {
+            return
+        }
+
         val snapshot = StructureSnapshot(
             timestamp = System.currentTimeMillis(),
-            elements = elements.map { it.copy() },
+            elements = copiedElements,
             description = description
         )
 
@@ -52,9 +58,9 @@ class StructureViewModel(
 
         if (snapshots.size > maxSnapshots) {
             snapshots.removeAt(0)
-        } else {
-            currentSnapshotIndex++
         }
+
+        currentSnapshotIndex = snapshots.lastIndex
     }
 
     /**
