@@ -537,65 +537,62 @@ class VoxelWorld:
         """Approximate raycast against OCCUPIED voxels.
 
         Returns distance to first OCCUPIED voxel along the ray, or None if nothing hit.
-        This is used for Stage 5 reprojection consistency checks.
-
-        Notes:
-        - We do NOT treat UNKNOWN as a hit here; UNKNOWN is handled separately in scoring.
-        - step defaults to resolution/2 for reasonable accuracy.
+        UNKNOWN is *not* treated as a hit (it is handled separately in scoring).
         """
         ox, oy, oz = map(float, origin_world)
         dx, dy, dz = map(float, direction_world)
         nrm = math.sqrt(dx * dx + dy * dy + dz * dz)
         if nrm <= 1e-9:
             return None
-        dx /= nrm
-        dy /= nrm
-        dz /= nrm
 
-        s = float(step) if step is not None else float(self.resolution) / 2.0
-        s = max(s, float(self.resolution) / 4.0)
+        dx, dy, dz = dx / nrm, dy / nrm, dz / nrm
+        # A reasonable default: half-voxel step
+        if step is None:
+            step = max(0.5 * float(self.resolution), 1e-3)
+
         dist = 0.0
-        while dist <= float(max_dist):
+        while dist <= max_dist:
             x = ox + dx * dist
             y = oy + dy * dist
             z = oz + dz * dist
-            if not self._in_bounds_xyz(x, y, z):
-                return None
-            coord = self._to_grid(x, y, z)
-            if coord in self.occupied or coord in self._safety_occupied:
-                return float(dist)
-            dist += s
+            g = self._to_grid(x, y, z)
+            if g in self.occupied:
+                return dist
+            dist += step
         return None
 
     def unknown_fraction_in_box(
         self,
-        *,
-        center: Tuple[float, float, float],
-        half_extents: Tuple[float, float, float],
-        sample_step: Optional[float] = None,
+        center_world: Tuple[float, float, float],
+        half_extents_m: Tuple[float, float, float],
+        sample_step_vox: int = 2,
     ) -> float:
-        """Estimate fraction of UNKNOWN voxels in a 3D box region.
+        """Estimate UNKNOWN fraction in an axis-aligned box.
 
-        Useful for conservative planning: if the support zone is mostly UNKNOWN, request more scans.
+        UNKNOWN := grid cells not in OCCUPIED and not in FREE.
+        Used for conservative gating (do not plan / do not confirm completions).
         """
-        cx, cy, cz = map(float, center)
-        hx, hy, hz = map(float, half_extents)
-        st = float(sample_step) if sample_step is not None else max(self.resolution * 2.0, 0.1)
+        cx, cy, cz = center_world
+        hx, hy, hz = half_extents_m
+
+        # Convert to grid bounds
+        gmin = self._to_grid(cx - hx, cy - hy, cz - hz)
+        gmax = self._to_grid(cx + hx, cy + hy, cz + hz)
+
+        # Ensure ordering
+        ix0, iy0, iz0 = (min(gmin[0], gmax[0]), min(gmin[1], gmax[1]), min(gmin[2], gmax[2]))
+        ix1, iy1, iz1 = (max(gmin[0], gmax[0]), max(gmin[1], gmax[1]), max(gmin[2], gmax[2]))
 
         total = 0
         unknown = 0
-        x = cx - hx
-        while x <= cx + hx:
-            y = cy - hy
-            while y <= cy + hy:
-                z = cz - hz
-                while z <= cz + hz:
+        step = max(1, int(sample_step_vox))
+        for ix in range(ix0, ix1 + 1, step):
+            for iy in range(iy0, iy1 + 1, step):
+                for iz in range(iz0, iz1 + 1, step):
                     total += 1
-                    if self.get_state(x, y, z) == self.UNKNOWN:
+                    g = (ix, iy, iz)
+                    if g not in self.occupied and g not in self.free:
                         unknown += 1
-                    z += st
-                y += st
-            x += st
         if total <= 0:
             return 1.0
         return float(unknown) / float(total)
