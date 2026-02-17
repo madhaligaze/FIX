@@ -116,3 +116,16 @@ class StructuralBrain:
             }
 
         return {"safe": True, "message": "Безопасно. Макс нагрузка перераспределится."}
+
+
+class PhysicsEngine(StructuralBrain):
+    """Modern alias for StructuralBrain used by main.py."""
+
+
+def quick_safety_check(nodes, beams) -> bool:
+    """Fast safety predicate used by option generation."""
+    engine = StructuralBrain()
+    result = engine.calculate_load_map(nodes, beams)
+    if result.get("status") != "OK":
+        return False
+    return all((item.get("load_ratio", 0.0) <= 1.0 for item in result.get("data", [])))

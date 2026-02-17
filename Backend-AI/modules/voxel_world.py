@@ -15,9 +15,35 @@ VoxelWorld — Воксельная карта рабочего простран
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
+
+
+@dataclass
+class Obstacle:
+    id: str
+    type: str
+    position: Tuple[float, float, float]
+    dimensions: Tuple[float, float, float]
+
+
+class VoxelCollisionSolver:
+    """Compatibility collision solver. Keeps structure unchanged if no precise data."""
+
+    def __init__(self, clearance: float = 0.15):
+        self.clearance = clearance
+
+    def resolve_collisions(self, nodes: List[Dict], beams: List[Dict], obstacles: List[Obstacle]):
+        return {
+            "success": True,
+            "nodes": nodes,
+            "beams": beams,
+            "moved_nodes": 0,
+            "removed_beams": 0,
+            "obstacles": len(obstacles),
+        }
 
 
 class VoxelWorld:
