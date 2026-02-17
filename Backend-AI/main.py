@@ -286,20 +286,47 @@ class Intrinsics(BaseModel):
     height: int
 
 
-class FramePacket(BaseModel):
+class FramePacketRequest(BaseModel):
+    """
+    FramePacket (Stage 2+): keyframe payload for honest 2D->3D.
+
+    Required for 3D lifting:
+      - intrinsics (fx,fy,cx,cy + image size)
+      - pose_world_from_camera (tx,ty,tz,qx,qy,qz,qw)
+      - rgb (bytes/base64)
+      - depth OR point_cloud fallback
+    """
+
     session_id: str
     frame_id: str
-    timestamp: float
-    pose_world_from_camera: Optional[List[float]] = None
-    intrinsics: Optional[Intrinsics] = None
+    timestamp: Optional[float] = None
 
-    rgb_image_base64: Optional[str] = None
+    # RGB image (base64-encoded bytes, jpeg/png)
+    rgb_base64: str
 
-    depth_map_base64: Optional[str] = None
+    # Image size
+    width: int
+    height: int
+
+    # Intrinsics
+    fx: float
+    fy: float
+    cx_px: float
+    cy_px: float
+
+    # Pose: [tx,ty,tz,qx,qy,qz,qw] world_from_camera
+    pose_world_from_camera: List[float]
+
+    # Depth (optional)
+    depth_base64: Optional[str] = None
     depth_scale: float = 1000.0
-    confidence_map_base64: Optional[str] = None
+    confidence_base64: Optional[str] = None
 
-    point_cloud: Optional[List[List[float]]] = None
+    # Point cloud fallback (world coords)
+    point_cloud: List[List[float]] = []
+
+    # Enable / disable vision (2D detector + lifting)
+    enable_vision: bool = True
 
 
 class LockWorldRequest(BaseModel):
@@ -384,141 +411,157 @@ async def start_session(request: SessionStartRequest):
 
 
 @app.post("/session/frame")
-async def session_frame(request: FramePacket):
-    """Ingest one keyframe with strict 2D->3D contract: pose + intrinsics + depth/pointcloud."""
-    session = session_manager.get_session(request.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Сессия не найдена")
+async def ingest_frame_packet(request: FramePacketRequest):
+    """
+    Stage 2: Honest vision integration (2D -> 3D lifting + stable WorldObjects).
 
-    if request.intrinsics is None or request.pose_world_from_camera is None:
-        raise HTTPException(status_code=400, detail="intrinsics и pose_world_from_camera обязательны")
+    - Updates world geometry from depth / point cloud.
+    - Runs optional 2D detector.
+    - Lifts Det2D -> Det3D using intrinsics + pose + depth (or point cloud fallback).
+    - Tracks & fuses into stable world_objects in session.scene_context.
+    """
+    try:
+        session = session_manager.get_session(request.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Сессия не найдена")
 
-    pose = list(request.pose_world_from_camera)
-    if len(pose) != 7:
-        raise HTTPException(status_code=400, detail="pose_world_from_camera должен содержать 7 чисел")
+        # Decode RGB
+        rgb_bytes = base64.b64decode(request.rgb_base64)
 
-    has_depth = bool(request.depth_map_base64)
-    has_point_cloud = bool(request.point_cloud)
-    if not has_depth and not has_point_cloud:
-        raise HTTPException(status_code=400, detail="Нужны depth_map_base64 или point_cloud")
+        # Decode optional depth/conf
+        depth_bytes = base64.b64decode(request.depth_base64) if request.depth_base64 else None
+        conf_bytes = base64.b64decode(request.confidence_base64) if request.confidence_base64 else None
 
-    depth_integrated = False
-    tsdf_integrated = False
-    voxels_added = 0
-    depth_stats = {}
-    degraded_mode = False
-
-    voxel_world = session.scene_context.ensure_voxel_world()
-
-    if has_depth and voxel_world is not None:
-        try:
-            depth_bytes = base64.b64decode(request.depth_map_base64)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Некорректный depth_map_base64")
-
-        confidence_bytes = None
-        if request.confidence_map_base64:
-            try:
-                confidence_bytes = base64.b64decode(request.confidence_map_base64)
-            except Exception:
-                raise HTTPException(status_code=400, detail="Некорректный confidence_map_base64")
-
-        depth_stats = voxel_world.ingest_depth_map(
-            depth_bytes=depth_bytes,
-            width=request.intrinsics.width,
-            height=request.intrinsics.height,
-            fx=request.intrinsics.fx,
-            fy=request.intrinsics.fy,
-            cx_px=request.intrinsics.cx,
-            cy_px=request.intrinsics.cy,
-            camera_pose=pose,
-            depth_scale=request.depth_scale,
-            confidence_bytes=confidence_bytes,
-        )
-        depth_integrated = bool(depth_stats.get("samples", 0.0) > 0)
-
+        # Ensure world models
+        voxel_world = session.scene_context.ensure_voxel_world()
         tsdf = session.scene_context.ensure_tsdf_integrator()
-        if tsdf is not None:
+
+        # Geometry integration
+        geom_stats = {}
+        if voxel_world is not None and depth_bytes is not None:
+            try:
+                normalized_pose = _normalize_camera_pose(request.pose_world_from_camera)
+
+                stats = voxel_world.ingest_depth_map(
+                    depth_bytes=depth_bytes,
+                    width=request.width,
+                    height=request.height,
+                    fx=request.fx,
+                    fy=request.fy,
+                    cx_px=request.cx_px,
+                    cy_px=request.cy_px,
+                    camera_pose=normalized_pose,
+                    depth_scale=request.depth_scale,
+                    confidence_bytes=conf_bytes,
+                    confidence_threshold=1,
+                    pixel_step=4,
+                )
+                geom_stats.update(stats or {})
+                # Coverage/unknown quality metrics (Stage 1)
+                geom_stats.update(voxel_world.get_coverage_metrics())
+            except Exception as e:
+                geom_stats["depth_ingest_error"] = str(e)
+
+        elif voxel_world is not None and request.point_cloud:
+            try:
+                added = voxel_world.add_point_cloud(request.point_cloud)
+                geom_stats["voxels_added"] = int(added)
+                geom_stats["total_voxels"] = int(voxel_world.total_voxels)
+            except Exception as e:
+                geom_stats["point_cloud_ingest_error"] = str(e)
+
+        # TSDF integration for mesh (optional)
+        mesh_info = {}
+        if tsdf is not None and depth_bytes is not None:
             try:
                 import numpy as np
+                from modules.lifter_2d3d import decode_depth_bytes, decode_confidence_bytes
 
-                depth_u16 = np.frombuffer(depth_bytes, dtype=np.uint16).reshape(
-                    request.intrinsics.height, request.intrinsics.width
+                depth_arr = decode_depth_bytes(depth_bytes, request.width, request.height)
+                conf_arr = decode_confidence_bytes(conf_bytes, request.width, request.height) if conf_bytes else None
+                # TSDFIntegrator expects depth in meters and (optionally) confidence weights
+                # Convert to meters for TSDF
+                depth_meters = depth_arr.astype(np.float32) / float(request.depth_scale)
+                tsdf.integrate_depth(
+                    depth_m=depth_meters,
+                    fx=request.fx,
+                    fy=request.fy,
+                    cx=request.cx_px,
+                    cy=request.cy_px,
+                    pose_world_from_camera_7=tuple(_normalize_camera_pose(request.pose_world_from_camera)),
+                    depth_trunc=None,
                 )
-                depth_m = depth_u16.astype(np.float32) / float(request.depth_scale)
-                tsdf_integrated = tsdf.integrate_depth(
-                    depth_m=depth_m,
-                    fx=request.intrinsics.fx,
-                    fy=request.intrinsics.fy,
-                    cx=request.intrinsics.cx,
-                    cy=request.intrinsics.cy,
-                    pose_world_from_camera_7=(
-                        float(pose[0]),
-                        float(pose[1]),
-                        float(pose[2]),
-                        float(pose[3]),
-                        float(pose[4]),
-                        float(pose[5]),
-                        float(pose[6]),
-                    ),
-                )
-            except Exception:
-                tsdf_integrated = False
-    elif has_point_cloud and voxel_world is not None:
-        voxels_added = voxel_world.add_point_cloud(request.point_cloud or [])
-        degraded_mode = True
+                mesh_info["tsdf_integrated"] = True
+            except Exception as e:
+                mesh_info["tsdf_integrated"] = False
+                mesh_info["tsdf_error"] = str(e)
 
-    if has_depth is False and has_point_cloud:
-        degraded_mode = True
+        # Perception pipeline
+        det2d, det3d, world_objects = [], [], []
+        pb = session.scene_context.ensure_perception_backend()
+        if pb is not None:
+            out = pb.process_frame(
+                frame_id=request.frame_id,
+                rgb_bytes=rgb_bytes,
+                width=request.width,
+                height=request.height,
+                fx=request.fx,
+                fy=request.fy,
+                cx=request.cx_px,
+                cy=request.cy_px,
+                pose7=_normalize_camera_pose(request.pose_world_from_camera),
+                depth_bytes=depth_bytes,
+                depth_scale=request.depth_scale,
+                conf_bytes=conf_bytes,
+                point_cloud_world=request.point_cloud if request.point_cloud else None,
+                voxel_world=voxel_world,
+                enable_vision=bool(request.enable_vision),
+            )
+            det2d = out.get("det2d", [])
+            det3d = out.get("det3d", [])
+            world_objects = out.get("world_objects", [])
 
-    quality = voxel_world.get_quality_metrics() if voxel_world is not None else {
-        "coverage_pct": 0.0,
-        "unknown_pct": 1.0,
-    }
-    current_quality = {
-        "coverage_pct": quality.get("coverage_pct", 0.0),
-        "unknown_pct": quality.get("unknown_pct", 1.0),
-        "drift_proxy": 1.0 - quality.get("coverage_pct", 0.0),
-    }
+            # Persist stable objects in scene_context
+            session.scene_context.world_objects = world_objects
+            # For legacy/debug: keep raw 3D dets in all_detected_objects
+            session.scene_context.all_detected_objects.extend(det3d)
 
-    frame_metrics = {
-        "frame_id": request.frame_id,
-        "depth_integrated": depth_integrated,
-        "depth_stats": depth_stats,
-        "tsdf_integrated": tsdf_integrated,
-        "degraded_mode": degraded_mode,
-        "point_cloud_voxels_added": voxels_added,
-        "point_cloud": request.point_cloud or [],
-    }
+        # Save a CameraFrame in history
+        frame = CameraFrame(
+            timestamp=request.timestamp or time.time(),
+            image_data=request.rgb_base64,
+            camera_position=[],
+            ar_points=[],
+            quality_metrics={
+                "geometry": geom_stats,
+                "mesh": mesh_info,
+            },
+            detected_objects=det3d,
+        )
+        session.add_frame(frame)
+        session_manager.auto_save_session(request.session_id)
 
-    frame = CameraFrame(
-        timestamp=request.timestamp,
-        image_data=request.rgb_image_base64 or "",
-        camera_position=pose,
-        quality_metrics=frame_metrics,
-        detected_objects=[],
-    )
-    session.add_frame(frame)
+        return {
+            "status": "processed",
+            "session_id": request.session_id,
+            "frame_id": request.frame_id,
+            "current_quality": {
+                "coverage": geom_stats.get("coverage", None),
+                "unknown_ratio": geom_stats.get("unknown_ratio", None),
+            },
+            "det2d": det2d,
+            "det3d": det3d,
+            "world_objects": world_objects,
+            "geometry_stats": geom_stats,
+            "mesh_info": mesh_info,
+        }
 
-    for obj in session.scene_context.all_detected_objects:
-        observed = obj.setdefault("observed_frames", [])
-        if request.frame_id not in observed:
-            observed.append(request.frame_id)
-
-    session_manager.auto_save_session(request.session_id)
-
-    return {
-        "status": "processed",
-        "session_id": request.session_id,
-        "frame_id": request.frame_id,
-        "degraded_mode": degraded_mode,
-        "current_quality": current_quality,
-        "areas_to_scan_next": [
-            "scan_unknown_regions_front",
-            "capture_oblique_view",
-        ],
-        "preview": None,
-    }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/session/frame error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/session/lock_world")
