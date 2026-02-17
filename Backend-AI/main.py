@@ -10,7 +10,7 @@ Main FastAPI Server - AI Brain Backend
 ✓ BuilderFixed - генератор с валидацией
 ✓ SessionManager - контекст всей сцены
 """
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response
 from pydantic import BaseModel
@@ -19,6 +19,7 @@ import base64
 import time
 import traceback
 import json
+import logging
 
 # Импорты исправленных модулей
 from modules.layher_standards import (
@@ -34,6 +35,9 @@ from modules.voxel_world import VoxelCollisionSolver
 from modules.builder import ScaffoldGenerator
 from modules.session_manager import CameraFrame
 from modules.session import SessionManager
+from modules.monitoring import request_logger, performance_monitor
+from modules.cache_manager import global_cache
+from modules.validators import SessionUpdateAction, validate_session_exists, validate_structure_stability
 
 # ── Новые модули v3.0 ───────────────────────────────────────────────────────
 try:
@@ -62,6 +66,45 @@ app = FastAPI(
     version="4.0.0",
     description="Генеративный инжиниринг строительных лесов с Layher стандартами"
 )
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("ai_brain.log"), logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Логировать HTTP запросы и время ответа."""
+    start_time = time.time()
+    session_id = request.path_params.get("session_id") if hasattr(request, "path_params") else None
+
+    try:
+        response = await call_next(request)
+        duration = time.time() - start_time
+        request_logger.log_request(
+            method=request.method,
+            path=request.url.path,
+            duration=duration,
+            status_code=response.status_code,
+            session_id=session_id,
+        )
+        response.headers["X-Process-Time"] = f"{duration:.4f}"
+        return response
+    except Exception as exc:
+        duration = time.time() - start_time
+        request_logger.log_request(
+            method=request.method,
+            path=request.url.path,
+            duration=duration,
+            status_code=500,
+            session_id=session_id,
+            error=str(exc),
+        )
+        raise
 
 # CORS для Android приложения
 app.add_middleware(
@@ -1192,51 +1235,48 @@ async def finalize_model(session_id: str):
 
 
 @app.post("/session/update/{session_id}")
-async def update_structure_realtime(session_id: str, action: Dict[str, Any]):
+async def update_structure_realtime(session_id: str, action: SessionUpdateAction):
     start_time = time.time()
-    session = session_manager.get_session(session_id)
-    if not session:
+    if not validate_session_exists(session_id, session_manager):
         raise HTTPException(status_code=404, detail="Session not found")
+
+    session = session_manager.get_session(session_id)
     if not session.current_structure:
         raise HTTPException(status_code=400, detail="No structure to update")
 
-    act = action.get("action")
-    if act == "REMOVE":
-        element_id = action.get("element_id")
-        if not element_id:
-            raise HTTPException(status_code=400, detail="element_id required")
-        if not session.remove_element(element_id):
+    if action.action == "REMOVE":
+        if not session.remove_element(action.element_id):
             raise HTTPException(status_code=404, detail="Element not found")
-    elif act == "ADD":
-        element_data = action.get("element_data")
-        if not element_data:
-            raise HTTPException(status_code=400, detail="element_data required")
-        session.add_element(element_data)
     else:
-        raise HTTPException(status_code=400, detail="Invalid action")
+        session.add_element(action.element_data.model_dump())
 
     phys_nodes = []
     phys_beams = []
     seen_nodes = set()
     for el in session.current_structure:
-        for p in [el.get("start"), el.get("end")]:
-            if not p:
+        for point in [el.get("start"), el.get("end")]:
+            if not point:
                 continue
-            k = f"{p.get('x', 0):.2f}_{p.get('y', 0):.2f}_{p.get('z', 0):.2f}"
-            if k not in seen_nodes:
-                phys_nodes.append({"id": k, "x": p.get("x", 0), "y": p.get("y", 0), "z": p.get("z", 0), "fixed": abs(p.get("z", 0)) < 0.1})
-                seen_nodes.add(k)
-        s = el.get("start", {})
-        e = el.get("end", {})
+            node_key = f"{point.get('x', 0):.2f}_{point.get('y', 0):.2f}_{point.get('z', 0):.2f}"
+            if node_key not in seen_nodes:
+                phys_nodes.append({
+                    "id": node_key,
+                    "x": point.get("x", 0),
+                    "y": point.get("y", 0),
+                    "z": point.get("z", 0),
+                    "fixed": abs(point.get("z", 0)) < 0.1,
+                })
+                seen_nodes.add(node_key)
+        start_point = el.get("start", {})
+        end_point = el.get("end", {})
         phys_beams.append({
             "id": el.get("id"),
             "type": el.get("type"),
-            "start": f"{s.get('x', 0):.2f}_{s.get('y', 0):.2f}_{s.get('z', 0):.2f}",
-            "end": f"{e.get('x', 0):.2f}_{e.get('y', 0):.2f}_{e.get('z', 0):.2f}",
+            "start": f"{start_point.get('x', 0):.2f}_{start_point.get('y', 0):.2f}_{start_point.get('z', 0):.2f}",
+            "end": f"{end_point.get('x', 0):.2f}_{end_point.get('y', 0):.2f}_{end_point.get('z', 0):.2f}",
             "length": el.get("length", 0),
         })
 
-    # Graph Integrity: убираем компоненты, оторванные от фиксированных (земля) узлов.
     collapsed_nodes = []
     collapsed_elements = []
     graph = session.ensure_structural_graph()
@@ -1249,32 +1289,34 @@ async def update_structure_realtime(session_id: str, action: Dict[str, Any]):
         if collapsed_elements:
             collapsed_set = set(collapsed_elements)
             session.current_structure = [
-                el for el in session.current_structure if el.get("id") not in collapsed_set
+                element for element in session.current_structure if element.get("id") not in collapsed_set
             ]
             phys_beams = [beam for beam in phys_beams if beam.get("id") not in collapsed_set]
             nodes_in_use = {beam["start"] for beam in phys_beams} | {beam["end"] for beam in phys_beams}
             phys_nodes = [node for node in phys_nodes if node.get("id") in nodes_in_use]
 
+    validation = validate_structure_stability(session.current_structure)
+    if not validation["is_valid"]:
+        logger.warning("Structure validation failed: %s", validation["errors"])
+
     physics_res = physics_engine.calculate_load_map(phys_nodes, phys_beams)
-    if isinstance(physics_res, dict):
-        physics_status = physics_res.get("status", "COLLAPSE")
-        physics_data = physics_res.get("data", [])
-    else:
-        physics_status = getattr(physics_res, "status", "COLLAPSE")
-        physics_data = getattr(physics_res, "beam_loads", [])
+    physics_status = physics_res.get("status", "COLLAPSE")
+    physics_data = physics_res.get("data", [])
 
     by_id = {item.get("id"): item for item in physics_data}
     affected = []
-    for el in session.current_structure:
-        phys_item = by_id.get(el.get("id"))
+    for element in session.current_structure:
+        phys_item = by_id.get(element.get("id"))
         if phys_item:
-            old_ratio = el.get("load_ratio", 0)
+            old_ratio = element.get("load_ratio", 0)
             new_ratio = phys_item.get("load_ratio", 0)
-            el["load_ratio"] = new_ratio
-            el["stress_color"] = phys_item.get("color", "green")
+            element["load_ratio"] = new_ratio
+            element["stress_color"] = phys_item.get("color", "green")
             if abs(new_ratio - old_ratio) > 0.1:
-                affected.append(el.get("id"))
+                affected.append(element.get("id"))
 
+    if hasattr(physics_engine, "invalidate_cache"):
+        physics_engine.invalidate_cache()
     session_manager.auto_save_session(session_id)
 
     return {
@@ -1287,6 +1329,7 @@ async def update_structure_realtime(session_id: str, action: Dict[str, Any]):
             "nodes": collapsed_nodes,
             "elements": collapsed_elements,
         },
+        "validation": validation,
         "processing_time_ms": int((time.time() - start_time) * 1000),
     }
 
@@ -1440,6 +1483,19 @@ async def get_debug_dump(session_id: str, include_voxels: bool = False):
 async def list_debug_dumps(session_id: Optional[str] = None):
     dumps = debug_dumper.list_dumps(session_id)
     return {"total": len(dumps), "dumps": dumps}
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """Метрики производительности, запросов и кэша."""
+    return {
+        "performance": performance_monitor.get_stats(),
+        "requests": {
+            "recent": request_logger.get_recent_requests(limit=20),
+            "errors": request_logger.get_error_requests(limit=10),
+        },
+        "cache": global_cache.get_stats(),
+    }
 
 
 @app.websocket("/ws/{session_id}")
