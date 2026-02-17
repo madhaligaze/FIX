@@ -13,14 +13,14 @@ import math
 from typing import List, Dict, Optional, Any
 import copy
 
-from core.layher_standards import (
+from modules.layher_standards import (
     LayherStandards, 
     BillOfMaterials, 
     ComponentType,
     snap_to_layher_grid,
     validate_scaffold_dimensions
 )
-from core.collision_solver import CollisionSolver, Obstacle
+from modules.voxel_world import VoxelCollisionSolver, Obstacle
 
 try:
     from modules.voxel_world import VoxelWorld
@@ -66,7 +66,7 @@ class ScaffoldGenerator:
             },
         ]
         
-        self.collision_solver = CollisionSolver(clearance=0.15)
+        self.collision_solver = VoxelCollisionSolver(clearance=0.15)
         self._voxel_world: Optional[Any] = None
         self._pathfinder: Optional[Any] = None
         

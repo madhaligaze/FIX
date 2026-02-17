@@ -8,11 +8,11 @@ from typing import Dict, List, Optional, Tuple
 try:
     from modules.voxel_world import VoxelWorld
     from modules.astar_pathfinder import ScaffoldPathfinder
-    from core.layher_standards import snap_to_layher_grid
+    from modules.layher_standards import snap_to_layher_grid
 except ImportError:
     from voxel_world import VoxelWorld
     from astar_pathfinder import ScaffoldPathfinder
-    from core.layher_standards import snap_to_layher_grid
+    from modules.layher_standards import snap_to_layher_grid
 
 
 class AutoScaffolder:

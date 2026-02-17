@@ -21,18 +21,20 @@ import traceback
 import json
 
 # Импорты исправленных модулей
-from core.layher_standards import (
-    LayherStandards, 
+from modules.layher_standards import (
+    LayherStandards,
     BillOfMaterials,
-    validate_scaffold_dimensions,
-    snap_to_layher_grid
 )
-from core.physics_enhanced import StructuralBrain, quick_safety_check
-from core.collision_solver import CollisionSolver
+from modules.geometry import (
+    validate_dimensions,
+    snap_to_grid,
+)
+from modules.physics import PhysicsEngine, quick_safety_check
+from modules.voxel_world import VoxelCollisionSolver
 from modules.builder import ScaffoldGenerator
-from core.session_manager import (
-    CameraFrame, 
-    session_manager
+from modules.session_manager import (
+    CameraFrame,
+    session_manager,
 )
 
 # ── Новые модули v3.0 ───────────────────────────────────────────────────────
@@ -74,8 +76,8 @@ app.add_middleware(
 
 # Инициализация компонентов
 scaffold_generator = ScaffoldGenerator()
-physics_brain = StructuralBrain()
-collision_solver = CollisionSolver(clearance=0.15)
+physics_engine = PhysicsEngine()
+collision_solver = VoxelCollisionSolver(clearance=0.15)
 
 
 # v4.0 components
@@ -404,7 +406,7 @@ async def generate_variants(request: GenerateRequest):
             )
 
             # Физический анализ
-            analysis = physics_brain.calculate_load_map(
+            analysis = physics_engine.calculate_load_map(
                 variant['nodes'], variant['beams']
             )
             variant['physics_analysis'] = {
@@ -440,13 +442,13 @@ async def generate_variants(request: GenerateRequest):
         # ────────────────────────────────────────────────────────────────────
         
         # Приводим размеры к стандартам
-        target_w = snap_to_layher_grid(
+        target_w = snap_to_grid(
             request.target_dimensions.get('width', 4.0), "ledger"
         )
-        target_h = snap_to_layher_grid(
+        target_h = snap_to_grid(
             request.target_dimensions.get('height', 3.0), "standard"
         )
-        target_d = snap_to_layher_grid(
+        target_d = snap_to_grid(
             request.target_dimensions.get('depth', 2.0), "ledger"
         )
         
@@ -475,7 +477,7 @@ async def generate_variants(request: GenerateRequest):
             
             # Closed Loop оптимизация (если включена)
             if request.optimize_structure:
-                optimization_result = physics_brain.optimize_structure_closed_loop(
+                optimization_result = physics_engine.optimize_structure_closed_loop(
                     variant['nodes'],
                     variant['beams'],
                     target_safety=0.85
@@ -492,7 +494,7 @@ async def generate_variants(request: GenerateRequest):
                 }
             
             # Физический анализ
-            analysis = physics_brain.calculate_load_map(
+            analysis = physics_engine.calculate_load_map(
                 variant['nodes'],
                 variant['beams']
             )
@@ -505,7 +507,7 @@ async def generate_variants(request: GenerateRequest):
             }
             
             # Валидация размеров
-            errors = validate_scaffold_dimensions(variant['nodes'], variant['beams'])
+            errors = validate_dimensions(variant['nodes'], variant['beams'])
             variant['validation_errors'] = errors
             
             optimized_variants.append(variant)
@@ -536,7 +538,7 @@ async def analyze_physics(request: AnalyzeRequest):
     """
     try:
         # Базовый анализ
-        analysis = physics_brain.calculate_load_map(
+        analysis = physics_engine.calculate_load_map(
             request.nodes,
             request.beams,
             fixed_node_ids=set(request.fixed_node_ids or [])
@@ -553,7 +555,7 @@ async def analyze_physics(request: AnalyzeRequest):
         
         # Автоматическая оптимизация если критично
         if request.optimize_if_critical and analysis.needs_optimization():
-            optimization = physics_brain.optimize_structure_closed_loop(
+            optimization = physics_engine.optimize_structure_closed_loop(
                 request.nodes,
                 request.beams,
                 fixed_node_ids=set(request.fixed_node_ids or [])
@@ -769,7 +771,7 @@ async def generate_auto_scaffold(request: AutoScaffoldRequest):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    analysis = physics_brain.calculate_load_map(variant["nodes"], variant["beams"])
+    analysis = physics_engine.calculate_load_map(variant["nodes"], variant["beams"])
     variant["physics_analysis"] = {
         "status": analysis.status,
         "max_load_ratio": analysis.max_load_ratio,
@@ -827,7 +829,7 @@ async def modify_structure(request: StructureModifyRequest):
     full_analysis = None
     if not result.get("is_stable") and session.generated_variants:
         try:
-            full_analysis = physics_brain.calculate_load_map(graph.get_nodes(), graph.get_beams())
+            full_analysis = physics_engine.calculate_load_map(graph.get_nodes(), graph.get_beams())
         except Exception:
             pass
 
@@ -967,7 +969,7 @@ async def finalize_model(session_id: str):
                     }
                 )
 
-            physics_res = physics_brain.calculate_load_map(phys_nodes, phys_beams)
+            physics_res = physics_engine.calculate_load_map(phys_nodes, phys_beams)
 
             if isinstance(physics_res, dict):
                 physics_status = physics_res.get("status", "COLLAPSE")
@@ -1142,7 +1144,7 @@ async def update_structure_realtime(session_id: str, action: Dict[str, Any]):
             nodes_in_use = {beam["start"] for beam in phys_beams} | {beam["end"] for beam in phys_beams}
             phys_nodes = [node for node in phys_nodes if node.get("id") in nodes_in_use]
 
-    physics_res = physics_brain.calculate_load_map(phys_nodes, phys_beams)
+    physics_res = physics_engine.calculate_load_map(phys_nodes, phys_beams)
     if isinstance(physics_res, dict):
         physics_status = physics_res.get("status", "COLLAPSE")
         physics_data = physics_res.get("data", [])
@@ -1175,6 +1177,63 @@ async def update_structure_realtime(session_id: str, action: Dict[str, Any]):
             "elements": collapsed_elements,
         },
         "processing_time_ms": int((time.time() - start_time) * 1000),
+    }
+
+
+@app.post("/session/preview_remove/{session_id}")
+async def preview_remove(session_id: str, element_id: str):
+    """Preview structural impact of an element removal without mutating structure."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    graph = session.ensure_structural_graph()
+    if graph is None:
+        return {"is_critical": False, "would_collapse_count": 0}
+
+    phys_nodes = []
+    phys_beams = []
+    seen_nodes = set()
+
+    for el in session.current_structure:
+        for p in [el.get("start"), el.get("end")]:
+            if not p:
+                continue
+            k = f"{p.get('x', 0):.2f}_{p.get('y', 0):.2f}_{p.get('z', 0):.2f}"
+            if k not in seen_nodes:
+                phys_nodes.append({
+                    "id": k,
+                    "x": p.get("x", 0),
+                    "y": p.get("y", 0),
+                    "z": p.get("z", 0),
+                    "fixed": abs(p.get("z", 0)) < 0.1,
+                })
+                seen_nodes.add(k)
+
+        s = el.get("start", {})
+        e = el.get("end", {})
+        phys_beams.append({
+            "id": el.get("id"),
+            "type": el.get("type"),
+            "start": f"{s.get('x', 0):.2f}_{s.get('y', 0):.2f}_{s.get('z', 0):.2f}",
+            "end": f"{e.get('x', 0):.2f}_{e.get('y', 0):.2f}_{e.get('z', 0):.2f}",
+            "length": el.get("length", 0),
+        })
+
+    graph.load_from_variant({"nodes": phys_nodes, "beams": phys_beams})
+    criticality = graph.check_element_criticality(element_id)
+
+    return {
+        "status": "PREVIEW",
+        "element_id": element_id,
+        "is_critical": criticality["is_critical"],
+        "would_collapse": criticality["affected_beams"],
+        "collapse_count": criticality["would_collapse_count"],
+        "warning": (
+            f"⚠️ Удаление этого элемента приведет к обрушению {criticality['would_collapse_count']} элементов!"
+            if criticality["is_critical"]
+            else "✅ Этот элемент можно безопасно удалить."
+        ),
     }
 
 

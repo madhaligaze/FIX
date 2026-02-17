@@ -40,7 +40,7 @@ try:
 except Exception:
     PANDAS_AVAILABLE = False
 
-from core.layher_standards import BillOfMaterials, LayherStandards
+from modules.layher_standards import BillOfMaterials, LayherStandards
 
 
 class BOMExporter:
