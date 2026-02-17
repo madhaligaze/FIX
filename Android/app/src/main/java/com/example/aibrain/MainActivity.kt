@@ -20,8 +20,8 @@ import com.google.ar.core.TrackingState
 import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.Node
 import com.google.ar.sceneform.math.Vector3
-import com.google.ar.sceneform.rendering.MaterialFactory
-import com.google.ar.sceneform.rendering.ShapeFactory
+import com.example.aibrain.scene.PhysicsAnimator
+import com.example.aibrain.scene.SceneBuilder
 import io.github.sceneview.ar.ArSceneView
 import kotlinx.coroutines.*
 import retrofit2.Retrofit
@@ -142,6 +142,8 @@ class MainActivity : AppCompatActivity() {
     private var selectedVariantIndex = 0
     private var show3DPreview = false
     private val modelNodes = mutableListOf<Node>()
+    private lateinit var sceneBuilder: SceneBuilder
+    private lateinit var physicsAnimator: PhysicsAnimator
 
     // ══════════════════════════════════════════════════════════════════════
     // СОСТОЯНИЕ - AR RULER
@@ -170,6 +172,9 @@ class MainActivity : AppCompatActivity() {
         setupARScene()
         setupClickListeners()
         initializeRuler()
+        sceneBuilder = SceneBuilder(sceneView.scene)
+        sceneBuilder.preloadModels()
+        physicsAnimator = PhysicsAnimator(sceneView, sceneBuilder)
 
         transitionTo(AppState.IDLE)
     }
@@ -300,6 +305,9 @@ class MainActivity : AppCompatActivity() {
 
         if (::arRuler.isInitialized) {
             arRuler.clearAll()
+        }
+        if (::physicsAnimator.isInitialized) {
+            physicsAnimator.stopAll()
         }
     }
 
@@ -791,10 +799,61 @@ class MainActivity : AppCompatActivity() {
     private fun stopStreaming() { /* ... */ }
     private suspend fun doRequestModeling() { /* ... */ }
     private fun placeAnchor() { /* ... */ }
-    private fun request3DReconstruction() { /* ... */ }
-    private fun hide3DPreview() { /* ... */ }
-    private fun visualizeScaffoldVariant(index: Int) { /* ... */ }
-    private fun showPhysicsHeatmap() { /* ... */ }
-    private fun showFinalResults(option: ScaffoldOption) { /* ... */ }
-    private fun clearARAnchors() { /* ... */ }
+    private fun request3DReconstruction() {
+        val option = current3DModel?.options?.getOrNull(selectedVariantIndex)
+        val elements = option?.elements.orEmpty().ifEmpty { option?.full_structure.orEmpty() }
+
+        if (elements.isEmpty()) {
+            showHint("⚠️ Пока нет элементов для 3D превью")
+            return
+        }
+
+        sceneBuilder.buildScene(elements)
+        transitionTo(AppState.PREVIEW_3D)
+        showHint("✓ Построено элементов: ${elements.size}")
+    }
+
+    private fun hide3DPreview() {
+        sceneBuilder.clearScene()
+        show3DPreview = false
+        showHint("👁️ Превью скрыто")
+    }
+
+    private fun visualizeScaffoldVariant(index: Int) {
+        val option = current3DModel?.options?.getOrNull(index) ?: return
+        val elements = option.elements.orEmpty().ifEmpty { option.full_structure.orEmpty() }
+        if (elements.isNotEmpty()) {
+            sceneBuilder.buildScene(elements)
+        }
+    }
+
+    private fun showPhysicsHeatmap() {
+        val option = current3DModel?.options?.getOrNull(selectedVariantIndex)
+        val elements = option?.elements.orEmpty().ifEmpty { option?.full_structure.orEmpty() }
+        if (elements.isEmpty()) {
+            showHint("⚠️ Нет данных physics для отображения")
+            return
+        }
+
+        val heatmap = elements.map {
+            mapOf(
+                "id" to it.id,
+                "color" to (it.stress_color ?: "gray")
+            )
+        }
+        sceneBuilder.updateColors(heatmap)
+        showHint("📊 Карта нагрузок обновлена")
+    }
+
+    private fun showFinalResults(option: ScaffoldOption) {
+        val score = option.safety_score
+        val status = option.physics?.status ?: "UNKNOWN"
+        showHint("🏁 Готово: safety $score%, physics=$status")
+    }
+
+    private fun clearARAnchors() {
+        anchorNodes.forEach { it.anchor?.detach(); it.setParent(null) }
+        anchorNodes.clear()
+        sceneBuilder.clearScene()
+    }
 }
