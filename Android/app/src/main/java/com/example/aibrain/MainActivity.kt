@@ -2,9 +2,13 @@ package com.example.aibrain
 
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
+import android.content.Context
 import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.os.Looper
 import android.view.Menu
 import android.view.MenuItem
@@ -15,6 +19,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
@@ -24,9 +29,11 @@ import com.google.ar.core.TrackingState
 import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.Node
 import com.google.ar.sceneform.math.Vector3
+import com.google.ar.sceneform.rendering.Color as SceneColor
 import com.example.aibrain.scene.PhysicsAnimator
 import com.example.aibrain.scene.SceneBuilder
 import io.github.sceneview.ar.ArSceneView
+import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.*
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
@@ -149,6 +156,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sceneBuilder: SceneBuilder
     private lateinit var physicsAnimator: PhysicsAnimator
     private lateinit var viewModel: StructureViewModel
+    private lateinit var soundManager: SoundManager
+    private lateinit var modeIndicator: LinearLayout
+    private lateinit var modeIcon: TextView
+    private lateinit var modeText: TextView
+    private lateinit var btnUndo: Button
+    private lateinit var btnRedo: Button
 
     // ══════════════════════════════════════════════════════════════════════
     // СОСТОЯНИЕ - AR RULER
@@ -181,12 +194,32 @@ class MainActivity : AppCompatActivity() {
         sceneBuilder.preloadModels()
         physicsAnimator = PhysicsAnimator(sceneView, sceneBuilder)
         viewModel = StructureViewModel(api)
+        soundManager = SoundManager(this)
 
         scope.launch {
             viewModel.structureState.collect { state ->
                 handleStructureState(state)
             }
         }
+
+
+        scope.launch {
+            viewModel.editMode.collect { mode ->
+                updateModeUI(mode)
+            }
+        }
+
+        btnUndo.setOnClickListener { performUndo() }
+        btnRedo.setOnClickListener { performRedo() }
+
+        scope.launch {
+            while (isActive) {
+                updateUndoRedoButtons()
+                delay(100)
+            }
+        }
+
+        viewModel.saveSnapshot(sceneBuilder.getAllElements(), "Исходное состояние")
 
         transitionTo(AppState.IDLE)
     }
@@ -225,6 +258,11 @@ class MainActivity : AppCompatActivity() {
         // Панели
         controlPanel = findViewById(R.id.control_panel)
         variantPanel = findViewById(R.id.variant_panel)
+        modeIndicator = findViewById(R.id.mode_indicator)
+        modeIcon = findViewById(R.id.mode_icon)
+        modeText = findViewById(R.id.mode_text)
+        btnUndo = findViewById(R.id.btn_undo)
+        btnRedo = findViewById(R.id.btn_redo)
 
         // AR Ruler элементы
         rulerOverlay = findViewById(R.id.ruler_overlay)
@@ -320,6 +358,9 @@ class MainActivity : AppCompatActivity() {
         }
         if (::physicsAnimator.isInitialized) {
             physicsAnimator.stopAll()
+        }
+        if (::soundManager.isInitialized) {
+            soundManager.release()
         }
     }
 
@@ -838,6 +879,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         sceneBuilder.buildScene(elements)
+        viewModel.saveSnapshot(elements, "Построена структура")
         transitionTo(AppState.PREVIEW_3D)
         showHint("✓ Построено элементов: ${elements.size}")
     }
@@ -853,6 +895,7 @@ class MainActivity : AppCompatActivity() {
         val elements = option.elements.orEmpty().ifEmpty { option.full_structure.orEmpty() }
         if (elements.isNotEmpty()) {
             sceneBuilder.buildScene(elements)
+            viewModel.saveSnapshot(elements, "Выбран вариант ${index + 1}")
         }
     }
 
@@ -902,6 +945,7 @@ class MainActivity : AppCompatActivity() {
 
         if (viewModel.editMode.value == EditMode.SIMULATION) {
             if (response.collapsed.elements.isNotEmpty()) {
+                soundManager.play(SoundType.COLLAPSE)
                 physicsAnimator.animateFall(response.collapsed.elements)
                 showCollapsedNotification(response.collapsed.elements.size)
 
@@ -937,9 +981,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun removeElementWithAnimation(elementId: String) {
+        viewModel.saveSnapshot(sceneBuilder.getAllElements(), "Удален $elementId")
+        soundManager.play(SoundType.REMOVE)
         viewModel.removeElement(
             elementId = elementId,
-            onSuccess = { },
+            onSuccess = { response ->
+                val removedIds = response.collapsed.elements.toSet() + elementId
+                val nextElements = sceneBuilder.getAllElements().filterNot { it.id in removedIds }
+                viewModel.saveSnapshot(nextElements, "Удален $elementId")
+            },
             onError = { error ->
                 runOnUiThread { showError("Не удалось удалить элемент: $error") }
             }
@@ -956,24 +1006,123 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showWarning(message: String) {
+        Snackbar.make(findViewById(android.R.id.content), message, Snackbar.LENGTH_LONG)
+            .setBackgroundTint(getColor(android.R.color.holo_orange_dark))
+            .setTextColor(getColor(android.R.color.white))
+            .show()
         showHint(message)
     }
 
     private fun highlightWouldCollapse(elementIds: List<String>) {
         showHint("⚠️ Могут упасть элементы: ${elementIds.size}")
+        elementIds.forEach { id ->
+            sceneBuilder.findNodeById(id)?.let { node ->
+                animateBlink(node, SceneColor(android.graphics.Color.RED))
+            }
+        }
+    }
+
+    private fun animateBlink(node: Node, color: SceneColor) {
+        val animator = ValueAnimator.ofFloat(0f, 1f)
+        animator.duration = 500
+        animator.repeatCount = 3
+        animator.repeatMode = ValueAnimator.REVERSE
+        animator.addUpdateListener {
+            val alpha = it.animatedValue as Float
+            node.localScale = Vector3.one().scaled(1f + alpha * 0.05f)
+        }
+        animator.start()
     }
 
     private fun showCollapsedNotification(count: Int) {
-        Toast.makeText(this, "Упало элементов: $count", Toast.LENGTH_SHORT).show()
+        val message = when {
+            count == 1 -> "💥 1 элемент обрушился!"
+            count < 5 -> "💥 $count элемента обрушились!"
+            else -> "💥 $count элементов обрушились!"
+        }
+        Snackbar.make(findViewById(android.R.id.content), message, Snackbar.LENGTH_SHORT)
+            .setBackgroundTint(getColor(android.R.color.holo_red_dark))
+            .setTextColor(getColor(android.R.color.white))
+            .show()
+
+        val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator.vibrate(300)
+        }
     }
 
     private fun showConfirmDialog(title: String, message: String, onConfirm: () -> Unit) {
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        AlertDialog.Builder(this)
             .setTitle(title)
             .setMessage(message)
             .setPositiveButton("Удалить") { _, _ -> onConfirm() }
             .setNegativeButton("Отмена", null)
+            .setIcon(android.R.drawable.ic_dialog_alert)
             .show()
+    }
+
+    private fun updateModeUI(mode: EditMode) {
+        when (mode) {
+            EditMode.EDIT -> {
+                modeIndicator.setBackgroundResource(R.drawable.mode_edit_bg)
+                modeIcon.text = "✏️"
+                modeText.text = "Режим редактирования"
+                tvModeStatus.text = "MODE: EDIT"
+                physicsAnimator.stopAll()
+            }
+            EditMode.SIMULATION -> {
+                modeIndicator.setBackgroundResource(R.drawable.mode_simulation_bg)
+                modeIcon.text = "⚡"
+                modeText.text = "Режим симуляции"
+                tvModeStatus.text = "MODE: SIMULATION"
+                checkStructureStability()
+            }
+        }
+    }
+
+    private fun checkStructureStability() {
+        viewModel.removeElement(
+            elementId = "__CHECK_ONLY__",
+            onSuccess = { response ->
+                if (response.collapsed.elements.isNotEmpty()) {
+                    showWarning(
+                        "⚠️ Обнаружено ${response.collapsed.elements.size} висящих элементов!\nОни будут удалены при первом изменении."
+                    )
+                    highlightWouldCollapse(response.collapsed.elements)
+                }
+            },
+            onError = { }
+        )
+    }
+
+    private fun updateUndoRedoButtons() {
+        btnUndo.isEnabled = viewModel.canUndo()
+        btnRedo.isEnabled = viewModel.canRedo()
+        if (viewModel.canUndo()) {
+            val description = viewModel.getUndoDescription()
+            btnUndo.tooltipText = "Отменить: $description"
+        }
+    }
+
+    private fun performUndo() {
+        viewModel.undo { snapshot ->
+            sceneBuilder.buildScene(snapshot.elements)
+            showToast("↶ Отменено: ${snapshot.description}")
+        }
+    }
+
+    private fun performRedo() {
+        viewModel.redo { snapshot ->
+            sceneBuilder.buildScene(snapshot.elements)
+            showToast("↷ Повторено: ${snapshot.description}")
+        }
+    }
+
+    private fun showToast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {

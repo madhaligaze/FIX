@@ -69,6 +69,7 @@ class SceneBuilder(private val scene: Scene) {
         sceneNodes.forEach { it.setParent(null) }
         sceneNodes.clear()
         elementNodes.clear()
+        allElements.clear()
     }
 
     fun getAllElements(): List<ScaffoldElement> = allElements.toList()
@@ -95,6 +96,7 @@ class SceneBuilder(private val scene: Scene) {
             node.parent = null
             elementNodes.remove(elementId)
             sceneNodes.remove(node)
+            allElements.removeAll { it.id == elementId }
         }
     }
 
