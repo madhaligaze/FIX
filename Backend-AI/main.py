@@ -85,6 +85,9 @@ bom_exporter = BOMExporter()
 scaffold_inspector = ScaffoldInspector()
 debug_dumper = DebugDumper()
 
+# Session persistence: восстанавливаем сессии после рестарта процесса
+session_manager.restore_sessions()
+
 
 def _normalize_camera_pose(camera_pose: Optional[List[float]]) -> List[float]:
     """Нормализация camera_pose до формата [tx,ty,tz,qx,qy,qz,qw]."""
@@ -1049,6 +1052,7 @@ async def finalize_model(session_id: str):
 
     # v4.0: сохраняем структуру и обогащаем ответ mesh/inspection
     session.save_structure(final_options[0]["elements"])
+    session_manager.auto_save_session(session_id)
 
     mesh = mesh_builder.build_from_elements(final_options[0]["elements"])
     final_options[0]["mesh"] = {
@@ -1162,6 +1166,8 @@ async def update_structure_realtime(session_id: str, action: Dict[str, Any]):
             el["stress_color"] = phys_item.get("color", "green")
             if abs(new_ratio - old_ratio) > 0.1:
                 affected.append(el.get("id"))
+
+    session_manager.auto_save_session(session_id)
 
     return {
         "status": "UPDATED",
