@@ -58,6 +58,17 @@ from modules.exporter import BOMExporter
 from modules.inspector import ScaffoldInspector
 from modules.debug_dumper import DebugDumper
 
+# ── Stage 5/6: self-critique + active scanning ─────────────────────────────
+try:
+    from modules.reprojection_check import run_reprojection_check
+    from modules.active_scanning import propose_views
+
+    VALIDATION_AVAILABLE = True
+except Exception:
+    run_reprojection_check = None
+    propose_views = None
+    VALIDATION_AVAILABLE = False
+
 # ═══════════════════════════════════════════════════════════════════════════
 # FASTAPI APP
 # ═══════════════════════════════════════════════════════════════════════════
@@ -369,6 +380,14 @@ class FramePacketRequest(BaseModel):
 class LockWorldRequest(BaseModel):
     session_id: str
 
+class ScanPlanRequest(BaseModel):
+    """Запрос плана активного досканирования (Stage 6)."""
+
+    session_id: str
+    max_views: int = 3
+    distance_m: float = 1.6
+
+
 class StructureModifyRequest(BaseModel):
     """Интерактивное изменение конструкции (удалить/добавить элемент)"""
 
@@ -533,39 +552,42 @@ async def ingest_frame_packet(request: FramePacketRequest):
                 mesh_info["tsdf_integrated"] = False
                 mesh_info["tsdf_error"] = str(e)
 
-        # Stage 5: reprojection consistency (safety check vs current voxel model)
-        reprojection_report = None
-        reprojection_suggestions = []
-        if voxel_world is not None and depth_bytes is not None:
+        # --- Stage 5: Reprojection self-critique (depth vs model) ---
+        reprojection = {}
+        scan_suggestions = []
+        if depth_bytes is not None and VALIDATION_AVAILABLE and run_reprojection_check is not None:
             try:
-                import numpy as np
-                from modules.lifter_2d3d import decode_depth_bytes
-                from modules.reprojection_check import check_reprojection
-
-                depth_arr = decode_depth_bytes(depth_bytes, request.width, request.height)
-                depth_meters = depth_arr.astype(np.float32) / float(request.depth_scale)
-                rep = check_reprojection(
+                r = run_reprojection_check(
                     voxel_world=voxel_world,
-                    depth_m=depth_meters,
-                    width=request.width,
-                    height=request.height,
-                    fx=request.fx,
-                    fy=request.fy,
-                    cx=request.cx_px,
-                    cy=request.cy_px,
-                    pose7=_normalize_camera_pose(request.pose_world_from_camera),
-                    max_depth=8.0,
-                    pixel_step=12,
+                    depth_bytes=depth_bytes,
+                    width=int(request.width),
+                    height=int(request.height),
+                    fx=float(request.fx),
+                    fy=float(request.fy),
+                    cx_px=float(request.cx_px),
+                    cy_px=float(request.cy_px),
+                    camera_pose=_normalize_camera_pose(request.pose_world_from_camera),
                 )
-                reprojection_report = rep.to_dict()
-                reprojection_suggestions = list(rep.suggestions or [])
-                geom_stats["reprojection"] = reprojection_report
-            except Exception as e:
-                geom_stats["reprojection_error"] = str(e)
+                reprojection = {
+                    "ok": bool(r.ok),
+                    "sampled": int(r.sampled),
+                    "hits": int(r.hits),
+                    "misses": int(r.misses),
+                    "mismatches": int(r.mismatches),
+                    "median_abs_error_m": float(r.median_abs_error_m),
+                    "p90_abs_error_m": float(r.p90_abs_error_m),
+                    "miss_rate": float(r.miss_rate),
+                    "mismatch_rate": float(r.mismatch_rate),
+                }
+                scan_suggestions = list(r.suggestions or [])
+                geom_stats["reprojection"] = reprojection
+            except Exception:
+                reprojection = {}
+                scan_suggestions = []
 
         # Perception pipeline
         det2d, det3d, world_objects = [], [], []
-        scan_suggestions = []
+        scan_suggestions_model = []
         pb = session.scene_context.ensure_perception_backend()
         if pb is not None:
             out = pb.process_frame(
@@ -588,24 +610,58 @@ async def ingest_frame_packet(request: FramePacketRequest):
             det2d = out.get("det2d", [])
             det3d = out.get("det3d", [])
             world_objects = out.get("world_objects", [])
-            scan_suggestions = out.get("scan_suggestions", [])
-            if reprojection_suggestions:
-                scan_suggestions.extend(reprojection_suggestions)
-
+            scan_suggestions_model = out.get("scan_suggestions", [])
             # Persist stable objects in scene_context
             session.scene_context.world_objects = world_objects
             # For legacy/debug: keep raw 3D dets in all_detected_objects
             session.scene_context.all_detected_objects.extend(det3d)
 
+        # Merge scan suggestions from perception + reprojection
+        if scan_suggestions_model:
+            scan_suggestions.extend(scan_suggestions_model)
+
+        # --- Stage 6: Active scanning plan (clusters + view proposals) ---
+        scan_plan = {}
+        pose = _normalize_camera_pose(request.pose_world_from_camera)
+        if scan_suggestions and VALIDATION_AVAILABLE and propose_views is not None:
+            try:
+                scan_plan = propose_views(
+                    scan_suggestions=scan_suggestions,
+                    current_pose=pose,
+                    default_distance_m=1.6,
+                    max_views=3,
+                )
+            except Exception:
+                scan_plan = {}
+
+        # Persist Stage 5/6 outputs in the session context
+        session.scene_context.last_reprojection = reprojection or {}
+        session.scene_context.last_scan_suggestions = scan_suggestions or []
+        session.scene_context.last_scan_plan = scan_plan or {}
+
+        # Lightweight local unknown-space estimate for UI guidance
+        try:
+            if voxel_world is not None:
+                unknown_local = voxel_world.unknown_fraction_in_box(
+                    center_world=(float(pose[0]), float(pose[1]), float(pose[2])),
+                    half_extents_m=(2.0, 2.0, 2.0),
+                    sample_step_vox=3,
+                )
+                geom_stats["unknown_local_ratio"] = float(unknown_local)
+        except Exception:
+            pass
+
         # Save a CameraFrame in history
         frame = CameraFrame(
             timestamp=request.timestamp or time.time(),
             image_data=request.rgb_base64,
-            camera_position=[],
+            camera_position=_normalize_camera_pose(request.pose_world_from_camera),
             ar_points=[],
             quality_metrics={
                 "geometry": geom_stats,
                 "mesh": mesh_info,
+                "reprojection": reprojection,
+                "scan_suggestions": scan_suggestions,
             },
             detected_objects=det3d,
         )
@@ -626,6 +682,7 @@ async def ingest_frame_packet(request: FramePacketRequest):
             "geometry_stats": geom_stats,
             "mesh_info": mesh_info,
             "scan_suggestions": scan_suggestions,
+            "scan_plan": scan_plan,
         }
 
     except HTTPException:
@@ -634,6 +691,66 @@ async def ingest_frame_packet(request: FramePacketRequest):
         logger.error(f"/session/frame error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/session/scan_plan")
+async def get_scan_plan(request: ScanPlanRequest):
+    """Stage 6: return clustered scan targets and suggested next views."""
+    session = session_manager.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+    ctx = session.scene_context
+    suggestions = list(ctx.last_scan_suggestions or [])
+
+    pose = None
+    if session.frames:
+        try:
+            pose = session.frames[-1].camera_position
+        except Exception:
+            pose = None
+
+    plan = ctx.last_scan_plan or {}
+    if suggestions and VALIDATION_AVAILABLE and propose_views is not None:
+        try:
+            plan = propose_views(
+                scan_suggestions=suggestions,
+                current_pose=pose,
+                default_distance_m=float(request.distance_m),
+                max_views=int(request.max_views),
+            )
+        except Exception:
+            plan = ctx.last_scan_plan or {}
+
+    ctx.last_scan_plan = plan or {}
+
+    reproj_ok = bool((ctx.last_reprojection or {}).get("ok", True))
+    ready = reproj_ok and (len(suggestions) <= 8)
+
+    unknown_local = None
+    try:
+        vw = ctx.ensure_voxel_world()
+        if vw is not None and pose and len(pose) >= 3:
+            unknown_local = vw.unknown_fraction_in_box(
+                center_world=(float(pose[0]), float(pose[1]), float(pose[2])),
+                half_extents_m=(2.0, 2.0, 2.0),
+                sample_step_vox=3,
+            )
+            if unknown_local is not None and float(unknown_local) > 0.55:
+                ready = False
+    except Exception:
+        pass
+
+    return {
+        "session_id": request.session_id,
+        "scan_suggestions": suggestions,
+        "scan_plan": plan,
+        "readiness": {
+            "ready_to_lock": bool(ready),
+            "reprojection_ok": bool(reproj_ok),
+            "unknown_local_ratio": float(unknown_local) if unknown_local is not None else None,
+        },
+    }
 
 
 @app.post("/session/lock_world")
