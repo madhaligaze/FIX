@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -65,6 +65,10 @@ class VoxelWorld:
 
         self.occupied: Set[Tuple[int, int, int]] = set()
         self.free: Set[Tuple[int, int, int]] = set()
+
+        # Stage 3: safety overlays inflated around tentative/needs_scan objects for planning.
+        self._safety_occupied: Set[Tuple[int, int, int]] = set()
+        self._safety_types: Dict[Tuple[int, int, int], int] = {}
 
         self._types: Dict[Tuple[int, int, int], int] = {}
         self._grid: Dict[Tuple[int, int, int], int] = {}
@@ -263,7 +267,7 @@ class VoxelWorld:
                 for dz in range(-extra, extra + 1):
                     check = (vx + dx, vy, vz + dz)
 
-                    if check in self.occupied:
+                    if check in self.occupied or check in self._safety_occupied:
                         vtype = self._types.get(check, self.OCCUPIED)
                         if vtype != self.FLOOR:
                             return True
@@ -274,9 +278,140 @@ class VoxelWorld:
 
         return False
 
+
+    # ── Stage 3: safety policy overlays ────────────────────────────────────
+
+    def clear_safety_overlays(self) -> None:
+        self._safety_occupied.clear()
+        self._safety_types.clear()
+
+    def apply_safety_overlays(
+        self,
+        world_objects: List[Dict[str, Any]],
+        *,
+        clearance_min: float = 0.15,
+        clearance_tentative: float = 0.30,
+        clearance_needs_scan: float = 0.50,
+        max_points_per_object: int = 2000,
+    ) -> Dict[str, Any]:
+        """Inflate occupied space around objects for conservative planning.
+
+        This does NOT assert new geometry - it is a planning-time overlay.
+        """
+        self.clear_safety_overlays()
+        if not world_objects:
+            return {"overlay_voxels": 0, "objects": 0}
+
+        overlay_count = 0
+
+        def _buffer_for(o: Dict[str, Any]) -> float:
+            st = (o.get("status") or "TENTATIVE").upper()
+            needs = bool(o.get("needs_scan", False))
+            if needs:
+                return float(clearance_needs_scan)
+            if st == "CONFIRMED":
+                return float(clearance_min)
+            if st == "TENTATIVE":
+                return float(clearance_tentative)
+            return float(clearance_needs_scan)
+
+        def _mark_sphere(center_xyz: np.ndarray, radius_m: float) -> None:
+            nonlocal overlay_count
+            r = float(max(self.resolution, 1e-6))
+            extra = int(math.ceil(radius_m / r))
+            vx, vy, vz = self._to_grid(float(center_xyz[0]), float(center_xyz[1]), float(center_xyz[2]))
+            for dx in range(-extra, extra + 1):
+                for dy in range(-extra, extra + 1):
+                    for dz in range(-extra, extra + 1):
+                        coord = (vx + dx, vy + dy, vz + dz)
+                        if not self._in_bounds_idx(coord):
+                            continue
+                        if coord in self._safety_occupied:
+                            continue
+                        self._safety_occupied.add(coord)
+                        self._safety_types[coord] = self.OCCUPIED
+                        overlay_count += 1
+
+        for o in world_objects:
+            pose = o.get("pose", {}) or {}
+            dims = o.get("dimensions", {}) or {}
+            buf = _buffer_for(o)
+
+            g = (o.get("geometry_type") or "MESH_PROXY").upper()
+
+            if g == "CYLINDER" and "axis" in pose and "radius" in dims:
+                try:
+                    axis = np.array(pose.get("axis", [0, 0, 1]), dtype=np.float64)
+                    an = float(np.linalg.norm(axis))
+                    if an < 1e-9:
+                        axis = np.array([0, 0, 1], dtype=np.float64)
+                        an = 1.0
+                    axis = axis / an
+                    origin = np.array(pose.get("position", [0, 0, 0]), dtype=np.float64)
+
+                    seg = o.get("observable_segment") or {}
+                    if seg:
+                        t0 = float(seg.get("t0", -0.1))
+                        t1 = float(seg.get("t1", 0.1))
+                    else:
+                        L = float(dims.get("length", 0.2))
+                        t0, t1 = -L / 2.0, L / 2.0
+
+                    for h in (o.get("extension_hypotheses") or []):
+                        if h.get("stop_reason") in ("OCCUPIED", "OTHER_OBJECT", "MAX_LENGTH") and float(h.get("confidence", 0.0)) >= 0.6:
+                            if h.get("end") == "neg_end":
+                                t0 = min(t0, float(h.get("t_end", t0)))
+                            elif h.get("end") == "pos_end":
+                                t1 = max(t1, float(h.get("t_end", t1)))
+
+                    radius = float(dims.get("radius", 0.05)) + buf
+                    length = float(abs(t1 - t0))
+                    n_samples = max(2, int(length / max(self.resolution, 0.02)))
+                    n_samples = min(n_samples, max_points_per_object)
+
+                    for k in range(n_samples + 1):
+                        t = float(t0 + (t1 - t0) * (k / max(1, n_samples)))
+                        p = origin + axis * t
+                        _mark_sphere(p, radius)
+                except Exception:
+                    pass
+                continue
+
+            try:
+                center = np.array(pose.get("position", [0, 0, 0]), dtype=np.float64)
+                if "dx" in dims:
+                    dx = float(dims.get("dx", 0.2)) + 2 * buf
+                    dy = float(dims.get("dy", 0.2)) + 2 * buf
+                    dz = float(dims.get("dz", 0.2)) + 2 * buf
+                else:
+                    r0 = float(dims.get("radius", 0.05)) + buf
+                    L0 = float(dims.get("length", 0.2)) + 2 * buf
+                    dx, dy, dz = 2 * r0, 2 * r0, L0
+
+                r = float(self.resolution)
+                xs = np.arange(center[0] - dx / 2.0, center[0] + dx / 2.0 + r, r)
+                ys = np.arange(center[1] - dy / 2.0, center[1] + dy / 2.0 + r, r)
+                zs = np.arange(center[2] - dz / 2.0, center[2] + dz / 2.0 + r, r)
+
+                for x in xs:
+                    for y in ys:
+                        for z in zs:
+                            coord = self._to_grid(float(x), float(y), float(z))
+                            if not self._in_bounds_idx(coord):
+                                continue
+                            if coord in self._safety_occupied:
+                                continue
+                            self._safety_occupied.add(coord)
+                            self._safety_types[coord] = self.OCCUPIED
+                            overlay_count += 1
+            except Exception:
+                continue
+
+        return {"overlay_voxels": int(overlay_count), "objects": int(len(world_objects))}
+
     def get_state(self, x: float, y: float, z: float) -> int:
         coord = self._to_grid(x, y, z)
-        if coord in self.occupied:
+        if coord in self.occupied or coord in self._safety_occupied:
             return self.OCCUPIED
         if coord in self.free:
             return self.FREE
@@ -302,6 +437,8 @@ class VoxelWorld:
     def clear(self) -> None:
         self.occupied.clear()
         self.free.clear()
+        self._safety_occupied.clear()
+        self._safety_types.clear()
         self._types.clear()
         self._grid.clear()
         self._last_depth_stats = {}

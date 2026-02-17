@@ -23,6 +23,11 @@ from modules.detector_2d import Detector2D
 from modules.lifter_2d3d import Intrinsics, decode_confidence_bytes, decode_depth_bytes, lift_det2d_to_3d
 from modules.object_tracker import ObjectTracker
 from modules.primitive_fitting import classify_for_fitting, fit_cylinder, fit_oriented_box
+from modules.extension_engine import (
+    observable_segment_from_points,
+    termination_evidence_cylinder,
+    propose_axis_extension,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +118,7 @@ class PerceptionBackend:
         # Step 5: Primitive fitting (optional refinement)
         # We use points from the latest det3d if available and class matches.
         refined = []
+        scan_suggestions: List[Dict[str, Any]] = []
         for obj in world_objects:
             ref = dict(obj)
             refined.append(ref)
@@ -124,11 +130,15 @@ class PerceptionBackend:
             if cid:
                 observed_ids.add(cid)
                 self._refine_geometry(cid, d, refined)
+                self._stage3_reconstruct(cid, d, refined, voxel_world, scan_suggestions)
+
+        self.tracker.objects = refined
 
         return {
             "det2d": det2d_list,
             "det3d": det3d_list,
             "world_objects": refined,
+            "scan_suggestions": scan_suggestions,
             "vision_enabled": bool(enable_vision),
             "detector_available": bool(self.detector.available),
         }
@@ -199,3 +209,83 @@ class PerceptionBackend:
             if "orientation_matrix" in fpose:
                 pose["orientation_matrix"] = fpose["orientation_matrix"]
             break
+
+    def _stage3_reconstruct(
+        self,
+        obj_id: str,
+        det3d: Dict[str, Any],
+        objects: List[Dict[str, Any]],
+        voxel_world,
+        scan_suggestions: List[Dict[str, Any]],
+    ) -> None:
+        pts = det3d.get("points_world") or []
+        if len(pts) < 30:
+            return
+
+        for o in objects:
+            if o.get("id") != obj_id:
+                continue
+
+            g = (o.get("geometry_type") or "").upper()
+            if g not in ("CYLINDER", "BOX"):
+                return
+
+            pose = o.get("pose", {}) or {}
+            dims = o.get("dimensions", {}) or {}
+            origin = np.array(pose.get("position", det3d.get("position_world", [0, 0, 0])), dtype=np.float64)
+
+            if g == "CYLINDER":
+                axis = np.array(pose.get("axis", [0, 0, 1]), dtype=np.float64)
+            else:
+                R = np.array(pose.get("orientation_matrix", np.eye(3).tolist()), dtype=np.float64)
+                axis = R[:, 2] if R.shape == (3, 3) else np.array([0, 0, 1], dtype=np.float64)
+
+            axis_n = float(np.linalg.norm(axis))
+            if axis_n < 1e-9:
+                axis = np.array([0, 0, 1], dtype=np.float64)
+            else:
+                axis = axis / axis_n
+
+            P = np.array(pts, dtype=np.float64)
+            seg = observable_segment_from_points(points_world=P, axis_origin=origin, axis_dir=axis, trim_pct=5.0)
+            if not seg:
+                return
+
+            o["observable_segment"] = seg
+            t0 = float(seg.get("t0", 0.0))
+            t1 = float(seg.get("t1", 0.0))
+
+            evidence = {}
+            if g == "CYLINDER":
+                radius = float(dims.get("radius", 0.05))
+                nearby = [
+                    (x.get("class_label"), (x.get("pose", {}) or {}).get("position", [0, 0, 0]))
+                    for x in objects
+                    if x.get("id") != obj_id
+                ]
+                evidence = termination_evidence_cylinder(
+                    points_world=P,
+                    axis_origin=origin,
+                    axis_dir=axis,
+                    t0=t0,
+                    t1=t1,
+                    radius=radius,
+                    nearby_labels=nearby,
+                )
+
+            hyp, needs_scan, scan_hints = propose_axis_extension(
+                obj=o,
+                voxel_world=voxel_world,
+                axis_origin=origin,
+                axis_dir=axis,
+                t0=t0,
+                t1=t1,
+                base_confidence=float(o.get("confidence", det3d.get("score", 0.5))),
+                termination_evidence=evidence,
+                objects=objects,
+            )
+            o["termination_evidence"] = evidence
+            o["extension_hypotheses"] = hyp
+            o["needs_scan"] = bool(needs_scan)
+            scan_suggestions.extend(scan_hints)
+            return
