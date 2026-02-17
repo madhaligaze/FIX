@@ -34,8 +34,7 @@ from modules.geometry import (
 from modules.physics import PhysicsEngine, quick_safety_check
 from modules.voxel_world import VoxelCollisionSolver
 from modules.builder import ScaffoldGenerator
-from modules.session_manager import CameraFrame
-from modules.session import SessionManager
+from modules.session_manager import CameraFrame, SessionManager
 from modules.monitoring import request_logger, performance_monitor
 from modules.cache_manager import global_cache
 from modules.validators import SessionUpdateAction, validate_session_exists, validate_structure_stability
@@ -73,6 +72,13 @@ except Exception:
     VALIDATION_AVAILABLE = False
 
 from modules.readiness_calibration import extract_reprojection_metrics_from_frames, suggest_thresholds
+
+# Stage 9: reproducible world snapshots
+try:
+    from modules.world_snapshot import DEFAULT_SNAPSHOT_DIR, load_snapshot as load_world_snapshot
+except Exception:  # pragma: no cover
+    DEFAULT_SNAPSHOT_DIR = "/tmp/ai_brain_snapshots"
+    load_world_snapshot = None
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FASTAPI APP
@@ -422,6 +428,8 @@ class GenerateRequest(BaseModel):
     max_variants: int = 3
     unknown_policy: str = "forbid"  # forbid|buffer
     target_point: Optional[Point3D] = None
+    # Stage 9: optionally generate from a frozen snapshot (revision)
+    snapshot_revision: Optional[str] = None
     force_unlocked: bool = False
 
 
@@ -437,6 +445,18 @@ class ExportBOMRequest(BaseModel):
     """Запрос на экспорт спецификации"""
     session_id: str
     variant_index: int
+
+
+class SnapshotCommitRequest(BaseModel):
+    session_id: str
+    reason: Optional[str] = "manual"
+    base_dir: Optional[str] = DEFAULT_SNAPSHOT_DIR
+
+
+class SnapshotRestoreRequest(BaseModel):
+    session_id: str
+    revision: str
+    base_dir: Optional[str] = DEFAULT_SNAPSHOT_DIR
 
 
 class SessionLockRequest(BaseModel):
@@ -1118,6 +1138,47 @@ async def unlock_world_v2(request: SessionUnlockRequest):
         "status": getattr(session, "status", "ACTIVE"),
     }
 
+@app.post("/session/snapshot/commit")
+async def commit_world_snapshot(request: SnapshotCommitRequest):
+    """
+    Stage 9: Persist a reproducible snapshot of the current world state.
+    This is used to make generation/export reproducible and auditable.
+    """
+    session = session_manager.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    meta = session_manager.commit_snapshot(
+        request.session_id,
+        base_dir=request.base_dir or DEFAULT_SNAPSHOT_DIR,
+        reason=request.reason or "manual",
+    )
+    if not meta:
+        raise HTTPException(status_code=500, detail="Не удалось создать snapshot")
+    return {"status": "ok", "snapshot": meta}
+
+
+@app.get("/session/snapshot/list/{session_id}")
+async def list_world_snapshots(session_id: str, base_dir: Optional[str] = None):
+    """List available snapshots for a session."""
+    return {
+        "session_id": session_id,
+        "snapshots": session_manager.list_snapshots(session_id, base_dir=base_dir or DEFAULT_SNAPSHOT_DIR),
+    }
+
+
+@app.post("/session/snapshot/restore")
+async def restore_world_snapshot(request: SnapshotRestoreRequest):
+    """Restore a previously committed snapshot into the session (overwrites in-memory model)."""
+    ok = session_manager.restore_snapshot(
+        request.session_id,
+        revision=request.revision,
+        base_dir=request.base_dir or DEFAULT_SNAPSHOT_DIR,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Snapshot не найден или восстановление не удалось")
+    return {"status": "ok", "session_id": request.session_id, "revision": request.revision}
+
+
 @app.post("/session/stream")
 async def stream_frame(request: StreamFrameRequest):
     """
@@ -1227,8 +1288,20 @@ async def generate_variants(request: GenerateRequest):
 
         _require_locked(session, force_unlocked=bool(getattr(request, "force_unlocked", False)))
 
+        # Stage 9: if snapshot_revision is provided, use its voxel_world for reproducibility
+        snapshot_revision_used = None
+        snapshot_voxel_world = None
+        if request.snapshot_revision and load_world_snapshot is not None:
+            try:
+                snap_session_dict, snap_vw = load_world_snapshot(request.session_id, request.snapshot_revision, base_dir=DEFAULT_SNAPSHOT_DIR)
+                if snap_vw is not None:
+                    snapshot_voxel_world = snap_vw
+                    snapshot_revision_used = request.snapshot_revision
+            except Exception:
+                pass
+
         if bool(getattr(request, "require_ready", True)) and compute_readiness is not None:
-            voxel_world_gate = session.scene_context.ensure_voxel_world()
+            voxel_world_gate = snapshot_voxel_world or session.scene_context.ensure_voxel_world()
             tb = _derive_target_box_for_planning(request, session)
             if tb is None:
                 raise HTTPException(
@@ -1275,7 +1348,7 @@ async def generate_variants(request: GenerateRequest):
 
         # ── НОВОЕ: AutoScaffolder — умная сборка от целевой точки ────────────
         if request.target_point is not None and BRAIN_V3_AVAILABLE:
-            voxel_world = session.scene_context.ensure_voxel_world()
+            voxel_world = snapshot_voxel_world or session.scene_context.ensure_voxel_world()
 
             # Заполняем воксели из YOLO-детекций накопленных в сессии
             # (вспомогательно, если point_cloud не передавался)
