@@ -17,15 +17,18 @@ object LayherModels {
     private const val LEDGER_LENGTH = 2.07f
     private const val DECK_WIDTH = 0.61f
     private const val DECK_LENGTH = 3.21f
+    private const val WEDGE_STEP = 0.5f
+    private const val WEDGE_NODE_RADIUS = 0.04f
 
     fun createStandard(
         context: Context,
         height: Float = STANDARD_HEIGHT,
         material: Material
     ): ModelRenderable {
+        val normalizedHeight = height.coerceAtLeast(0.1f)
         return ShapeFactory.makeCylinder(
             TUBE_DIAMETER / 2,
-            height,
+            normalizedHeight,
             Vector3.zero(),
             material
         )
@@ -36,9 +39,10 @@ object LayherModels {
         length: Float = LEDGER_LENGTH,
         material: Material
     ): ModelRenderable {
+        val normalizedLength = length.coerceAtLeast(0.1f)
         return ShapeFactory.makeCylinder(
             TUBE_DIAMETER / 2,
-            length,
+            normalizedLength,
             Vector3.zero(),
             material
         )
@@ -49,9 +53,10 @@ object LayherModels {
         length: Float,
         material: Material
     ): ModelRenderable {
+        val normalizedLength = length.coerceAtLeast(0.1f)
         return ShapeFactory.makeCylinder(
             TUBE_DIAMETER / 2,
-            length,
+            normalizedLength,
             Vector3.zero(),
             material
         )
@@ -73,10 +78,21 @@ object LayherModels {
         material: Material
     ): ModelRenderable {
         return ShapeFactory.makeSphere(
-            0.04f,
+            WEDGE_NODE_RADIUS,
             Vector3.zero(),
             material
         )
+    }
+
+    /**
+     * Смещения клиновых узлов от центра стойки.
+     */
+    fun getWedgeOffsets(height: Float): List<Float> {
+        val normalizedHeight = height.coerceAtLeast(0.1f)
+        val wedgeCount = (normalizedHeight / WEDGE_STEP).toInt()
+        return (0..wedgeCount).map { i ->
+            i * WEDGE_STEP - normalizedHeight / 2f
+        }
     }
 
     fun createStandardWithWedges(
@@ -93,9 +109,7 @@ object LayherModels {
             setParent(containerNode)
         }
 
-        val wedgeCount = (height / 0.5f).toInt()
-        for (i in 0..wedgeCount) {
-            val yPos = i * 0.5f - height / 2
+        for (yPos in getWedgeOffsets(height)) {
             val wedge = createWedgeNode(context, wedgeMaterial)
             Node().apply {
                 renderable = wedge

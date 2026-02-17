@@ -90,6 +90,8 @@ class SceneBuilder(private val scene: Scene) {
         }
 
         val renderable = getOrCreateRenderable(element).makeCopy()
+        val elementLength = calculateLength(element.start, element.end)
+        val loadRatio = element.load_ratio ?: 0.0
 
         val node = Node().apply {
             this.renderable = renderable
@@ -101,6 +103,10 @@ class SceneBuilder(private val scene: Scene) {
             )
             worldPosition = midPoint
             worldRotation = calculateRotation(element.start, element.end)
+        }
+
+        if (isVerticalElement(element.type)) {
+            attachWedgeNodes(node, elementLength, loadRatio)
         }
 
         node.setParent(scene)
@@ -126,10 +132,39 @@ class SceneBuilder(private val scene: Scene) {
         }
     }
 
+
+    private fun attachWedgeNodes(parentNode: Node, height: Float, loadRatio: Double) {
+        val wedgeRenderable = getWedgeRenderable(loadRatio)
+        LayherModels.getWedgeOffsets(height).forEach { yOffset ->
+            Node().apply {
+                renderable = wedgeRenderable.makeCopy()
+                localPosition = Vector3(0f, yOffset, 0f)
+                setParent(parentNode)
+            }
+        }
+    }
+
+    private fun getWedgeRenderable(loadRatio: Double): ModelRenderable {
+        val cacheKey = "wedge_${(loadRatio * 10).toInt()}"
+        return renderableCache.getOrPut(cacheKey) {
+            val wedgeMaterial = materialManager.getMaterial("vertical", loadRatio)
+            LayherModels.createWedgeNode(scene.view.context, wedgeMaterial)
+        }
+    }
+
+    private fun isVerticalElement(type: String): Boolean {
+        return type == "standard" || type == "vertical"
+    }
+
     fun updateElementColor(elementId: String, loadRatio: Double) {
         elementNodes[elementId]?.let { elementNode ->
             val material = materialManager.getMaterial(elementNode.element.type, loadRatio)
             elementNode.renderable.material = material
+            if (isVerticalElement(elementNode.element.type)) {
+                elementNode.node.children.forEach { child ->
+                    child.renderable?.material = material
+                }
+            }
         }
     }
 
