@@ -429,6 +429,23 @@ class ScaffoldGenerator:
             "material_count": len(beams)
         }
     
+    def create_grid_variant(
+        self,
+        *,
+        width: float,
+        height: float,
+        depth: float,
+        stand_len: float,
+        ledger_len: float,
+        label: str,
+        obstacles: Optional[List[Dict]] = None,
+    ) -> Dict:
+        """Public wrapper around the internal grid variant builder.
+
+        Stage 4 planners use this to keep planning code separate from generator internals.
+        """
+        return self._create_variant(width, height, depth, stand_len, ledger_len, label, obstacles)
+    
     def _create_variant_anchored(self, anchors: List[Dict],
                                 width: float, height: float, depth: float,
                                 stand_len: float, ledger_len: float, label: str,

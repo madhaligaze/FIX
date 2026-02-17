@@ -236,6 +236,9 @@ class GenerateRequest(BaseModel):
     user_points: List[Point3D] = []
     use_ai_detection: bool = True
     optimize_structure: bool = True  # Включить Closed Loop оптимизацию
+    planner_mode: str = "beam"  # legacy|beam
+    max_variants: int = 3
+    unknown_policy: str = "forbid"  # forbid|buffer
     # НОВОЕ: если задан — используем AutoScaffolder вместо старого генератора.
     # Формат: {"x": f, "y": f, "z": f} — точка доступа (труба/оборудование на потолке).
     target_point: Optional[Point3D] = None
@@ -737,15 +740,54 @@ async def generate_variants(request: GenerateRequest):
         # Собираем точки
         user_points = [p.dict() for p in request.user_points]
         ai_points = session.scene_context.all_ar_points if request.use_ai_detection else []
-        
-        # Генерируем варианты
-        variants = scaffold_generator.generate_smart_options(
-            user_points=user_points,
-            ai_points=ai_points,
-            bounds={"w": target_w, "h": target_h, "d": target_d},
-            obstacles=session.scene_context.obstacles,
-            voxel_world=session.scene_context.voxel_world,
-        )
+
+        all_anchors = list(user_points or []) + list(ai_points or [])
+        planner_mode = (getattr(request, "planner_mode", None) or "beam").lower()
+
+        if request.optimize_structure and planner_mode in {"beam", "optimizer", "constraint"}:
+            from modules.constraints import ConstraintConfig
+            from modules.scaffold_optimizer import ScaffoldOptimizer
+
+            cfg = ConstraintConfig(
+                clearance_min=float(request.target_dimensions.get("clearance_min", 0.15)),
+                clearance_tentative=float(request.target_dimensions.get("clearance_tentative", 0.30)),
+                clearance_needs_scan=float(request.target_dimensions.get("clearance_needs_scan", 0.50)),
+                unknown_policy=str(getattr(request, "unknown_policy", "forbid")),
+                unknown_buffer=float(request.target_dimensions.get("unknown_buffer", 0.50)),
+            )
+            optimizer = ScaffoldOptimizer(
+                generator=scaffold_generator,
+                voxel_world=session.scene_context.voxel_world,
+                obstacles=session.scene_context.obstacles,
+                config=cfg,
+            )
+            variants, solve_meta = optimizer.solve(
+                bounds={"w": target_w, "h": target_h, "d": target_d},
+                anchors=all_anchors,
+                max_variants=int(getattr(request, "max_variants", 3) or 3),
+                unknown_policy=getattr(request, "unknown_policy", None),
+            )
+
+            if not variants:
+                return {
+                    "status": "insufficient_data",
+                    "mode": "constraint_optimizer",
+                    "variants": [],
+                    "count": 0,
+                    "warnings": list(getattr(solve_meta, "warnings", [])),
+                    "scan_hints": list(getattr(solve_meta, "scan_hints", [])),
+                    "message": "Недостаточно данных: UNKNOWN зоны. Досканьте указанные места или поставьте unknown_policy=buffer.",
+                }
+        else:
+            solve_meta = None
+            # Генерируем варианты
+            variants = scaffold_generator.generate_smart_options(
+                user_points=user_points,
+                ai_points=ai_points,
+                bounds={"w": target_w, "h": target_h, "d": target_d},
+                obstacles=session.scene_context.obstacles,
+                voxel_world=session.scene_context.voxel_world,
+            )
         
         # Оптимизация каждого варианта (если включено)
         optimized_variants = []
@@ -800,9 +842,12 @@ async def generate_variants(request: GenerateRequest):
         
         return {
             "status": "success",
+            "mode": "constraint_optimizer" if (request.optimize_structure and (getattr(request, "planner_mode", "beam") or "beam").lower() in {"beam", "optimizer", "constraint"}) else "legacy_generator",
             "variants": optimized_variants,
             "count": len(optimized_variants),
-            "message": "Варианты сгенерированы и оптимизированы"
+            "warnings": list(getattr(solve_meta, "warnings", [])) if solve_meta is not None else [],
+            "scan_hints": list(getattr(solve_meta, "scan_hints", [])) if solve_meta is not None else [],
+            "message": "Варианты сгенерированы и оптимизированы",
         }
     
     except Exception as e:
