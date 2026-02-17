@@ -1,5 +1,6 @@
 package com.example.aibrain.scene
 
+import com.example.aibrain.HeatmapItem
 import com.example.aibrain.ScaffoldElement
 import com.google.ar.sceneform.Node
 import com.google.ar.sceneform.Scene
@@ -15,7 +16,7 @@ class SceneBuilder(private val scene: Scene) {
 
     private val modelCache = mutableMapOf<String, ModelRenderable>()
     private val sceneNodes = mutableListOf<Node>()
-    private val nodeById = mutableMapOf<String, Node>()
+    private val elementNodes = mutableMapOf<String, Node>()
     private val allElements = mutableListOf<ScaffoldElement>()
 
     private val stressColors = mapOf(
@@ -67,7 +68,7 @@ class SceneBuilder(private val scene: Scene) {
     fun clearScene() {
         sceneNodes.forEach { it.setParent(null) }
         sceneNodes.clear()
-        nodeById.clear()
+        elementNodes.clear()
     }
 
     fun getAllElements(): List<ScaffoldElement> = allElements.toList()
@@ -78,10 +79,35 @@ class SceneBuilder(private val scene: Scene) {
             val color = it["color"] as? String ?: "gray"
             id to color
         }
-        colorById.forEach { (id, color) -> nodeById[id]?.let { applyStressColor(it, color) } }
+        colorById.forEach { (id, color) -> elementNodes[id]?.let { applyStressColor(it, color) } }
     }
 
-    fun findNodeById(id: String): Node? = nodeById[id]
+    /**
+     * Найти Node по ID элемента.
+     */
+    fun findNodeById(elementId: String): Node? = elementNodes[elementId]
+
+    /**
+     * Удалить элемент из сцены.
+     */
+    fun removeElement(elementId: String) {
+        elementNodes[elementId]?.let { node ->
+            node.parent = null
+            elementNodes.remove(elementId)
+            sceneNodes.remove(node)
+        }
+    }
+
+    /**
+     * Обновить цвета элементов на основе heatmap.
+     */
+    fun updateHeatmap(heatmap: List<HeatmapItem>) {
+        heatmap.forEach { item ->
+            elementNodes[item.id]?.let { node ->
+                applyStressColor(node, item.color)
+            }
+        }
+    }
 
     private fun createElement(element: ScaffoldElement) {
         val baseModel = modelCache[element.type] ?: modelCache["ledger"] ?: return
@@ -102,7 +128,7 @@ class SceneBuilder(private val scene: Scene) {
 
         node.setParent(scene)
         sceneNodes.add(node)
-        nodeById[element.id] = node
+        elementNodes[element.id] = node
     }
 
     private fun applyStressColor(node: Node, colorName: String) {

@@ -4,6 +4,10 @@ import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.graphics.Color
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.Menu
+import android.view.MenuItem
 import android.view.View
 import android.view.animation.AlphaAnimation
 import android.view.animation.Animation
@@ -144,6 +148,7 @@ class MainActivity : AppCompatActivity() {
     private val modelNodes = mutableListOf<Node>()
     private lateinit var sceneBuilder: SceneBuilder
     private lateinit var physicsAnimator: PhysicsAnimator
+    private lateinit var viewModel: StructureViewModel
 
     // ══════════════════════════════════════════════════════════════════════
     // СОСТОЯНИЕ - AR RULER
@@ -175,6 +180,13 @@ class MainActivity : AppCompatActivity() {
         sceneBuilder = SceneBuilder(sceneView.scene)
         sceneBuilder.preloadModels()
         physicsAnimator = PhysicsAnimator(sceneView, sceneBuilder)
+        viewModel = StructureViewModel(api)
+
+        scope.launch {
+            viewModel.structureState.collect { state ->
+                handleStructureState(state)
+            }
+        }
 
         transitionTo(AppState.IDLE)
     }
@@ -794,7 +806,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     // Заглушки для методов которые еще не реализованы полностью
-    private suspend fun doStartSession() { /* ... */ }
+    private suspend fun doStartSession() {
+        try {
+            val response = api.startSession()
+            if (response.isSuccessful && response.body() != null) {
+                val sessionId = response.body()!!.session_id
+                currentSessionId = sessionId
+                viewModel.setSessionId(sessionId)
+                showHint("✓ Сессия создана")
+                transitionTo(AppState.SCANNING)
+            } else {
+                showError("Не удалось создать сессию: ${response.code()}")
+                transitionTo(AppState.IDLE)
+            }
+        } catch (e: Exception) {
+            showError("Ошибка старта сессии: ${e.message}")
+            transitionTo(AppState.IDLE)
+        }
+    }
     private suspend fun sendFrame(): Boolean { return false }
     private fun stopStreaming() { /* ... */ }
     private suspend fun doRequestModeling() { /* ... */ }
@@ -849,6 +878,127 @@ class MainActivity : AppCompatActivity() {
         val score = option.safety_score
         val status = option.physics?.status ?: "UNKNOWN"
         showHint("🏁 Готово: safety $score%, physics=$status")
+    }
+
+
+
+    private fun handleStructureState(state: StructureState) {
+        when (state) {
+            is StructureState.Idle -> Unit
+            is StructureState.Updating -> showLoadingIndicator()
+            is StructureState.Updated -> {
+                hideLoadingIndicator()
+                handleUpdateResponse(state.response)
+            }
+            is StructureState.Error -> {
+                hideLoadingIndicator()
+                showError(state.message)
+            }
+        }
+    }
+
+    private fun handleUpdateResponse(response: UpdateResponse) {
+        sceneBuilder.updateHeatmap(response.heatmap)
+
+        if (viewModel.editMode.value == EditMode.SIMULATION) {
+            if (response.collapsed.elements.isNotEmpty()) {
+                physicsAnimator.animateFall(response.collapsed.elements)
+                showCollapsedNotification(response.collapsed.elements.size)
+
+                Handler(Looper.getMainLooper()).postDelayed({
+                    response.collapsed.elements.forEach { elementId ->
+                        sceneBuilder.removeElement(elementId)
+                    }
+                }, 2000)
+            }
+        } else if (response.collapsed.elements.isNotEmpty()) {
+            highlightWouldCollapse(response.collapsed.elements)
+        }
+
+        if (!response.is_stable) {
+            showWarning("⚠️ Структура нестабильна!")
+        }
+    }
+
+    private fun onElementTapped(elementId: String) {
+        viewModel.previewRemoveElement(elementId) { preview ->
+            runOnUiThread {
+                if (preview.is_critical) {
+                    showConfirmDialog(
+                        title = "⚠️ Критический элемент!",
+                        message = preview.warning,
+                        onConfirm = { removeElementWithAnimation(elementId) }
+                    )
+                } else {
+                    removeElementWithAnimation(elementId)
+                }
+            }
+        }
+    }
+
+    private fun removeElementWithAnimation(elementId: String) {
+        viewModel.removeElement(
+            elementId = elementId,
+            onSuccess = { },
+            onError = { error ->
+                runOnUiThread { showError("Не удалось удалить элемент: $error") }
+            }
+        )
+    }
+
+    private fun showLoadingIndicator() = showHint("⏳ Обновление структуры...")
+
+    private fun hideLoadingIndicator() = Unit
+
+    private fun showError(message: String) {
+        showHint("❌ $message")
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun showWarning(message: String) {
+        showHint(message)
+    }
+
+    private fun highlightWouldCollapse(elementIds: List<String>) {
+        showHint("⚠️ Могут упасть элементы: ${elementIds.size}")
+    }
+
+    private fun showCollapsedNotification(count: Int) {
+        Toast.makeText(this, "Упало элементов: $count", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun showConfirmDialog(title: String, message: String, onConfirm: () -> Unit) {
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton("Удалить") { _, _ -> onConfirm() }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menuInflater.inflate(R.menu.edit_menu, menu)
+
+        scope.launch {
+            viewModel.editMode.collect { mode ->
+                menu.findItem(R.id.action_toggle_mode)?.title = when (mode) {
+                    EditMode.EDIT -> "🎬 Режим: EDIT"
+                    EditMode.SIMULATION -> "⚡ Режим: SIMULATION"
+                }
+            }
+        }
+
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        return when (item.itemId) {
+            R.id.action_toggle_mode -> {
+                viewModel.toggleEditMode()
+                true
+            }
+            else -> super.onOptionsItemSelected(item)
+        }
     }
 
     private fun clearARAnchors() {
