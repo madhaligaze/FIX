@@ -35,6 +35,10 @@ class SceneContext:
         self.obstacles: List[Dict[str, Any]] = []
         self.voxel_world = None
         self.tsdf_integrator = None
+        # Stage 5/6: self-critique and active scanning hints
+        self.last_reprojection: Dict[str, Any] = {}
+        self.last_scan_suggestions: List[Dict[str, Any]] = []
+        self.last_scan_plan: Dict[str, Any] = {}
 
     def ensure_voxel_world(self):
         if self.voxel_world is None:
@@ -85,6 +89,7 @@ class SceneContext:
             "detected_objects": len(self.all_detected_objects),
             "world_objects": len(self.world_objects),
             "point_cloud_points": len(self.point_cloud),
+            "scan_suggestions": len(self.last_scan_suggestions),
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -95,6 +100,9 @@ class SceneContext:
             "world_objects": self.world_objects,
             "point_cloud": self.point_cloud,
             "obstacles": self.obstacles,
+            "last_reprojection": self.last_reprojection,
+            "last_scan_suggestions": self.last_scan_suggestions,
+            "last_scan_plan": self.last_scan_plan,
         }
 
     @classmethod
@@ -106,6 +114,9 @@ class SceneContext:
         ctx.world_objects = data.get("world_objects", [])
         ctx.point_cloud = data.get("point_cloud", [])
         ctx.obstacles = data.get("obstacles", [])
+        ctx.last_reprojection = data.get("last_reprojection", {})
+        ctx.last_scan_suggestions = data.get("last_scan_suggestions", [])
+        ctx.last_scan_plan = data.get("last_scan_plan", {})
         return ctx
 
 
