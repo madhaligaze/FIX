@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from modules.session_state import LockInfo, SessionState, compute_world_revision
+
 
 @dataclass
 class CameraFrame:
@@ -39,6 +41,7 @@ class SceneContext:
         self.last_reprojection: Optional[Dict[str, Any]] = None
         self.last_scan_suggestions: List[Dict[str, Any]] = []
         self.last_scan_plan: Optional[Dict[str, Any]] = None
+        self.last_readiness: Optional[Dict[str, Any]] = None
 
     def ensure_voxel_world(self):
         if self.voxel_world is None:
@@ -82,6 +85,23 @@ class SceneContext:
             self.all_ar_points.extend(frame.ar_points)
         if frame.detected_objects:
             self.all_detected_objects.extend(frame.detected_objects)
+        try:
+            qm = frame.quality_metrics or {}
+            gs = qm.get("geometry_stats") or {}
+            repro = gs.get("reprojection") or qm.get("reprojection")
+            if repro:
+                self.last_reprojection = repro
+            ss = qm.get("scan_suggestions")
+            if isinstance(ss, list):
+                self.last_scan_suggestions = ss
+            sp = qm.get("scan_plan")
+            if isinstance(sp, dict):
+                self.last_scan_plan = sp
+            rd = qm.get("readiness")
+            if isinstance(rd, dict):
+                self.last_readiness = rd
+        except Exception:
+            pass
         point_cloud = frame.quality_metrics.get("point_cloud") if frame.quality_metrics else None
         if point_cloud:
             self.point_cloud.extend(point_cloud)
@@ -94,6 +114,8 @@ class SceneContext:
             "world_objects": len(self.world_objects),
             "point_cloud_points": len(self.point_cloud),
             "scan_suggestions": len(self.last_scan_suggestions),
+            "has_reprojection": bool(self.last_reprojection),
+            "has_scan_plan": bool(self.last_scan_plan),
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -107,6 +129,7 @@ class SceneContext:
             "last_reprojection": self.last_reprojection,
             "last_scan_suggestions": self.last_scan_suggestions,
             "last_scan_plan": self.last_scan_plan,
+            "last_readiness": self.last_readiness,
         }
 
     @classmethod
@@ -121,6 +144,7 @@ class SceneContext:
         ctx.last_reprojection = data.get("last_reprojection")
         ctx.last_scan_suggestions = data.get("last_scan_suggestions", [])
         ctx.last_scan_plan = data.get("last_scan_plan")
+        ctx.last_readiness = data.get("last_readiness")
         return ctx
 
 
@@ -131,6 +155,9 @@ class Session:
         self.updated_at = self.created_at
         self.last_activity = self.created_at
         self.status = "ACTIVE"
+        self.lifecycle_state = SessionState.SCANNING
+        self.lock_info: Optional[LockInfo] = None
+        self.world_revision: str = ""
         self.frames: List[CameraFrame] = []
         self.scene_context = SceneContext()
         self.generated_variants: List[Dict[str, Any]] = []
@@ -159,12 +186,61 @@ class Session:
         self.total_objects_detected += len(frame.detected_objects)
         self._touch()
 
-    def lock_world(self) -> int:
-        """Freeze current geometry snapshot version for planning stage."""
+    def lock_world(
+        self,
+        reason: str = "user_lock",
+        thresholds: Optional[Dict[str, Any]] = None,
+        readiness: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Freeze current geometry snapshot for planning/export stage."""
         self.world_locked = True
         self.locked_mesh_version = self.mesh_version
+        self.lifecycle_state = SessionState.LOCKED
+        self.status = "LOCKED"
+        self.world_revision = compute_world_revision(self.to_dict())
+        self.lock_info = LockInfo(
+            locked_at=time.time(),
+            reason=reason,
+            world_revision=self.world_revision,
+            readiness=readiness or (self.scene_context.last_readiness or {}),
+            thresholds=thresholds or {},
+        )
         self._touch()
-        return self.locked_mesh_version
+        return {
+            "locked_mesh_version": self.locked_mesh_version,
+            "lifecycle_state": self.lifecycle_state.value,
+            "lock_info": self.lock_info.to_dict(),
+        }
+
+    def unlock_world(self, reason: str = "user_unlock") -> Dict[str, Any]:
+        self.world_locked = False
+        self.locked_mesh_version = None
+        self.lifecycle_state = SessionState.SCANNING
+        self.status = "ACTIVE"
+        if self.lock_info:
+            self.structure_history.append(
+                {
+                    "timestamp": time.time(),
+                    "action": "UNLOCK_WORLD",
+                    "reason": reason,
+                    "world_revision": self.lock_info.world_revision,
+                }
+            )
+        self.lock_info = None
+        self._touch()
+        return {"lifecycle_state": self.lifecycle_state.value}
+
+    def is_locked(self) -> bool:
+        return self.lifecycle_state == SessionState.LOCKED or self.status == "LOCKED"
+
+    def get_state(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "lifecycle_state": getattr(self.lifecycle_state, "value", str(self.lifecycle_state)),
+            "is_locked": self.is_locked(),
+            "world_revision": self.world_revision,
+            "lock_info": self.lock_info.to_dict() if self.lock_info else None,
+        }
 
     def add_variant(self, variant: Dict[str, Any]) -> None:
         self.generated_variants.append(variant)
@@ -226,6 +302,9 @@ class Session:
         return {
             "session_id": self.session_id,
             "status": self.status,
+            "lifecycle_state": getattr(self.lifecycle_state, "value", str(self.lifecycle_state)),
+            "world_revision": self.world_revision,
+            "lock_info": self.lock_info.to_dict() if self.lock_info else None,
             "frames": len(self.frames),
             "variants": len(self.generated_variants),
             "current_structure_elements": len(self.current_structure),
@@ -242,6 +321,9 @@ class Session:
             "updated_at": self.updated_at,
             "last_activity": self.last_activity,
             "status": self.status,
+            "lifecycle_state": getattr(self.lifecycle_state, "value", str(self.lifecycle_state)),
+            "world_revision": self.world_revision,
+            "lock_info": self.lock_info.to_dict() if self.lock_info else None,
             "frames": [f.to_dict() for f in self.frames[-200:]],
             "scene_context": self.scene_context.to_dict(),
             "generated_variants": self.generated_variants,
@@ -259,6 +341,12 @@ class Session:
         s.updated_at = data.get("updated_at", s.updated_at)
         s.last_activity = data.get("last_activity", s.updated_at)
         s.status = data.get("status", "ACTIVE")
+        try:
+            s.lifecycle_state = SessionState(data.get("lifecycle_state") or ("LOCKED" if s.status == "LOCKED" else "SCANNING"))
+        except Exception:
+            s.lifecycle_state = SessionState.SCANNING
+        s.world_revision = data.get("world_revision", "")
+        s.lock_info = LockInfo.from_dict(data.get("lock_info"))
         s.frames = [CameraFrame.from_dict(item) for item in data.get("frames", [])]
         s.scene_context = SceneContext.from_dict(data.get("scene_context", {}))
         s.generated_variants = data.get("generated_variants", [])
@@ -286,6 +374,9 @@ class Session:
                 "world_locked": self.world_locked,
                 "locked_mesh_version": self.locked_mesh_version,
                 "mesh_version": self.mesh_version,
+                "lifecycle_state": getattr(self.lifecycle_state, "value", str(self.lifecycle_state)),
+                "world_revision": self.world_revision,
+                "lock_info": self.lock_info.to_dict() if self.lock_info else None,
             }
             with open(session_dir / "metadata.json", "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -335,6 +426,15 @@ class Session:
             session.world_locked = metadata.get("world_locked", False)
             session.locked_mesh_version = metadata.get("locked_mesh_version")
             session.mesh_version = metadata.get("mesh_version", session.mesh_version)
+            try:
+                session.lifecycle_state = SessionState(
+                    metadata.get("lifecycle_state")
+                    or ("LOCKED" if metadata.get("status") == "LOCKED" else "SCANNING")
+                )
+            except Exception:
+                session.lifecycle_state = SessionState.SCANNING
+            session.world_revision = metadata.get("world_revision", "")
+            session.lock_info = LockInfo.from_dict(metadata.get("lock_info"))
 
             structure_file = session_dir / "current_structure.json"
             if structure_file.exists():
