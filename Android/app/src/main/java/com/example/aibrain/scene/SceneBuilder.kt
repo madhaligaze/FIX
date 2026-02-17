@@ -3,79 +3,200 @@ package com.example.aibrain.scene
 import com.example.aibrain.ElementPoint
 import com.example.aibrain.HeatmapItem
 import com.example.aibrain.ScaffoldElement
-import com.example.aibrain.materials.MaterialManager
-import com.example.aibrain.models.LayherModels
+import com.example.aibrain.assets.ModelAssets
 import com.google.ar.sceneform.Node
 import com.google.ar.sceneform.Scene
 import com.google.ar.sceneform.math.Quaternion
 import com.google.ar.sceneform.math.Vector3
+import com.google.ar.sceneform.rendering.Color
+import com.google.ar.sceneform.rendering.Material
 import com.google.ar.sceneform.rendering.ModelRenderable
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlin.math.sqrt
 
+/**
+ * SceneBuilder с учетом Layher offset и кэшированием материалов.
+ */
 class SceneBuilder(private val scene: Scene) {
 
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private val materialManager = MaterialManager(scene.view.context)
-    private var isInitialized = false
-
-    private val renderableCache = mutableMapOf<String, ModelRenderable>()
     private val sceneNodes = mutableListOf<Node>()
-    private val elementNodes = mutableMapOf<String, ElementNode>()
+    private val nodeById = mutableMapOf<String, Node>()
     private val allElements = mutableListOf<ScaffoldElement>()
+    private val materialCache = mutableMapOf<String, Material>()
+
+    private val flangeOffsets = mapOf(
+        "standard" to FlangeOffset(bottom = 0.0f, top = 2.0f, nodePositions = listOf(0.0f, 0.5f, 1.0f, 1.5f, 2.0f)),
+        "ledger" to FlangeOffset(start = 0.035f, end = 0.035f),
+        "diagonal" to FlangeOffset(start = 0.05f, end = 0.05f)
+    )
 
     fun preloadModels(onReady: (() -> Unit)? = null) {
-        if (isInitialized) {
-            onReady?.invoke()
-            return
-        }
-
-        scope.launch {
-            materialManager.init()
-            isInitialized = true
-            onReady?.invoke()
-        }
+        onReady?.invoke()
     }
 
     fun buildScene(elements: List<ScaffoldElement>) {
         clearScene()
         allElements.clear()
         allElements.addAll(elements)
-        elements.forEach { createElement(it) }
+        elements.forEach { createElementWithOffset(it) }
+    }
+
+    private fun createElementWithOffset(element: ScaffoldElement) {
+        val modelType = getModelType(element.type)
+        val renderable = ModelAssets.getCopy(modelType) ?: return createPrimitiveElement(element)
+        val (position, rotation, scale) = calculateTransform(element)
+
+        val node = Node().apply {
+            this.renderable = renderable
+            worldPosition = position
+            worldRotation = rotation
+            localScale = scale
+        }
+
+        applyStressColor(node, element.stress_color ?: colorFromLoadRatio(element.load_ratio ?: 0.0))
+
+        node.setParent(scene)
+        sceneNodes.add(node)
+        nodeById[element.id] = node
+    }
+
+    private fun calculateTransform(element: ScaffoldElement): Triple<Vector3, Quaternion, Vector3> {
+        val start = Vector3(element.start.x, element.start.y, element.start.z)
+        val end = Vector3(element.end.x, element.end.y, element.end.z)
+        val offset = flangeOffsets[element.type]
+
+        val adjustedStart: Vector3
+        val adjustedEnd: Vector3
+
+        when (element.type) {
+            "standard", "vertical" -> {
+                val bottomOffset = offset?.bottom ?: 0f
+                adjustedStart = Vector3(start.x, start.y + bottomOffset, start.z)
+                adjustedEnd = end
+            }
+
+            "ledger", "horizontal", "diagonal", "bracing" -> {
+                val direction = Vector3.subtract(end, start).normalized()
+                val startOffset = offset?.start ?: 0f
+                val endOffset = offset?.end ?: 0f
+                adjustedStart = Vector3.add(start, direction.scaled(startOffset))
+                adjustedEnd = Vector3.subtract(end, direction.scaled(endOffset))
+            }
+
+            else -> {
+                adjustedStart = start
+                adjustedEnd = end
+            }
+        }
+
+        val center = Vector3(
+            (adjustedStart.x + adjustedEnd.x) / 2f,
+            (adjustedStart.y + adjustedEnd.y) / 2f,
+            (adjustedStart.z + adjustedEnd.z) / 2f
+        )
+
+        val direction = Vector3.subtract(adjustedEnd, adjustedStart)
+        val length = direction.length().coerceAtLeast(0.05f)
+
+        val rotation = if (length > 0.01f) {
+            Quaternion.lookRotation(direction.normalized(), Vector3.up())
+        } else {
+            Quaternion.identity()
+        }
+
+        val scale = when (element.type) {
+            "standard", "vertical" -> Vector3(1f, length / 2.0f, 1f)
+            "ledger", "horizontal" -> Vector3(length / 2.07f, 1f, 1f)
+            "diagonal", "bracing" -> Vector3(length / 3.0f, 1f, 1f)
+            else -> Vector3(1f, 1f, 1f)
+        }
+
+        return Triple(center, rotation, scale)
+    }
+
+    private fun getModelType(elementType: String): ModelAssets.ModelType {
+        return when (elementType) {
+            "standard", "vertical" -> ModelAssets.ModelType.LAYHER_STANDARD_2M
+            "ledger", "horizontal" -> ModelAssets.ModelType.LAYHER_LEDGER_207
+            "diagonal", "bracing" -> ModelAssets.ModelType.LAYHER_DIAGONAL_300
+            "deck_steel" -> ModelAssets.ModelType.LAYHER_DECK_STEEL
+            "deck", "deck_wood", "platform" -> ModelAssets.ModelType.LAYHER_DECK_WOOD
+            else -> ModelAssets.ModelType.LAYHER_LEDGER_207
+        }
+    }
+
+    private fun applyStressColor(node: Node, colorName: String) {
+        val renderable = node.renderable as? ModelRenderable ?: return
+        val material = materialCache.getOrPut(colorName) {
+            val color = getStressColor(colorName)
+            renderable.material.makeCopy().apply {
+                setFloat4("baseColorFactor", color)
+                setFloat("metallic", 0.9f)
+                setFloat("roughness", 0.3f)
+            }
+        }
+        renderable.material = material
+    }
+
+    private fun getStressColor(colorName: String): Color {
+        return when (colorName) {
+            "green" -> Color(0.2f, 0.8f, 0.2f)
+            "yellow" -> Color(0.9f, 0.9f, 0.2f)
+            "orange" -> Color(1.0f, 0.65f, 0.0f)
+            "red" -> Color(0.9f, 0.2f, 0.2f)
+            else -> Color(0.7f, 0.7f, 0.7f)
+        }
+    }
+
+    private fun createPrimitiveElement(element: ScaffoldElement) {
+        val start = element.start
+        val end = element.end
+        val direction = Vector3(end.x - start.x, end.y - start.y, end.z - start.z)
+        val length = calculateLength(start, end).coerceAtLeast(0.05f)
+
+        val fallbackRenderable = com.google.ar.sceneform.rendering.ShapeFactory.makeCube(
+            Vector3(0.06f, 1.0f, 0.06f),
+            Vector3.zero(),
+            com.google.ar.sceneform.rendering.MaterialFactory.makeOpaqueWithColor(
+                scene.view.context,
+                Color(0.6f, 0.6f, 0.6f)
+            ).get()
+        )
+
+        val node = Node().apply {
+            renderable = fallbackRenderable
+            worldPosition = Vector3(
+                (start.x + end.x) / 2f,
+                (start.y + end.y) / 2f,
+                (start.z + end.z) / 2f
+            )
+            worldRotation = if (length > 0.01f) {
+                Quaternion.lookRotation(direction.normalized(), Vector3.up())
+            } else {
+                Quaternion.identity()
+            }
+        }
+
+        node.setParent(scene)
+        sceneNodes.add(node)
+        nodeById[element.id] = node
     }
 
     fun clearScene() {
         sceneNodes.forEach { it.setParent(null) }
         sceneNodes.clear()
-        elementNodes.clear()
-        allElements.clear()
+        nodeById.clear()
+        materialCache.clear()
     }
+
+    fun findNodeById(id: String): Node? = nodeById[id]
 
     fun getAllElements(): List<ScaffoldElement> = allElements.toList()
 
-    fun updateColors(heatmap: List<Map<String, Any>>) {
-        val colorById = heatmap.associate {
-            val id = it["id"] as? String ?: ""
-            val loadRatio = when (val color = it["color"] as? String ?: "gray") {
-                "red" -> 1.0
-                "orange", "yellow" -> 0.7
-                else -> 0.2
-            }
-            id to loadRatio
-        }
-        colorById.forEach { (id, loadRatio) -> updateElementColor(id, loadRatio) }
-    }
-
-    fun findNodeById(elementId: String): Node? = elementNodes[elementId]?.node
-
     fun removeElement(elementId: String) {
-        elementNodes[elementId]?.let { elementNode ->
-            elementNode.node.setParent(null)
-            sceneNodes.remove(elementNode.node)
-            elementNodes.remove(elementId)
+        nodeById[elementId]?.let { node ->
+            node.setParent(null)
+            sceneNodes.remove(node)
+            nodeById.remove(elementId)
             allElements.removeAll { it.id == elementId }
         }
     }
@@ -84,116 +205,40 @@ class SceneBuilder(private val scene: Scene) {
         heatmap.forEach { updateElementColor(it.id, it.load_ratio) }
     }
 
-    private fun createElement(element: ScaffoldElement) {
-        if (!isInitialized) {
-            return
+    fun updateColors(heatmap: List<Map<String, Any>>) {
+        val colorById = heatmap.associate {
+            val id = it["id"] as? String ?: ""
+            val color = it["color"] as? String ?: "gray"
+            id to color
         }
 
-        val renderable = getOrCreateRenderable(element).makeCopy()
-        val elementLength = calculateLength(element.start, element.end)
-        val loadRatio = element.load_ratio ?: 0.0
-
-        val node = Node().apply {
-            this.renderable = renderable
-
-            val midPoint = Vector3(
-                (element.start.x + element.end.x) / 2f,
-                (element.start.y + element.end.y) / 2f,
-                (element.start.z + element.end.z) / 2f
-            )
-            worldPosition = midPoint
-            worldRotation = calculateRotation(element.start, element.end)
-        }
-
-        if (isVerticalElement(element.type)) {
-            attachWedgeNodes(node, elementLength, loadRatio)
-        }
-
-        node.setParent(scene)
-        sceneNodes.add(node)
-        elementNodes[element.id] = ElementNode(node = node, element = element, renderable = renderable)
-    }
-
-    private fun getOrCreateRenderable(element: ScaffoldElement): ModelRenderable {
-        val loadRatio = element.load_ratio ?: 0.0
-        val length = calculateLength(element.start, element.end)
-        val roundedLen = (length * 20).toInt()
-        val cacheKey = "${element.type}_${(loadRatio * 10).toInt()}_$roundedLen"
-
-        return renderableCache.getOrPut(cacheKey) {
-            val material = materialManager.getMaterial(element.type, loadRatio)
-            when (element.type) {
-                "standard", "vertical" -> LayherModels.createStandard(scene.view.context, length, material)
-                "ledger", "horizontal" -> LayherModels.createLedger(scene.view.context, length, material)
-                "bracing", "diagonal" -> LayherModels.createBracing(scene.view.context, length, material)
-                "deck", "platform" -> LayherModels.createDeck(scene.view.context, material)
-                else -> LayherModels.createLedger(scene.view.context, length, material)
-            }
-        }
-    }
-
-
-    private fun attachWedgeNodes(parentNode: Node, height: Float, loadRatio: Double) {
-        val wedgeRenderable = getWedgeRenderable(loadRatio)
-        LayherModels.getWedgeOffsets(height).forEach { yOffset ->
-            Node().apply {
-                renderable = wedgeRenderable.makeCopy()
-                localPosition = Vector3(0f, yOffset, 0f)
-                setParent(parentNode)
-            }
-        }
-    }
-
-    private fun getWedgeRenderable(loadRatio: Double): ModelRenderable {
-        val cacheKey = "wedge_${(loadRatio * 10).toInt()}"
-        return renderableCache.getOrPut(cacheKey) {
-            val wedgeMaterial = materialManager.getMaterial("vertical", loadRatio)
-            LayherModels.createWedgeNode(scene.view.context, wedgeMaterial)
-        }
-    }
-
-    private fun isVerticalElement(type: String): Boolean {
-        return type == "standard" || type == "vertical"
+        colorById.forEach { (id, color) -> nodeById[id]?.let { node -> applyStressColor(node, color) } }
     }
 
     fun updateElementColor(elementId: String, loadRatio: Double) {
-        elementNodes[elementId]?.let { elementNode ->
-            val material = materialManager.getMaterial(elementNode.element.type, loadRatio)
-            elementNode.renderable.material = material
-            if (isVerticalElement(elementNode.element.type)) {
-                elementNode.node.children.forEach { child ->
-                    child.renderable?.material = material
-                }
-            }
-        }
+        val colorName = colorFromLoadRatio(loadRatio)
+        nodeById[elementId]?.let { node -> applyStressColor(node, colorName) }
+    }
+
+    private fun colorFromLoadRatio(loadRatio: Double): String = when {
+        loadRatio >= 0.9 -> "red"
+        loadRatio >= 0.7 -> "orange"
+        loadRatio >= 0.4 -> "yellow"
+        else -> "green"
     }
 
     private fun calculateLength(start: ElementPoint, end: ElementPoint): Float {
         val dx = end.x - start.x
         val dy = end.y - start.y
         val dz = end.z - start.z
-        return sqrt(dx * dx + dy * dy + dz * dz).coerceAtLeast(0.05f)
+        return sqrt(dx * dx + dy * dy + dz * dz)
     }
-
-    private fun calculateRotation(start: ElementPoint, end: ElementPoint): Quaternion {
-        val direction = Vector3(
-            end.x - start.x,
-            end.y - start.y,
-            end.z - start.z
-        ).normalized()
-
-        if (direction.y > 0.98f) return Quaternion.identity()
-        if (direction.y < -0.98f) return Quaternion.axisAngle(Vector3.right(), 180f)
-
-        val up = Vector3.up()
-        val angle = Math.acos(Vector3.dot(up, direction).toDouble()).toFloat()
-        val axis = Vector3.cross(up, direction).normalized()
-        return Quaternion.axisAngle(axis, Math.toDegrees(angle.toDouble()).toFloat())
-    }
-
-    private data class ElementNode(
-        val node: Node,
-        val element: ScaffoldElement,
-        val renderable: ModelRenderable
-    )
 }
+
+data class FlangeOffset(
+    val bottom: Float = 0f,
+    val top: Float = 0f,
+    val start: Float = 0f,
+    val end: Float = 0f,
+    val nodePositions: List<Float> = emptyList()
+)
