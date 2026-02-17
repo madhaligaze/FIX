@@ -20,9 +20,87 @@ class StructureViewModel(
     val structureState: StateFlow<StructureState> = _structureState
 
     private var currentSessionId: String? = null
+    private val snapshots = mutableListOf<StructureSnapshot>()
+    private var currentSnapshotIndex = -1
+    private val maxSnapshots = 20
+
+    data class StructureSnapshot(
+        val timestamp: Long,
+        val elements: List<ScaffoldElement>,
+        val description: String
+    )
 
     fun setSessionId(sessionId: String) {
         currentSessionId = sessionId
+    }
+
+    /**
+     * Сохранить текущее состояние структуры.
+     */
+    fun saveSnapshot(elements: List<ScaffoldElement>, description: String) {
+        if (currentSnapshotIndex < snapshots.size - 1) {
+            snapshots.subList(currentSnapshotIndex + 1, snapshots.size).clear()
+        }
+
+        val snapshot = StructureSnapshot(
+            timestamp = System.currentTimeMillis(),
+            elements = elements.map { it.copy() },
+            description = description
+        )
+
+        snapshots.add(snapshot)
+
+        if (snapshots.size > maxSnapshots) {
+            snapshots.removeAt(0)
+        } else {
+            currentSnapshotIndex++
+        }
+    }
+
+    /**
+     * Отменить последнее действие (Undo).
+     */
+    fun undo(onRestore: (StructureSnapshot) -> Unit): Boolean {
+        if (currentSnapshotIndex > 0) {
+            currentSnapshotIndex--
+            val snapshot = snapshots[currentSnapshotIndex]
+            onRestore(snapshot)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Повторить отмененное действие (Redo).
+     */
+    fun redo(onRestore: (StructureSnapshot) -> Unit): Boolean {
+        if (currentSnapshotIndex < snapshots.size - 1) {
+            currentSnapshotIndex++
+            val snapshot = snapshots[currentSnapshotIndex]
+            onRestore(snapshot)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Можно ли сделать Undo.
+     */
+    fun canUndo(): Boolean = currentSnapshotIndex > 0
+
+    /**
+     * Можно ли сделать Redo.
+     */
+    fun canRedo(): Boolean = currentSnapshotIndex < snapshots.size - 1
+
+    /**
+     * Получить описание последнего действия для Undo.
+     */
+    fun getUndoDescription(): String? {
+        if (currentSnapshotIndex > 0) {
+            return snapshots[currentSnapshotIndex].description
+        }
+        return null
     }
 
     fun toggleEditMode() {
