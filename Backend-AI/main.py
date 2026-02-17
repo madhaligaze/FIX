@@ -275,6 +275,36 @@ class DepthStreamRequest(BaseModel):
     pixel_step: int = 4
 
 
+
+
+class Intrinsics(BaseModel):
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    width: int
+    height: int
+
+
+class FramePacket(BaseModel):
+    session_id: str
+    frame_id: str
+    timestamp: float
+    pose_world_from_camera: Optional[List[float]] = None
+    intrinsics: Optional[Intrinsics] = None
+
+    rgb_image_base64: Optional[str] = None
+
+    depth_map_base64: Optional[str] = None
+    depth_scale: float = 1000.0
+    confidence_map_base64: Optional[str] = None
+
+    point_cloud: Optional[List[List[float]]] = None
+
+
+class LockWorldRequest(BaseModel):
+    session_id: str
+
 class StructureModifyRequest(BaseModel):
     """Интерактивное изменение конструкции (удалить/добавить элемент)"""
 
@@ -350,6 +380,163 @@ async def start_session(request: SessionStartRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+
+@app.post("/session/frame")
+async def session_frame(request: FramePacket):
+    """Ingest one keyframe with strict 2D->3D contract: pose + intrinsics + depth/pointcloud."""
+    session = session_manager.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+    if request.intrinsics is None or request.pose_world_from_camera is None:
+        raise HTTPException(status_code=400, detail="intrinsics и pose_world_from_camera обязательны")
+
+    pose = list(request.pose_world_from_camera)
+    if len(pose) != 7:
+        raise HTTPException(status_code=400, detail="pose_world_from_camera должен содержать 7 чисел")
+
+    has_depth = bool(request.depth_map_base64)
+    has_point_cloud = bool(request.point_cloud)
+    if not has_depth and not has_point_cloud:
+        raise HTTPException(status_code=400, detail="Нужны depth_map_base64 или point_cloud")
+
+    depth_integrated = False
+    tsdf_integrated = False
+    voxels_added = 0
+    depth_stats = {}
+    degraded_mode = False
+
+    voxel_world = session.scene_context.ensure_voxel_world()
+
+    if has_depth and voxel_world is not None:
+        try:
+            depth_bytes = base64.b64decode(request.depth_map_base64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Некорректный depth_map_base64")
+
+        confidence_bytes = None
+        if request.confidence_map_base64:
+            try:
+                confidence_bytes = base64.b64decode(request.confidence_map_base64)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Некорректный confidence_map_base64")
+
+        depth_stats = voxel_world.ingest_depth_map(
+            depth_bytes=depth_bytes,
+            width=request.intrinsics.width,
+            height=request.intrinsics.height,
+            fx=request.intrinsics.fx,
+            fy=request.intrinsics.fy,
+            cx_px=request.intrinsics.cx,
+            cy_px=request.intrinsics.cy,
+            camera_pose=pose,
+            depth_scale=request.depth_scale,
+            confidence_bytes=confidence_bytes,
+        )
+        depth_integrated = bool(depth_stats.get("samples", 0.0) > 0)
+
+        tsdf = session.scene_context.ensure_tsdf_integrator()
+        if tsdf is not None:
+            try:
+                import numpy as np
+
+                depth_u16 = np.frombuffer(depth_bytes, dtype=np.uint16).reshape(
+                    request.intrinsics.height, request.intrinsics.width
+                )
+                depth_m = depth_u16.astype(np.float32) / float(request.depth_scale)
+                tsdf_integrated = tsdf.integrate_depth(
+                    depth_m=depth_m,
+                    fx=request.intrinsics.fx,
+                    fy=request.intrinsics.fy,
+                    cx=request.intrinsics.cx,
+                    cy=request.intrinsics.cy,
+                    pose_world_from_camera_7=(
+                        float(pose[0]),
+                        float(pose[1]),
+                        float(pose[2]),
+                        float(pose[3]),
+                        float(pose[4]),
+                        float(pose[5]),
+                        float(pose[6]),
+                    ),
+                )
+            except Exception:
+                tsdf_integrated = False
+    elif has_point_cloud and voxel_world is not None:
+        voxels_added = voxel_world.add_point_cloud(request.point_cloud or [])
+        degraded_mode = True
+
+    if has_depth is False and has_point_cloud:
+        degraded_mode = True
+
+    quality = voxel_world.get_quality_metrics() if voxel_world is not None else {
+        "coverage_pct": 0.0,
+        "unknown_pct": 1.0,
+    }
+    current_quality = {
+        "coverage_pct": quality.get("coverage_pct", 0.0),
+        "unknown_pct": quality.get("unknown_pct", 1.0),
+        "drift_proxy": 1.0 - quality.get("coverage_pct", 0.0),
+    }
+
+    frame_metrics = {
+        "frame_id": request.frame_id,
+        "depth_integrated": depth_integrated,
+        "depth_stats": depth_stats,
+        "tsdf_integrated": tsdf_integrated,
+        "degraded_mode": degraded_mode,
+        "point_cloud_voxels_added": voxels_added,
+        "point_cloud": request.point_cloud or [],
+    }
+
+    frame = CameraFrame(
+        timestamp=request.timestamp,
+        image_data=request.rgb_image_base64 or "",
+        camera_position=pose,
+        quality_metrics=frame_metrics,
+        detected_objects=[],
+    )
+    session.add_frame(frame)
+
+    for obj in session.scene_context.all_detected_objects:
+        observed = obj.setdefault("observed_frames", [])
+        if request.frame_id not in observed:
+            observed.append(request.frame_id)
+
+    session_manager.auto_save_session(request.session_id)
+
+    return {
+        "status": "processed",
+        "session_id": request.session_id,
+        "frame_id": request.frame_id,
+        "degraded_mode": degraded_mode,
+        "current_quality": current_quality,
+        "areas_to_scan_next": [
+            "scan_unknown_regions_front",
+            "capture_oblique_view",
+        ],
+        "preview": None,
+    }
+
+
+@app.post("/session/lock_world")
+async def lock_world(request: LockWorldRequest):
+    session = session_manager.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+    mesh_version = session.lock_world()
+    session.status = "LOCKED_WORLD"
+    session_manager.auto_save_session(request.session_id)
+
+    return {
+        "status": "LOCKED_WORLD",
+        "session_id": request.session_id,
+        "mesh_version": mesh_version,
+        "planner_can_run": True,
+    }
 
 @app.post("/session/stream")
 async def stream_frame(request: StreamFrameRequest):
