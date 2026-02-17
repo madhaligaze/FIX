@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import math
 import numpy as np
 
+from modules.information_gain import TargetBox, estimate_information_gain
+
 
 def _vec3(p: Dict[str, Any]) -> np.ndarray:
     return np.array([float(p.get("x", 0.0)), float(p.get("y", 0.0)), float(p.get("z", 0.0))], dtype=float)
@@ -128,8 +130,14 @@ def _score_candidate(
     target: np.ndarray,
     cluster_priority: float,
     default_distance_m: float,
+    target_box: Optional[Dict[str, Any]] = None,
+    gain_weight: float = 8.0,
+    gain_samples: int = 220,
 ) -> Tuple[float, Dict[str, Any]]:
-    """Compute a conservative score for a candidate view."""
+    """Compute a conservative score for a candidate view.
+
+    Adds a Stage 7 information-gain proxy when target_box is available.
+    """
     dist = float(np.linalg.norm(pos - target))
     score = float(cluster_priority)
     diag: Dict[str, Any] = {"distance_m": dist}
@@ -147,7 +155,6 @@ def _score_candidate(
     try:
         st = int(voxel_world.get_state(float(pos[0]), float(pos[1]), float(pos[2])))
         diag["pos_state"] = st
-        # In this repo: OCCUPIED is positive constant, UNKNOWN is -1.
         if st == getattr(voxel_world, "OCCUPIED", 1):
             score -= 20.0
             diag["pos_penalty"] = 20.0
@@ -186,6 +193,27 @@ def _score_candidate(
     except Exception:
         pass
 
+    # Stage 7: Information gain proxy in the planning target region.
+    if target_box:
+        try:
+            c = target_box.get("center") or {}
+            h = target_box.get("half_extents") or target_box.get("half_extents_m") or {}
+            box = TargetBox(
+                center=(float(c.get("x", 0.0)), float(c.get("y", 0.0)), float(c.get("z", 0.0))),
+                half_extents=(float(h.get("x", 0.0)), float(h.get("y", 0.0)), float(h.get("z", 0.0))),
+            )
+            gain, gdiag = estimate_information_gain(
+                voxel_world=voxel_world,
+                camera_pos=(float(pos[0]), float(pos[1]), float(pos[2])),
+                box=box,
+                max_samples=int(gain_samples),
+            )
+            diag["info_gain"] = float(gain)
+            diag["info_gain_diag"] = gdiag
+            score += float(gain_weight) * float(gain)
+        except Exception:
+            pass
+
     return score, diag
 
 
@@ -193,6 +221,9 @@ def propose_views(
     scan_suggestions: List[Dict[str, Any]],
     current_pose: Optional[List[float]],
     voxel_world: Any = None,
+    target_box: Optional[Dict[str, Any]] = None,
+    gain_weight: float = 8.0,
+    gain_samples: int = 220,
     default_distance_m: float = 1.6,
     max_views: int = 3,
     angles_deg: Tuple[float, ...] = (0.0, 25.0, -25.0, 55.0, -55.0, 180.0),
@@ -245,6 +276,9 @@ def propose_views(
                 target=target,
                 cluster_priority=float(c.get("priority", 0.0)),
                 default_distance_m=float(default_distance_m),
+                target_box=target_box,
+                gain_weight=float(gain_weight),
+                gain_samples=int(gain_samples),
             )
             candidates.append(
                 {

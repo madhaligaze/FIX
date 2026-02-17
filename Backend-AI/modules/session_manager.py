@@ -35,10 +35,10 @@ class SceneContext:
         self.obstacles: List[Dict[str, Any]] = []
         self.voxel_world = None
         self.tsdf_integrator = None
-        # Stage 5/6: self-critique and active scanning hints
-        self.last_reprojection: Dict[str, Any] = {}
+        # Stage 5/6/7: last diagnostics
+        self.last_reprojection: Optional[Dict[str, Any]] = None
         self.last_scan_suggestions: List[Dict[str, Any]] = []
-        self.last_scan_plan: Dict[str, Any] = {}
+        self.last_scan_plan: Optional[Dict[str, Any]] = None
 
     def ensure_voxel_world(self):
         if self.voxel_world is None:
@@ -58,6 +58,10 @@ class SceneContext:
                 self.tsdf_integrator = TSDFIntegrator()
             except Exception:
                 self.tsdf_integrator = None
+        # Stage 5/6/7: last diagnostics
+        self.last_reprojection: Optional[Dict[str, Any]] = None
+        self.last_scan_suggestions: List[Dict[str, Any]] = []
+        self.last_scan_plan: Optional[Dict[str, Any]] = None
         return self.tsdf_integrator
 
     def ensure_perception_backend(self):
@@ -114,9 +118,9 @@ class SceneContext:
         ctx.world_objects = data.get("world_objects", [])
         ctx.point_cloud = data.get("point_cloud", [])
         ctx.obstacles = data.get("obstacles", [])
-        ctx.last_reprojection = data.get("last_reprojection", {})
+        ctx.last_reprojection = data.get("last_reprojection")
         ctx.last_scan_suggestions = data.get("last_scan_suggestions", [])
-        ctx.last_scan_plan = data.get("last_scan_plan", {})
+        ctx.last_scan_plan = data.get("last_scan_plan")
         return ctx
 
 

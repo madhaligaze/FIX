@@ -13,7 +13,7 @@ Main FastAPI Server - AI Brain Backend
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
 import base64
 import time
@@ -62,11 +62,14 @@ from modules.debug_dumper import DebugDumper
 try:
     from modules.reprojection_check import run_reprojection_check
     from modules.active_scanning import propose_views
+    from modules.readiness import ReadinessThresholds, compute_readiness
 
     VALIDATION_AVAILABLE = True
 except Exception:
     run_reprojection_check = None
     propose_views = None
+    ReadinessThresholds = None
+    compute_readiness = None
     VALIDATION_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -167,6 +170,129 @@ def _normalize_camera_pose(camera_pose: Optional[List[float]]) -> List[float]:
         return [cp[0], cp[1], cp[2], 0, 0, 0, 1]
 
     return [0, 0, 0, 0, 0, 0, 1]
+
+
+def _box_from_points(points: List[Dict[str, Any]], margin_m: float = 1.5) -> Optional[Dict[str, Any]]:
+    if not points:
+        return None
+    xs = [float(p.get("x", 0.0)) for p in points]
+    ys = [float(p.get("y", 0.0)) for p in points]
+    zs = [float(p.get("z", 0.0)) for p in points]
+    mn = (min(xs), min(ys), min(zs))
+    mx = (max(xs), max(ys), max(zs))
+    center = {"x": 0.5 * (mn[0] + mx[0]), "y": 0.5 * (mn[1] + mx[1]), "z": 0.5 * (mn[2] + mx[2])}
+    half = {
+        "x": 0.5 * (mx[0] - mn[0]) + float(margin_m),
+        "y": 0.5 * (mx[1] - mn[1]) + float(margin_m),
+        "z": 0.5 * (mx[2] - mn[2]) + float(margin_m),
+    }
+    return {"center": center, "half_extents": half}
+
+
+def _derive_target_box_for_planning(request: Any, session: Any) -> Optional[Dict[str, Any]]:
+    if getattr(request, "target_box", None) is not None:
+        tb = request.target_box
+        return {
+            "center": {"x": float(tb.center.x), "y": float(tb.center.y), "z": float(tb.center.z)},
+            "half_extents": {"x": float(tb.half_extents.x), "y": float(tb.half_extents.y), "z": float(tb.half_extents.z)},
+        }
+
+    if getattr(request, "target_point", None) is not None:
+        tp = request.target_point
+        dims = getattr(request, "target_dimensions", {}) or {}
+        w = float(dims.get("width", 4.0))
+        h = float(dims.get("height", 3.0))
+        d = float(dims.get("depth", 2.0))
+        buffer_m = float(dims.get("unknown_buffer", 3.0))
+        return {
+            "center": {"x": float(tp.x), "y": float(tp.y), "z": float(tp.z)},
+            "half_extents": {"x": 0.5 * w + buffer_m, "y": 0.5 * h + buffer_m, "z": 0.5 * d + buffer_m},
+        }
+
+    pts = []
+    try:
+        for p in getattr(request, "user_points", []) or []:
+            pts.append({"x": float(p.x), "y": float(p.y), "z": float(p.z)})
+    except Exception:
+        pass
+    try:
+        for p in getattr(session.scene_context, "all_ar_points", []) or []:
+            if isinstance(p, dict):
+                pts.append({"x": float(p.get("x", 0.0)), "y": float(p.get("y", 0.0)), "z": float(p.get("z", 0.0))})
+    except Exception:
+        pass
+
+    box = _box_from_points(pts, margin_m=2.5)
+    if box is not None:
+        box["half_extents"]["y"] = max(float(box["half_extents"]["y"]), 3.0)
+        return box
+
+    try:
+        sugg = getattr(session.scene_context, "last_scan_suggestions", []) or []
+        pts2 = []
+        for s in sugg:
+            p = s.get("point") or s
+            if isinstance(p, dict):
+                pts2.append(p)
+        box2 = _box_from_points(pts2, margin_m=2.0)
+        if box2 is not None:
+            box2["half_extents"]["y"] = max(float(box2["half_extents"]["y"]), 3.0)
+        return box2
+    except Exception:
+        return None
+
+
+def _compute_scan_plan(
+    session: Any,
+    current_pose: Optional[List[float]],
+    target_box: Optional[Dict[str, Any]],
+    *,
+    max_views: int = 3,
+    distance_m: float = 1.6,
+    angles_deg: Optional[List[float]] = None,
+    distance_multipliers: Optional[List[float]] = None,
+    gain_weight: float = 8.0,
+    gain_samples: int = 220,
+    thresholds: Optional[Any] = None,
+) -> Dict[str, Any]:
+    voxel_world = session.scene_context.ensure_voxel_world()
+    scan_suggestions = list(getattr(session.scene_context, "last_scan_suggestions", []) or [])
+
+    plan = {"clusters": [], "next_best_views": []}
+    if VALIDATION_AVAILABLE and propose_views is not None:
+        plan = propose_views(
+            scan_suggestions=scan_suggestions,
+            current_pose=current_pose,
+            voxel_world=voxel_world,
+            target_box=target_box,
+            default_distance_m=float(distance_m),
+            max_views=int(max_views),
+            angles_deg=tuple(float(a) for a in (angles_deg or [0.0, 25.0, -25.0, 55.0, -55.0, 180.0])),
+            distance_multipliers=tuple(float(m) for m in (distance_multipliers or [1.0, 1.25])),
+            gain_weight=float(gain_weight),
+            gain_samples=int(gain_samples),
+        )
+
+    readiness = None
+    if target_box is not None and voxel_world is not None and compute_readiness is not None:
+        c = target_box.get("center") or {}
+        h = target_box.get("half_extents") or {}
+        readiness = compute_readiness(
+            voxel_world=voxel_world,
+            target_center=(float(c.get("x", 0.0)), float(c.get("y", 0.0)), float(c.get("z", 0.0))),
+            target_half_extents=(float(h.get("x", 0.0)), float(h.get("y", 0.0)), float(h.get("z", 0.0))),
+            reprojection=getattr(session.scene_context, "last_reprojection", None),
+            thresholds=thresholds,
+        )
+
+    plan_out = {
+        "target_box": target_box,
+        "clusters": plan.get("clusters", []),
+        "next_best_views": plan.get("next_best_views", []),
+        "readiness": readiness,
+    }
+    session.scene_context.last_scan_plan = plan_out
+    return plan_out
 
 
 def _build_layher_bom_from_elements(elements: List[Dict[str, Any]]) -> BillOfMaterials:
@@ -277,6 +403,15 @@ class StreamFrameRequest(BaseModel):
 class GenerateRequest(BaseModel):
     """Запрос на генерацию вариантов"""
     session_id: str
+    require_ready: bool = True
+    allow_override: bool = False
+    target_box: Optional["TargetBoxModel"] = None
+    gain_weight: float = 8.0
+    gain_samples: int = 220
+    max_unknown_ratio: float = 0.45
+    max_miss_rate: float = 0.20
+    max_mismatch_rate: float = 0.12
+    max_median_abs_error_m: float = 0.07
     target_dimensions: Dict[str, float]  # {width, height, depth}
     user_points: List[Point3D] = []
     use_ai_detection: bool = True
@@ -284,8 +419,6 @@ class GenerateRequest(BaseModel):
     planner_mode: str = "beam"  # legacy|beam
     max_variants: int = 3
     unknown_policy: str = "forbid"  # forbid|buffer
-    # НОВОЕ: если задан — используем AutoScaffolder вместо старого генератора.
-    # Формат: {"x": f, "y": f, "z": f} — точка доступа (труба/оборудование на потолке).
     target_point: Optional[Point3D] = None
 
 
@@ -380,31 +513,27 @@ class FramePacketRequest(BaseModel):
 class LockWorldRequest(BaseModel):
     session_id: str
 
-class ScanPlanRequest(BaseModel):
-    """Запрос плана активного досканирования (Stage 6.2).
 
-    Можно (опционально) указать target_box - регион, который надо досканировать
-    (например, рабочая зона +3м вокруг будущих лесов). Если не указан,
-    используется локальная область вокруг последней позы камеры.
-    """
+class TargetBoxModel(BaseModel):
+    center: Point3D
+    half_extents: Point3D
+
+
+class ScanPlanRequest(BaseModel):
+    """Запрос плана активного досканирования (Stage 6/7)."""
 
     session_id: str
+    target_box: Optional[TargetBoxModel] = None
     max_views: int = 3
     distance_m: float = 1.6
-
-    # Optional target region for readiness gating
-    target_center: Optional[Point3D] = None
-    target_half_extents: Optional[Point3D] = None
-
-    # View generation knobs
-    angles_deg: List[float] = [0.0, 30.0, -30.0, 60.0, -60.0]
-    distance_multipliers: List[float] = [1.0, 1.25]
-
-    # Readiness thresholds
+    angles_deg: List[float] = Field(default_factory=lambda: [0.0, 25.0, -25.0, 55.0, -55.0, 180.0])
+    distance_multipliers: List[float] = Field(default_factory=lambda: [1.0, 1.25])
+    gain_weight: float = 8.0
+    gain_samples: int = 220
+    max_unknown_ratio: float = 0.45
     max_miss_rate: float = 0.20
     max_mismatch_rate: float = 0.12
     max_median_abs_error_m: float = 0.07
-    max_unknown_ratio: float = 0.45
 
 
 class StructureModifyRequest(BaseModel):
@@ -425,6 +554,9 @@ class AutoScaffoldRequest(BaseModel):
     floor_z: float = 0.0
     ledger_len: float = 1.09
     standard_h: float = 2.07
+
+
+GenerateRequest.update_forward_refs(TargetBoxModel=TargetBoxModel)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -586,6 +718,7 @@ async def ingest_frame_packet(request: FramePacketRequest):
                     cx_px=float(request.cx_px),
                     cy_px=float(request.cy_px),
                     camera_pose=_normalize_camera_pose(request.pose_world_from_camera),
+                    sample_step_px=12,
                 )
                 reprojection = {
                     "ok": bool(r.ok),
@@ -639,25 +772,21 @@ async def ingest_frame_packet(request: FramePacketRequest):
         if scan_suggestions_model:
             scan_suggestions.extend(scan_suggestions_model)
 
-        # --- Stage 6: Active scanning plan (clusters + view proposals) ---
-        scan_plan = {}
-        pose = _normalize_camera_pose(request.pose_world_from_camera)
-        if scan_suggestions and VALIDATION_AVAILABLE and propose_views is not None:
-            try:
-                scan_plan = propose_views(
-                    scan_suggestions=scan_suggestions,
-                    current_pose=pose,
-                    voxel_world=voxel_world,
-                    default_distance_m=1.6,
-                    max_views=3,
-                )
-            except Exception:
-                scan_plan = {}
-
-        # Persist Stage 5/6 outputs in the session context
+        # Persist Stage diagnostics in the session context
         session.scene_context.last_reprojection = reprojection or {}
         session.scene_context.last_scan_suggestions = scan_suggestions or []
-        session.scene_context.last_scan_plan = scan_plan or {}
+
+        pose = _normalize_camera_pose(request.pose_world_from_camera)
+        scan_plan = _compute_scan_plan(
+            session=session,
+            current_pose=pose,
+            target_box=_box_from_points(
+                [s.get("point") or s for s in (scan_suggestions or []) if isinstance((s.get("point") or s), dict)],
+                margin_m=2.0,
+            ),
+            max_views=3,
+            distance_m=1.6,
+        )
 
         # Lightweight local unknown-space estimate for UI guidance
         try:
@@ -715,104 +844,57 @@ async def ingest_frame_packet(request: FramePacketRequest):
 
 @app.post("/session/scan_plan")
 async def get_scan_plan(request: ScanPlanRequest):
-    """Stage 6: return clustered scan targets and suggested next views."""
+    """Return an active scanning plan for the operator (Stage 6/7)."""
     session = session_manager.get_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Сессия не найдена")
 
-    ctx = session.scene_context
-    suggestions = list(ctx.last_scan_suggestions or [])
+    tb = None
+    if request.target_box is not None:
+        tb = {
+            "center": {
+                "x": float(request.target_box.center.x),
+                "y": float(request.target_box.center.y),
+                "z": float(request.target_box.center.z),
+            },
+            "half_extents": {
+                "x": float(request.target_box.half_extents.x),
+                "y": float(request.target_box.half_extents.y),
+                "z": float(request.target_box.half_extents.z),
+            },
+        }
+    else:
+        sugg = getattr(session.scene_context, "last_scan_suggestions", []) or []
+        pts = []
+        for s in sugg:
+            p = s.get("point") or s
+            if isinstance(p, dict):
+                pts.append(p)
+        tb = _box_from_points(pts, margin_m=2.0)
 
-    pose = None
-    if session.frames:
-        try:
-            pose = session.frames[-1].camera_position
-        except Exception:
-            pose = None
+    th = None
+    if ReadinessThresholds is not None:
+        th = ReadinessThresholds(
+            max_unknown_ratio=float(request.max_unknown_ratio),
+            max_miss_rate=float(request.max_miss_rate),
+            max_mismatch_rate=float(request.max_mismatch_rate),
+            max_median_abs_error_m=float(request.max_median_abs_error_m),
+        )
 
-    plan = ctx.last_scan_plan or {}
+    plan = _compute_scan_plan(
+        session=session,
+        current_pose=None,
+        target_box=tb,
+        max_views=int(request.max_views),
+        distance_m=float(request.distance_m),
+        angles_deg=list(request.angles_deg or []),
+        distance_multipliers=list(request.distance_multipliers or []),
+        gain_weight=float(request.gain_weight),
+        gain_samples=int(request.gain_samples),
+        thresholds=th,
+    )
 
-    # Get voxel world for scoring visibility / UNKNOWN density
-    vw = None
-    try:
-        vw = ctx.ensure_voxel_world()
-    except Exception:
-        vw = None
-
-    if suggestions and VALIDATION_AVAILABLE and propose_views is not None:
-        try:
-            plan = propose_views(
-                scan_suggestions=suggestions,
-                current_pose=pose,
-                voxel_world=vw,
-                default_distance_m=float(request.distance_m),
-                max_views=int(request.max_views),
-                angles_deg=tuple(float(a) for a in (request.angles_deg or [])) or None,
-                distance_multipliers=tuple(float(m) for m in (request.distance_multipliers or [])) or None,
-            )
-        except Exception:
-            plan = ctx.last_scan_plan or {}
-
-    ctx.last_scan_plan = plan or {}
-
-    # Conservative readiness signal for UX:
-    # - if reprojection says ok and few scan suggestions, we can allow "lock".
-    # Conservative readiness signal for UX (Stage 6.2):
-    # - require reprojection to be OK and within thresholds
-    # - require UNKNOWN fraction in target_box to be small
-    reproj = (ctx.last_reprojection or {})
-    reproj_ok = bool(reproj.get("ok", True))
-    miss_rate = float(reproj.get("miss_rate", 0.0) or 0.0)
-    mismatch_rate = float(reproj.get("mismatch_rate", 0.0) or 0.0)
-    median_err = float(reproj.get("median_abs_error_m", 0.0) or 0.0)
-
-    # default readiness
-    ready = reproj_ok and (len(suggestions) <= 8)
-
-    # compute UNKNOWN ratio in target region
-    unknown_target = None
-    try:
-        vw = ctx.ensure_voxel_world()
-        if vw is not None:
-            if request.target_center and request.target_half_extents:
-                c = request.target_center
-                h = request.target_half_extents
-                center = (float(c.x), float(c.y), float(c.z))
-                half = (float(h.x), float(h.y), float(h.z))
-            elif pose and len(pose) >= 3:
-                center = (float(pose[0]), float(pose[1]), float(pose[2]))
-                half = (2.0, 2.0, 2.0)
-            else:
-                center = (0.0, 0.0, 0.0)
-                half = (2.0, 2.0, 2.0)
-
-            unknown_target = vw.unknown_fraction_in_box(
-                center_world=center,
-                half_extents_m=half,
-                sample_step_vox=3,
-            )
-
-            # readiness gating with thresholds
-            if miss_rate > float(request.max_miss_rate):
-                ready = False
-            if mismatch_rate > float(request.max_mismatch_rate):
-                ready = False
-            if median_err > float(request.max_median_abs_error_m):
-                ready = False
-            if unknown_target is not None and float(unknown_target) > float(request.max_unknown_ratio):
-                ready = False
-    except Exception:
-        pass
-    return {
-        "session_id": request.session_id,
-        "scan_suggestions": suggestions,
-        "scan_plan": plan,
-        "readiness": {
-            "ready_to_lock": bool(ready),
-            "reprojection_ok": bool(reproj_ok),
-            "unknown_local_ratio": float(unknown_target) if unknown_target is not None else None,
-        },
-    }
+    return {"status": "ok", "session_id": request.session_id, "scan_plan": plan}
 
 
 @app.post("/session/lock_world")
@@ -938,6 +1020,52 @@ async def generate_variants(request: GenerateRequest):
         session = session_manager.get_session(request.session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+        if bool(getattr(request, "require_ready", True)) and compute_readiness is not None:
+            voxel_world_gate = session.scene_context.ensure_voxel_world()
+            tb = _derive_target_box_for_planning(request, session)
+            if tb is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Недостаточно данных для готовности: передайте target_box/target_point или поставьте точки опоры.",
+                )
+
+            th = ReadinessThresholds(
+                max_unknown_ratio=float(getattr(request, "max_unknown_ratio", 0.45)),
+                max_miss_rate=float(getattr(request, "max_miss_rate", 0.20)),
+                max_mismatch_rate=float(getattr(request, "max_mismatch_rate", 0.12)),
+                max_median_abs_error_m=float(getattr(request, "max_median_abs_error_m", 0.07)),
+            )
+            readiness = compute_readiness(
+                voxel_world=voxel_world_gate,
+                target_center=(float(tb["center"]["x"]), float(tb["center"]["y"]), float(tb["center"]["z"])),
+                target_half_extents=(
+                    float(tb["half_extents"]["x"]),
+                    float(tb["half_extents"]["y"]),
+                    float(tb["half_extents"]["z"]),
+                ),
+                reprojection=getattr(session.scene_context, "last_reprojection", None),
+                thresholds=th,
+            )
+
+            if not readiness.get("ready_to_lock", False) and not bool(getattr(request, "allow_override", False)):
+                plan = _compute_scan_plan(
+                    session=session,
+                    current_pose=None,
+                    target_box=tb,
+                    max_views=3,
+                    distance_m=1.6,
+                    gain_weight=float(getattr(request, "gain_weight", 8.0)),
+                    gain_samples=int(getattr(request, "gain_samples", 220)),
+                    thresholds=th,
+                )
+                return {
+                    "status": "insufficient_data",
+                    "mode": "readiness_gate",
+                    "readiness": readiness,
+                    "scan_plan": plan,
+                    "message": "Недостаточно данных в целевой зоне. Досканьте указанные места или передайте allow_override=true.",
+                }
 
         # ── НОВОЕ: AutoScaffolder — умная сборка от целевой точки ────────────
         if request.target_point is not None and BRAIN_V3_AVAILABLE:
