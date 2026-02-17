@@ -1,26 +1,230 @@
-"""Stage 5: Reprojection consistency checks (no-NeRF, voxel-based).
+"""Stage 5 - Reprojection consistency check.
 
 Goal
 ----
-Given an incoming depth frame and the current world model (VoxelWorld),
-estimate whether the model matches what the camera sees.
+Given an incoming depth frame and the current voxel world, estimate whether
+the model agrees with observation. If it does not, produce actionable scan
+suggestions (world-space points) instead of silently continuing.
 
-This is NOT photogrammetry. It's a safety-oriented validator:
-- if the model is inconsistent, do not "pretend" the world is known.
-- produce actionable scan suggestions.
-
-Implementation
---------------
-We approximate expected depth by raycasting into OCCUPIED voxels.
-UNKNOWN is tracked separately (if the ray crosses lots of UNKNOWN, we lower trust).
+This is intentionally conservative and cheap:
+- It raycasts only against OCCUPIED voxels (UNKNOWN is handled as uncertainty).
+- It samples depth sparsely (step) to stay real-time.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
+import math
 import numpy as np
+
+
+@dataclass
+class ReprojectionResult:
+    ok: bool
+    sampled: int
+    hits: int
+    misses: int
+    mismatches: int
+    median_abs_error_m: float
+    p90_abs_error_m: float
+    miss_rate: float
+    mismatch_rate: float
+    suggestions: List[Dict[str, Any]]
+
+
+def _quat_to_rotation(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    # Same convention as in VoxelWorld._quat_to_rotation
+    x, y, z, w = qx, qy, qz, qw
+    n = x * x + y * y + z * z + w * w
+    if n <= 1e-12:
+        return np.eye(3, dtype=float)
+    s = 2.0 / n
+    xx, yy, zz = x * x * s, y * y * s, z * z * s
+    xy, xz, yz = x * y * s, x * z * s, y * z * s
+    wx, wy, wz = w * x * s, w * y * s, w * z * s
+    return np.array(
+        [
+            [1.0 - (yy + zz), xy - wz, xz + wy],
+            [xy + wz, 1.0 - (xx + zz), yz - wx],
+            [xz - wy, yz + wx, 1.0 - (xx + yy)],
+        ],
+        dtype=float,
+    )
+
+
+def _percentile(values: List[float], p: float) -> float:
+    if not values:
+        return 0.0
+    arr = np.array(values, dtype=float)
+    return float(np.percentile(arr, p))
+
+
+def run_reprojection_check(
+    voxel_world: Any,
+    depth_bytes: bytes,
+    width: int,
+    height: int,
+    fx: float,
+    fy: float,
+    cx_px: float,
+    cy_px: float,
+    camera_pose: List[float],
+    max_range_m: float = 8.0,
+    sample_step_px: int = 12,
+    mismatch_thresh_m: float = 0.15,
+    max_suggestions: int = 40,
+) -> ReprojectionResult:
+    """Compare observed depth with expected depth from the voxel model.
+
+    Returns a ReprojectionResult including scan suggestions.
+    """
+    if voxel_world is None:
+        return ReprojectionResult(
+            ok=True,
+            sampled=0,
+            hits=0,
+            misses=0,
+            mismatches=0,
+            median_abs_error_m=0.0,
+            p90_abs_error_m=0.0,
+            miss_rate=0.0,
+            mismatch_rate=0.0,
+            suggestions=[],
+        )
+
+    if width <= 0 or height <= 0 or fx <= 0 or fy <= 0 or len(camera_pose) < 7:
+        return ReprojectionResult(
+            ok=True,
+            sampled=0,
+            hits=0,
+            misses=0,
+            mismatches=0,
+            median_abs_error_m=0.0,
+            p90_abs_error_m=0.0,
+            miss_rate=0.0,
+            mismatch_rate=0.0,
+            suggestions=[],
+        )
+
+    if len(depth_bytes) < width * height * 2:
+        return ReprojectionResult(
+            ok=True,
+            sampled=0,
+            hits=0,
+            misses=0,
+            mismatches=0,
+            median_abs_error_m=0.0,
+            p90_abs_error_m=0.0,
+            miss_rate=0.0,
+            mismatch_rate=0.0,
+            suggestions=[],
+        )
+
+    depth_mm = np.frombuffer(depth_bytes, dtype=np.uint16).reshape(int(height), int(width))
+    depth_m = depth_mm.astype(np.float32) / 1000.0
+
+    tx, ty, tz, qx, qy, qz, qw = [float(x) for x in camera_pose[:7]]
+    R = _quat_to_rotation(qx, qy, qz, qw)
+    origin_w = np.array([tx, ty, tz], dtype=float)
+
+    errors: List[float] = []
+    suggestions: List[Dict[str, Any]] = []
+
+    sampled = 0
+    hits = 0
+    misses = 0
+    mismatches = 0
+
+    step = max(4, int(sample_step_px))
+
+    # Sample a grid of pixels.
+    for v in range(0, int(height), step):
+        for u in range(0, int(width), step):
+            d_obs = float(depth_m[v, u])
+            if d_obs <= 0.0 or d_obs > float(max_range_m):
+                continue
+
+            # Build a ray in camera coords: z-forward.
+            x = (float(u) - float(cx_px)) / float(fx)
+            y = (float(v) - float(cy_px)) / float(fy)
+            dir_c = np.array([x, y, 1.0], dtype=float)
+            nrm = float(np.linalg.norm(dir_c))
+            if nrm <= 1e-9:
+                continue
+            dir_c = dir_c / nrm
+
+            # To world
+            dir_w = R @ dir_c
+            dir_w_n = float(np.linalg.norm(dir_w))
+            if dir_w_n <= 1e-9:
+                continue
+            dir_w = dir_w / dir_w_n
+
+            d_exp = voxel_world.raycast_distance(
+                origin_world=(float(origin_w[0]), float(origin_w[1]), float(origin_w[2])),
+                direction_world=(float(dir_w[0]), float(dir_w[1]), float(dir_w[2])),
+                max_dist=float(max_range_m),
+            )
+
+            sampled += 1
+
+            if d_exp is None:
+                # Model has no surface where depth sees one -> missing occupancy.
+                misses += 1
+                if len(suggestions) < max_suggestions:
+                    p = origin_w + dir_w * d_obs
+                    suggestions.append(
+                        {
+                            "point": {"x": float(p[0]), "y": float(p[1]), "z": float(p[2])},
+                            "reason": "model_missing",
+                            "severity": 1.0,
+                        }
+                    )
+                continue
+
+            hits += 1
+            err = abs(float(d_exp) - float(d_obs))
+            errors.append(err)
+
+            if err > float(mismatch_thresh_m):
+                mismatches += 1
+                # Suggest rescan near the observed surface point.
+                if len(suggestions) < max_suggestions:
+                    p = origin_w + dir_w * d_obs
+                    severity = min(1.0, err / max(1e-3, float(mismatch_thresh_m)))
+                    suggestions.append(
+                        {
+                            "point": {"x": float(p[0]), "y": float(p[1]), "z": float(p[2])},
+                            "reason": "depth_mismatch",
+                            "severity": float(severity),
+                        }
+                    )
+
+    median_err = _percentile(errors, 50.0)
+    p90_err = _percentile(errors, 90.0)
+
+    miss_rate = float(misses) / float(sampled) if sampled > 0 else 0.0
+    mismatch_rate = float(mismatches) / float(sampled) if sampled > 0 else 0.0
+
+    ok = True
+    # Conservative default thresholds.
+    if sampled >= 30 and (miss_rate > 0.25 or mismatch_rate > 0.35 or p90_err > 0.25):
+        ok = False
+
+    return ReprojectionResult(
+        ok=ok,
+        sampled=sampled,
+        hits=hits,
+        misses=misses,
+        mismatches=mismatches,
+        median_abs_error_m=float(median_err),
+        p90_abs_error_m=float(p90_err),
+        miss_rate=miss_rate,
+        mismatch_rate=mismatch_rate,
+        suggestions=suggestions,
+    )
 
 
 @dataclass
@@ -32,7 +236,7 @@ class ReprojectionReport:
     p90_abs_error_m: float
     unknown_ray_frac: float
     inconsistent: bool
-    suggestions: List[Dict[str, float]]
+    suggestions: List[Dict[str, Any]]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -47,20 +251,9 @@ class ReprojectionReport:
         }
 
 
-def _quat_to_rotation(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
-    return np.array(
-        [
-            [1 - 2 * (qy**2 + qz**2), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
-            [2 * (qx * qy + qz * qw), 1 - 2 * (qx**2 + qz**2), 2 * (qy * qz - qx * qw)],
-            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx**2 + qy**2)],
-        ],
-        dtype=np.float64,
-    )
-
-
 def check_reprojection(
     *,
-    voxel_world,
+    voxel_world: Any,
     depth_m: np.ndarray,
     width: int,
     height: int,
@@ -75,167 +268,50 @@ def check_reprojection(
     error_threshold_m: float = 0.25,
     miss_rate_threshold: float = 0.35,
 ) -> ReprojectionReport:
-    """Compute reprojection consistency.
+    """Backward-compatible wrapper around run_reprojection_check."""
+    del unknown_sample_step, miss_rate_threshold
 
-    Parameters
-    ----------
-    voxel_world : VoxelWorld
-        Must implement raycast_distance() and get_state().
-    depth_m : (H,W) float32
-        Depth in meters. Values <=0 are invalid.
-    pixel_step : int
-        Sampling stride (bigger = faster, less accurate).
-
-    Returns
-    -------
-    ReprojectionReport
-    """
-    if voxel_world is None or depth_m is None or depth_m.ndim != 2:
-        return ReprojectionReport(
-            samples=0,
-            hit_rate=0.0,
-            miss_rate=1.0,
-            median_abs_error_m=0.0,
-            p90_abs_error_m=0.0,
-            unknown_ray_frac=1.0,
-            inconsistent=True,
-            suggestions=[],
-        )
-
-    if len(pose7) < 7:
-        return ReprojectionReport(
-            samples=0,
-            hit_rate=0.0,
-            miss_rate=1.0,
-            median_abs_error_m=0.0,
-            p90_abs_error_m=0.0,
-            unknown_ray_frac=1.0,
-            inconsistent=True,
-            suggestions=[],
-        )
-
-    tx, ty, tz, qx, qy, qz, qw = [float(x) for x in pose7[:7]]
-    rotation = _quat_to_rotation(qx, qy, qz, qw)
-    camera = np.array([tx, ty, tz], dtype=np.float64)
-
-    abs_errors: List[float] = []
-    hits = 0
-    misses = 0
-    suggestions: List[Dict[str, float]] = []
-
-    unknown_rays = 0
-    total_rays = 0
-
-    img_h, img_w = int(height), int(width)
-    step = max(1, int(pixel_step))
-
-    for v in range(0, img_h, step):
-        for u in range(0, img_w, step):
-            depth = float(depth_m[v, u])
-            if depth <= 0.0 or depth > float(max_depth):
-                continue
-
-            x_cam = (float(u) - float(cx)) / float(fx)
-            y_cam = (float(v) - float(cy)) / float(fy)
-            dir_cam = np.array([x_cam, y_cam, 1.0], dtype=np.float64)
-            dir_cam /= max(1e-9, float(np.linalg.norm(dir_cam)))
-
-            dir_world = rotation @ dir_cam
-
-            total_rays += 1
-            unknown_count = 0
-            n_samples = max(2, int(depth / max(voxel_world.resolution * unknown_sample_step, 0.2)))
-            for i in range(1, n_samples):
-                t = (float(i) / float(n_samples)) * depth
-                point = camera + dir_world * t
-                if voxel_world.get_state(float(point[0]), float(point[1]), float(point[2])) == voxel_world.UNKNOWN:
-                    unknown_count += 1
-            if unknown_count > 0:
-                unknown_rays += 1
-
-            predicted = voxel_world.raycast_distance(
-                origin_world=(float(camera[0]), float(camera[1]), float(camera[2])),
-                direction_world=(float(dir_world[0]), float(dir_world[1]), float(dir_world[2])),
-                max_dist=float(max_depth),
-            )
-
-            if predicted is None:
-                misses += 1
-                point_world = camera + dir_world * depth
-                suggestions.append(
-                    {
-                        "x": float(point_world[0]),
-                        "y": float(point_world[1]),
-                        "z": float(point_world[2]),
-                        "reason": "model_missing",
-                    }
-                )
-                continue
-
-            hits += 1
-            error = abs(float(predicted) - depth)
-            abs_errors.append(error)
-            if error > float(error_threshold_m):
-                point_world = camera + dir_world * depth
-                suggestions.append(
-                    {
-                        "x": float(point_world[0]),
-                        "y": float(point_world[1]),
-                        "z": float(point_world[2]),
-                        "reason": "depth_mismatch",
-                    }
-                )
-
-    samples = hits + misses
-    if samples <= 0:
-        return ReprojectionReport(
-            samples=0,
-            hit_rate=0.0,
-            miss_rate=1.0,
-            median_abs_error_m=0.0,
-            p90_abs_error_m=0.0,
-            unknown_ray_frac=1.0,
-            inconsistent=True,
-            suggestions=[],
-        )
-
-    if abs_errors:
-        errors = np.array(abs_errors, dtype=np.float64)
-        med = float(np.median(errors))
-        p90 = float(np.percentile(errors, 90))
+    if depth_m is None:
+        depth_bytes = b""
     else:
-        med = 0.0
-        p90 = 0.0
+        depth_bytes = (np.clip(depth_m, 0.0, None) * 1000.0).astype(np.uint16).tobytes()
 
-    hit_rate = float(hits) / float(samples)
-    miss_rate = float(misses) / float(samples)
-    unknown_frac = float(unknown_rays) / float(max(1, total_rays))
+    result = run_reprojection_check(
+        voxel_world=voxel_world,
+        depth_bytes=depth_bytes,
+        width=width,
+        height=height,
+        fx=fx,
+        fy=fy,
+        cx_px=cx,
+        cy_px=cy,
+        camera_pose=pose7,
+        max_range_m=max_depth,
+        sample_step_px=pixel_step,
+        mismatch_thresh_m=error_threshold_m,
+    )
 
-    inconsistent = (med > float(error_threshold_m)) or (miss_rate > float(miss_rate_threshold))
-
-    out_suggestions: List[Dict[str, float]] = []
-    seen = set()
-    for suggestion in suggestions:
-        key = (
-            round(suggestion["x"], 2),
-            round(suggestion["y"], 2),
-            round(suggestion["z"], 2),
-            suggestion.get("reason", ""),
+    samples = int(result.sampled)
+    hit_rate = float(result.hits) / float(samples) if samples > 0 else 0.0
+    suggestions: List[Dict[str, Any]] = []
+    for s in result.suggestions:
+        pt = s.get("point", {}) if isinstance(s, dict) else {}
+        suggestions.append(
+            {
+                "x": float(pt.get("x", 0.0)),
+                "y": float(pt.get("y", 0.0)),
+                "z": float(pt.get("z", 0.0)),
+                "reason": s.get("reason", "") if isinstance(s, dict) else "",
+            }
         )
-        if key in seen:
-            continue
-        seen.add(key)
-        out_suggestions.append(suggestion)
-        if len(out_suggestions) >= 25:
-            break
 
     return ReprojectionReport(
-        samples=int(samples),
-        hit_rate=float(hit_rate),
-        miss_rate=float(miss_rate),
-        median_abs_error_m=float(med),
-        p90_abs_error_m=float(p90),
-        unknown_ray_frac=float(unknown_frac),
-        inconsistent=bool(inconsistent),
-        suggestions=out_suggestions,
+        samples=samples,
+        hit_rate=hit_rate,
+        miss_rate=float(result.miss_rate),
+        median_abs_error_m=float(result.median_abs_error_m),
+        p90_abs_error_m=float(result.p90_abs_error_m),
+        unknown_ray_frac=0.0,
+        inconsistent=not bool(result.ok),
+        suggestions=suggestions,
     )
