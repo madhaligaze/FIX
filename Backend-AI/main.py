@@ -72,6 +72,8 @@ except Exception:
     compute_readiness = None
     VALIDATION_AVAILABLE = False
 
+from modules.readiness_calibration import extract_reprojection_metrics_from_frames, suggest_thresholds
+
 # ═══════════════════════════════════════════════════════════════════════════
 # FASTAPI APP
 # ═══════════════════════════════════════════════════════════════════════════
@@ -420,6 +422,7 @@ class GenerateRequest(BaseModel):
     max_variants: int = 3
     unknown_policy: str = "forbid"  # forbid|buffer
     target_point: Optional[Point3D] = None
+    force_unlocked: bool = False
 
 
 class AnalyzeRequest(BaseModel):
@@ -434,6 +437,23 @@ class ExportBOMRequest(BaseModel):
     """Запрос на экспорт спецификации"""
     session_id: str
     variant_index: int
+
+
+class SessionLockRequest(BaseModel):
+    session_id: str
+    reason: Optional[str] = "user_lock"
+    target_box: Optional[Dict[str, Any]] = None
+    thresholds: Optional[Dict[str, Any]] = None
+
+
+class SessionUnlockRequest(BaseModel):
+    session_id: str
+    reason: Optional[str] = "user_unlock"
+
+
+class ReadinessCalibrateRequest(BaseModel):
+    session_id: str
+    target_box: Optional[Dict[str, Any]] = None
 
 
 # ─── v3.0 Models ────────────────────────────────────────────────────────────
@@ -554,6 +574,7 @@ class AutoScaffoldRequest(BaseModel):
     floor_z: float = 0.0
     ledger_len: float = 1.09
     standard_h: float = 2.07
+    force_unlocked: bool = False
 
 
 GenerateRequest.update_forward_refs(TargetBoxModel=TargetBoxModel)
@@ -562,6 +583,39 @@ GenerateRequest.update_forward_refs(TargetBoxModel=TargetBoxModel)
 # ═══════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def summarize_session_metrics(session: Any) -> Dict[str, Any]:
+    frames = [f.to_dict() for f in getattr(session, "frames", [])]
+    metrics = extract_reprojection_metrics_from_frames(frames)
+    return {
+        "frames": len(frames),
+        "reprojection_metrics_count": len(metrics),
+        "last_reprojection": getattr(session.scene_context, "last_reprojection", None),
+    }
+
+
+def suggest_thresholds_from_session(session: Any, target_box: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    _ = target_box
+    frames = [f.to_dict() for f in getattr(session, "frames", [])]
+    metrics = extract_reprojection_metrics_from_frames(frames)
+    return suggest_thresholds(metrics)
+
+
+def _require_locked(session: Any, force_unlocked: bool = False) -> None:
+    if force_unlocked:
+        return
+    state = session.get_state() if hasattr(session, "get_state") else {"status": getattr(session, "status", "UNKNOWN")}
+    if not state.get("is_locked", False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "world_not_locked",
+                "message": "World is not locked. Finish scanning and lock the world before planning/export.",
+                "session_status": state.get("status"),
+                "lock_info": state.get("lock_info"),
+            },
+        )
 
 @app.get("/")
 async def root():
@@ -914,6 +968,76 @@ async def lock_world(request: LockWorldRequest):
         "planner_can_run": True,
     }
 
+
+@app.get("/session/state/{session_id}")
+async def get_session_state(session_id: str):
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    state = session.get_state() if hasattr(session, "get_state") else {"status": getattr(session, "status", "UNKNOWN")}
+    return {
+        "session_id": session_id,
+        "state": state,
+        "context_summary": session.scene_context.get_summary() if hasattr(session, "scene_context") else {},
+    }
+
+
+@app.post("/session/readiness/calibrate")
+async def calibrate_readiness(request: ReadinessCalibrateRequest):
+    session = session_manager.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    metrics = summarize_session_metrics(session)
+    suggested = suggest_thresholds_from_session(session, target_box=request.target_box)
+    return {
+        "session_id": request.session_id,
+        "metrics_summary": metrics,
+        "suggested_thresholds": suggested,
+    }
+
+
+@app.post("/session/lock")
+async def lock_world_v2(request: SessionLockRequest):
+    session = session_manager.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if getattr(session, "status", "") == "LOCKED":
+        return {
+            "session_id": request.session_id,
+            "status": "LOCKED",
+            "lock_info": session.lock_info.to_dict() if getattr(session, "lock_info", None) else None,
+        }
+
+    metrics = summarize_session_metrics(session)
+    suggested = suggest_thresholds_from_session(session, target_box=request.target_box)
+    thresholds = request.thresholds or suggested
+    lock_info = session.lock_world(
+        reason=request.reason or "user_lock",
+        thresholds=thresholds,
+        readiness={"metrics_summary": metrics, "target_box": request.target_box},
+    )
+    session_manager.auto_save_session(request.session_id)
+    return {
+        "session_id": request.session_id,
+        "status": "LOCKED",
+        "metrics_summary": metrics,
+        "thresholds": thresholds,
+        "lock_info": lock_info,
+    }
+
+
+@app.post("/session/unlock")
+async def unlock_world_v2(request: SessionUnlockRequest):
+    session = session_manager.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session.unlock_world(reason=request.reason or "user_unlock")
+    session_manager.auto_save_session(request.session_id)
+    return {
+        "session_id": request.session_id,
+        "status": getattr(session, "status", "ACTIVE"),
+    }
+
 @app.post("/session/stream")
 async def stream_frame(request: StreamFrameRequest):
     """
@@ -1020,6 +1144,8 @@ async def generate_variants(request: GenerateRequest):
         session = session_manager.get_session(request.session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+        _require_locked(session, force_unlocked=bool(getattr(request, "force_unlocked", False)))
 
         if bool(getattr(request, "require_ready", True)) and compute_readiness is not None:
             voxel_world_gate = session.scene_context.ensure_voxel_world()
@@ -1327,6 +1453,7 @@ async def export_bom(request: ExportBOMRequest):
         session = session_manager.get_session(request.session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Сессия не найдена")
+        _require_locked(session, force_unlocked=False)
         
         if request.variant_index >= len(session.generated_variants):
             raise HTTPException(status_code=400, detail="Неверный индекс варианта")
@@ -1633,6 +1760,7 @@ async def generate_auto_scaffold(request: AutoScaffoldRequest):
     session = session_manager.get_session(request.session_id)
     if not session:
         raise HTTPException(404, "Сессия не найдена")
+    _require_locked(session, force_unlocked=bool(getattr(request, "force_unlocked", False)))
 
     voxel_world = session.scene_context.ensure_voxel_world()
 
@@ -2147,6 +2275,7 @@ async def export_session_bom(session_id: str, format: str = "csv", project_name:
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    _require_locked(session, force_unlocked=False)
     if not session.current_structure and not session.generated_variants:
         raise HTTPException(status_code=400, detail="No structure to export")
 
