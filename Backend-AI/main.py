@@ -20,6 +20,7 @@ import time
 import traceback
 import json
 import logging
+import os
 
 # Импорты исправленных модулей
 from modules.layher_standards import (
@@ -75,6 +76,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _parse_allowed_origins() -> List[str]:
+    raw_origins = os.getenv("AI_BRAIN_ALLOWED_ORIGINS", "http://localhost,http://127.0.0.1")
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    return origins or ["http://localhost", "http://127.0.0.1"]
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -106,10 +112,11 @@ async def log_requests(request: Request, call_next):
         )
         raise
 
-# CORS для Android приложения
+# CORS policy configurable via environment variable AI_BRAIN_ALLOWED_ORIGINS.
+# Example: AI_BRAIN_ALLOWED_ORIGINS="https://app.example.com,https://admin.example.com"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене указать конкретные домены
+    allow_origins=_parse_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
