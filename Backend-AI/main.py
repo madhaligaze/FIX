@@ -216,17 +216,44 @@ class DetectedObject(BaseModel):
 
 
 class StreamFrameRequest(BaseModel):
-    """Запрос на стриминг кадра"""
+    """Запрос на стриминг кадра (legacy wrapper for FramePacket).
+
+    ВНИМАНИЕ:
+      - Для честного 2D->3D lifting нужны intrinsics + pose + (depth или point_cloud).
+      - Если этих полей нет, endpoint работает как legacy: только point_cloud -> VoxelWorld, без vision.
+      - Рекомендуемый endpoint: POST /session/frame (FramePacketRequest).
+    """
+
     session_id: str
-    frame_base64: str  # base64 encoded image
+
+    # Legacy: base64 encoded image (jpeg/png)
+    frame_base64: str
+
+    # Legacy: optional (Android used to send only position)
     camera_position: Optional[Dict] = None
+
+    # Legacy: user anchor points
     ar_points: List[Point3D] = []
-    # НОВОЕ: Облако точек от ARCore (мировые координаты, уже трансформированные).
-    # ARCore API: Frame.acquirePointCloud() → PointCloud.getPoints() → float[N*4]
-    # Формат: [[x, y, z, confidence], ...] или [[x, y, z], ...]
-    # Confidence опционален, используем только XYZ.
+
+    # Legacy: point cloud in world coords (ARCore already transformed).
+    # Format: [[x, y, z, confidence], ...] or [[x, y, z], ...]
     point_cloud: List[List[float]] = []
+
     timestamp: Optional[float] = None
+
+    # ── Optional FramePacket fields (recommended to send) ──────────────────
+    frame_id: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    fx: Optional[float] = None
+    fy: Optional[float] = None
+    cx_px: Optional[float] = None
+    cy_px: Optional[float] = None
+    pose_world_from_camera: Optional[List[float]] = None
+    depth_base64: Optional[str] = None
+    depth_scale: float = 1000.0
+    confidence_base64: Optional[str] = None
+    enable_vision: bool = True
 
 
 class GenerateRequest(BaseModel):
@@ -590,56 +617,88 @@ async def lock_world(request: LockWorldRequest):
 @app.post("/session/stream")
 async def stream_frame(request: StreamFrameRequest):
     """
-    Стриминг кадров камеры в режиме реального времени.
-    
-    ИИ обрабатывает кадр, детектирует объекты и добавляет в контекст сессии.
+    Legacy streaming endpoint.
+
+    - If FramePacket fields are present (intrinsics + pose + size), this endpoint proxies to /session/frame.
+    - Otherwise it only ingests point_cloud into VoxelWorld (no vision, no 2D->3D).
     """
     try:
-        # Получаем сессию
+        # Fast path: proxy to /session/frame if we have honest geometry inputs.
+        if (
+            request.width is not None
+            and request.height is not None
+            and request.fx is not None
+            and request.fy is not None
+            and request.cx_px is not None
+            and request.cy_px is not None
+            and request.pose_world_from_camera is not None
+            and len(request.pose_world_from_camera) >= 7
+        ):
+            frame_req = FramePacketRequest(
+                session_id=request.session_id,
+                frame_id=request.frame_id or f"stream-{int((request.timestamp or time.time()) * 1000)}",
+                timestamp=request.timestamp,
+                rgb_base64=request.frame_base64,
+                width=int(request.width),
+                height=int(request.height),
+                fx=float(request.fx),
+                fy=float(request.fy),
+                cx_px=float(request.cx_px),
+                cy_px=float(request.cy_px),
+                pose_world_from_camera=list(request.pose_world_from_camera),
+                depth_base64=request.depth_base64,
+                depth_scale=float(request.depth_scale or 1000.0),
+                confidence_base64=request.confidence_base64,
+                point_cloud=request.point_cloud or [],
+                enable_vision=bool(request.enable_vision),
+            )
+            out = await session_frame(frame_req)
+            # Mark as legacy wrapper response
+            if isinstance(out, dict):
+                out["legacy_stream"] = True
+                out["legacy_mode"] = "framepacket_proxy"
+            return out
+
+        # Legacy behavior: point_cloud -> VoxelWorld only.
         session = session_manager.get_session(request.session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Сессия не найдена")
-        
-        # Создаем кадр
+
         frame = CameraFrame(
             timestamp=request.timestamp or time.time(),
             image_data=request.frame_base64,
-            camera_position=request.camera_position,
-            ar_points=[p.dict() for p in request.ar_points],
+            camera_position=request.camera_position or {},
+            ar_points=[p.dict() for p in (request.ar_points or [])],
             quality_metrics={
-                "incoming_point_cloud_points": len(request.point_cloud),
-                "android_depth_ready": bool(request.point_cloud),
+                "incoming_point_cloud_points": len(request.point_cloud or []),
+                "legacy_stream": True,
+                "vision": "disabled_no_intrinsics_pose",
             },
+            detected_objects=[],
         )
 
-        # ── НОВОЕ: Заполняем VoxelWorld из point_cloud ──────────────────────
-        # Это основной источник "зрения" ИИ.
-        # point_cloud уже в мировых координатах от ARCore — просто кладём в сетку.
         if request.point_cloud and BRAIN_V3_AVAILABLE:
             voxel_world = session.scene_context.ensure_voxel_world()
-            added = voxel_world.add_point_cloud(request.point_cloud)
-            frame.quality_metrics = frame.quality_metrics or {}
-            frame.quality_metrics['voxels_added'] = added
-            frame.quality_metrics['total_voxels'] = voxel_world.total_voxels
-        
-        # TODO: Здесь должна быть детекция объектов через YOLO
-        # Пока возвращаем заглушку
-        detected_objects = []
-        
-        frame.detected_objects = detected_objects
-        
-        # Добавляем кадр в сессию
+            if voxel_world is not None:
+                added = voxel_world.add_point_cloud(request.point_cloud)
+                frame.quality_metrics["voxels_added"] = added
+                frame.quality_metrics["total_voxels"] = len(getattr(voxel_world, "occupied", []) or [])
+
         session.add_frame(frame)
         session_manager.auto_save_session(request.session_id)
-        
+
         return {
             "status": "processed",
             "session_id": request.session_id,
-            "detected_objects": detected_objects,
+            "detected_objects": [],
             "context_summary": session.scene_context.get_summary(),
-            "message": "Кадр обработан. Контекст обновлен."
+            "legacy_stream": True,
+            "legacy_mode": "pointcloud_only",
+            "message": "Legacy /session/stream: используйте /session/frame для 2D->3D и unknown-space.",
         }
-    
+
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
