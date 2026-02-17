@@ -381,11 +381,30 @@ class LockWorldRequest(BaseModel):
     session_id: str
 
 class ScanPlanRequest(BaseModel):
-    """Запрос плана активного досканирования (Stage 6)."""
+    """Запрос плана активного досканирования (Stage 6.2).
+
+    Можно (опционально) указать target_box - регион, который надо досканировать
+    (например, рабочая зона +3м вокруг будущих лесов). Если не указан,
+    используется локальная область вокруг последней позы камеры.
+    """
 
     session_id: str
     max_views: int = 3
     distance_m: float = 1.6
+
+    # Optional target region for readiness gating
+    target_center: Optional[Point3D] = None
+    target_half_extents: Optional[Point3D] = None
+
+    # View generation knobs
+    angles_deg: List[float] = [0.0, 30.0, -30.0, 60.0, -60.0]
+    distance_multipliers: List[float] = [1.0, 1.25]
+
+    # Readiness thresholds
+    max_miss_rate: float = 0.20
+    max_mismatch_rate: float = 0.12
+    max_median_abs_error_m: float = 0.07
+    max_unknown_ratio: float = 0.45
 
 
 class StructureModifyRequest(BaseModel):
@@ -628,6 +647,7 @@ async def ingest_frame_packet(request: FramePacketRequest):
                 scan_plan = propose_views(
                     scan_suggestions=scan_suggestions,
                     current_pose=pose,
+                    voxel_world=voxel_world,
                     default_distance_m=1.6,
                     max_views=3,
                 )
@@ -711,36 +731,78 @@ async def get_scan_plan(request: ScanPlanRequest):
             pose = None
 
     plan = ctx.last_scan_plan or {}
+
+    # Get voxel world for scoring visibility / UNKNOWN density
+    vw = None
+    try:
+        vw = ctx.ensure_voxel_world()
+    except Exception:
+        vw = None
+
     if suggestions and VALIDATION_AVAILABLE and propose_views is not None:
         try:
             plan = propose_views(
                 scan_suggestions=suggestions,
                 current_pose=pose,
+                voxel_world=vw,
                 default_distance_m=float(request.distance_m),
                 max_views=int(request.max_views),
+                angles_deg=tuple(float(a) for a in (request.angles_deg or [])) or None,
+                distance_multipliers=tuple(float(m) for m in (request.distance_multipliers or [])) or None,
             )
         except Exception:
             plan = ctx.last_scan_plan or {}
 
     ctx.last_scan_plan = plan or {}
 
-    reproj_ok = bool((ctx.last_reprojection or {}).get("ok", True))
+    # Conservative readiness signal for UX:
+    # - if reprojection says ok and few scan suggestions, we can allow "lock".
+    # Conservative readiness signal for UX (Stage 6.2):
+    # - require reprojection to be OK and within thresholds
+    # - require UNKNOWN fraction in target_box to be small
+    reproj = (ctx.last_reprojection or {})
+    reproj_ok = bool(reproj.get("ok", True))
+    miss_rate = float(reproj.get("miss_rate", 0.0) or 0.0)
+    mismatch_rate = float(reproj.get("mismatch_rate", 0.0) or 0.0)
+    median_err = float(reproj.get("median_abs_error_m", 0.0) or 0.0)
+
+    # default readiness
     ready = reproj_ok and (len(suggestions) <= 8)
 
-    unknown_local = None
+    # compute UNKNOWN ratio in target region
+    unknown_target = None
     try:
         vw = ctx.ensure_voxel_world()
-        if vw is not None and pose and len(pose) >= 3:
-            unknown_local = vw.unknown_fraction_in_box(
-                center_world=(float(pose[0]), float(pose[1]), float(pose[2])),
-                half_extents_m=(2.0, 2.0, 2.0),
+        if vw is not None:
+            if request.target_center and request.target_half_extents:
+                c = request.target_center
+                h = request.target_half_extents
+                center = (float(c.x), float(c.y), float(c.z))
+                half = (float(h.x), float(h.y), float(h.z))
+            elif pose and len(pose) >= 3:
+                center = (float(pose[0]), float(pose[1]), float(pose[2]))
+                half = (2.0, 2.0, 2.0)
+            else:
+                center = (0.0, 0.0, 0.0)
+                half = (2.0, 2.0, 2.0)
+
+            unknown_target = vw.unknown_fraction_in_box(
+                center_world=center,
+                half_extents_m=half,
                 sample_step_vox=3,
             )
-            if unknown_local is not None and float(unknown_local) > 0.55:
+
+            # readiness gating with thresholds
+            if miss_rate > float(request.max_miss_rate):
+                ready = False
+            if mismatch_rate > float(request.max_mismatch_rate):
+                ready = False
+            if median_err > float(request.max_median_abs_error_m):
+                ready = False
+            if unknown_target is not None and float(unknown_target) > float(request.max_unknown_ratio):
                 ready = False
     except Exception:
         pass
-
     return {
         "session_id": request.session_id,
         "scan_suggestions": suggestions,
@@ -748,7 +810,7 @@ async def get_scan_plan(request: ScanPlanRequest):
         "readiness": {
             "ready_to_lock": bool(ready),
             "reprojection_ok": bool(reproj_ok),
-            "unknown_local_ratio": float(unknown_local) if unknown_local is not None else None,
+            "unknown_local_ratio": float(unknown_target) if unknown_target is not None else None,
         },
     }
 
