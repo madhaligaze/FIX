@@ -526,6 +526,36 @@ async def ingest_frame_packet(request: FramePacketRequest):
                 mesh_info["tsdf_integrated"] = False
                 mesh_info["tsdf_error"] = str(e)
 
+        # Stage 5: reprojection consistency (safety check vs current voxel model)
+        reprojection_report = None
+        reprojection_suggestions = []
+        if voxel_world is not None and depth_bytes is not None:
+            try:
+                import numpy as np
+                from modules.lifter_2d3d import decode_depth_bytes
+                from modules.reprojection_check import check_reprojection
+
+                depth_arr = decode_depth_bytes(depth_bytes, request.width, request.height)
+                depth_meters = depth_arr.astype(np.float32) / float(request.depth_scale)
+                rep = check_reprojection(
+                    voxel_world=voxel_world,
+                    depth_m=depth_meters,
+                    width=request.width,
+                    height=request.height,
+                    fx=request.fx,
+                    fy=request.fy,
+                    cx=request.cx_px,
+                    cy=request.cy_px,
+                    pose7=_normalize_camera_pose(request.pose_world_from_camera),
+                    max_depth=8.0,
+                    pixel_step=12,
+                )
+                reprojection_report = rep.to_dict()
+                reprojection_suggestions = list(rep.suggestions or [])
+                geom_stats["reprojection"] = reprojection_report
+            except Exception as e:
+                geom_stats["reprojection_error"] = str(e)
+
         # Perception pipeline
         det2d, det3d, world_objects = [], [], []
         scan_suggestions = []
@@ -552,6 +582,8 @@ async def ingest_frame_packet(request: FramePacketRequest):
             det3d = out.get("det3d", [])
             world_objects = out.get("world_objects", [])
             scan_suggestions = out.get("scan_suggestions", [])
+            if reprojection_suggestions:
+                scan_suggestions.extend(reprojection_suggestions)
 
             # Persist stable objects in scene_context
             session.scene_context.world_objects = world_objects

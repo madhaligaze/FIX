@@ -506,6 +506,79 @@ class VoxelWorld:
                 free_added += 1
         return free_added, conflicts
 
+    def raycast_distance(
+        self,
+        origin_world: Tuple[float, float, float],
+        direction_world: Tuple[float, float, float],
+        max_dist: float = 8.0,
+        step: Optional[float] = None,
+    ) -> Optional[float]:
+        """Approximate raycast against OCCUPIED voxels.
+
+        Returns distance to first OCCUPIED voxel along the ray, or None if nothing hit.
+        This is used for Stage 5 reprojection consistency checks.
+
+        Notes:
+        - We do NOT treat UNKNOWN as a hit here; UNKNOWN is handled separately in scoring.
+        - step defaults to resolution/2 for reasonable accuracy.
+        """
+        ox, oy, oz = map(float, origin_world)
+        dx, dy, dz = map(float, direction_world)
+        nrm = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if nrm <= 1e-9:
+            return None
+        dx /= nrm
+        dy /= nrm
+        dz /= nrm
+
+        s = float(step) if step is not None else float(self.resolution) / 2.0
+        s = max(s, float(self.resolution) / 4.0)
+        dist = 0.0
+        while dist <= float(max_dist):
+            x = ox + dx * dist
+            y = oy + dy * dist
+            z = oz + dz * dist
+            if not self._in_bounds_xyz(x, y, z):
+                return None
+            coord = self._to_grid(x, y, z)
+            if coord in self.occupied or coord in self._safety_occupied:
+                return float(dist)
+            dist += s
+        return None
+
+    def unknown_fraction_in_box(
+        self,
+        *,
+        center: Tuple[float, float, float],
+        half_extents: Tuple[float, float, float],
+        sample_step: Optional[float] = None,
+    ) -> float:
+        """Estimate fraction of UNKNOWN voxels in a 3D box region.
+
+        Useful for conservative planning: if the support zone is mostly UNKNOWN, request more scans.
+        """
+        cx, cy, cz = map(float, center)
+        hx, hy, hz = map(float, half_extents)
+        st = float(sample_step) if sample_step is not None else max(self.resolution * 2.0, 0.1)
+
+        total = 0
+        unknown = 0
+        x = cx - hx
+        while x <= cx + hx:
+            y = cy - hy
+            while y <= cy + hy:
+                z = cz - hz
+                while z <= cz + hz:
+                    total += 1
+                    if self.get_state(x, y, z) == self.UNKNOWN:
+                        unknown += 1
+                    z += st
+                y += st
+            x += st
+        if total <= 0:
+            return 1.0
+        return float(unknown) / float(total)
+
     def _to_grid(self, x: float, y: float, z: float) -> Tuple[int, int, int]:
         r = self.resolution
         return (int(math.floor(x / r)), int(math.floor(y / r)), int(math.floor(z / r)))
