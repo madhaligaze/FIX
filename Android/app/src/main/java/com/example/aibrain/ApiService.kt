@@ -2,6 +2,7 @@ package com.example.aibrain
 
 import retrofit2.Response
 import retrofit2.http.*
+import com.google.gson.annotations.SerializedName
 
 /**
  * API-интерфейс для связи с Python-сервером.
@@ -61,12 +62,30 @@ data class ModelingResponse(
 )
 
 data class ScaffoldOption(
-    val variant_name: String,
-    val material_info: String,
-    val safety_score: Int,           // 0–100, выше = безопаснее
+    @SerializedName(value = "variant_name", alternate = ["name"])
+    val variant_name: String = "Option",
+    val material_info: String = "",
+    val safety_score: Int = 0,           // 0–100, выше = безопаснее
     val ai_critique: List<String>?,  // самокритика ИИ
+    val elements: List<ScaffoldElement>? = null,
+    val full_structure: List<ScaffoldElement>? = null,
     val stats: ScaffoldStats?,
     val physics: PhysicsResult?
+)
+
+data class ScaffoldElement(
+    val id: String,
+    val type: String,
+    val start: ElementPoint,
+    val end: ElementPoint,
+    val stress_color: String? = null,
+    val load_ratio: Double? = null
+)
+
+data class ElementPoint(
+    val x: Float,
+    val y: Float,
+    val z: Float
 )
 
 data class ScaffoldStats(

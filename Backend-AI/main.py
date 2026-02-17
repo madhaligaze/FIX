@@ -344,6 +344,7 @@ async def stream_frame(request: StreamFrameRequest):
         
         # Добавляем кадр в сессию
         session.add_frame(frame)
+        session_manager.auto_save_session(request.session_id)
         
         return {
             "status": "processed",
