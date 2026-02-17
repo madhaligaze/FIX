@@ -23,6 +23,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.google.ar.core.Config
 import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
@@ -199,14 +200,14 @@ class MainActivity : AppCompatActivity() {
         viewModel = StructureViewModel(api)
         soundManager = SoundManager(this)
 
-        scope.launch {
+        lifecycleScope.launch {
             viewModel.structureState.collect { state ->
                 handleStructureState(state)
             }
         }
 
 
-        scope.launch {
+        lifecycleScope.launch {
             viewModel.editMode.collect { mode ->
                 updateModeUI(mode)
             }
@@ -1153,7 +1154,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menuInflater.inflate(R.menu.edit_menu, menu)
 
-        scope.launch {
+        lifecycleScope.launch {
             viewModel.editMode.collect { mode ->
                 menu.findItem(R.id.action_toggle_mode)?.title = when (mode) {
                     EditMode.EDIT -> "🎬 Режим: EDIT"
