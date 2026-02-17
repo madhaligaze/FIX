@@ -10,7 +10,7 @@ import kotlinx.coroutines.launch
  * ViewModel для управления состоянием структуры и взаимодействия с API.
  */
 class StructureViewModel(
-    private val apiService: ApiService
+    private var apiService: ApiService
 ) : ViewModel() {
 
     private val _editMode = MutableStateFlow(EditMode.EDIT)
@@ -32,6 +32,10 @@ class StructureViewModel(
 
     fun setSessionId(sessionId: String) {
         currentSessionId = sessionId
+    }
+
+    fun updateApiService(newApiService: ApiService) {
+        apiService = newApiService
     }
 
     /**
