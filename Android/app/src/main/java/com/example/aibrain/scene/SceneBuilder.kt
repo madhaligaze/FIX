@@ -1,61 +1,43 @@
 package com.example.aibrain.scene
 
+import com.example.aibrain.ElementPoint
 import com.example.aibrain.HeatmapItem
 import com.example.aibrain.ScaffoldElement
+import com.example.aibrain.materials.MaterialManager
+import com.example.aibrain.models.LayherModels
 import com.google.ar.sceneform.Node
 import com.google.ar.sceneform.Scene
 import com.google.ar.sceneform.math.Quaternion
 import com.google.ar.sceneform.math.Vector3
-import com.google.ar.sceneform.rendering.Color
-import com.google.ar.sceneform.rendering.Material
-import com.google.ar.sceneform.rendering.MaterialFactory
 import com.google.ar.sceneform.rendering.ModelRenderable
-import com.google.ar.sceneform.rendering.ShapeFactory
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlin.math.sqrt
 
 class SceneBuilder(private val scene: Scene) {
 
-    private val modelCache = mutableMapOf<String, ModelRenderable>()
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val materialManager = MaterialManager(scene.view.context)
+    private var isInitialized = false
+
+    private val renderableCache = mutableMapOf<String, ModelRenderable>()
     private val sceneNodes = mutableListOf<Node>()
-    private val elementNodes = mutableMapOf<String, Node>()
+    private val elementNodes = mutableMapOf<String, ElementNode>()
     private val allElements = mutableListOf<ScaffoldElement>()
 
-    private val stressColors = mapOf(
-        "green" to Color(0f, 0.8f, 0f),
-        "yellow" to Color(1f, 1f, 0f),
-        "orange" to Color(1f, 0.65f, 0f),
-        "red" to Color(1f, 0f, 0f),
-        "gray" to Color(0.6f, 0.6f, 0.6f)
-    )
-
     fun preloadModels(onReady: (() -> Unit)? = null) {
-        if (modelCache.isNotEmpty()) {
+        if (isInitialized) {
             onReady?.invoke()
             return
         }
 
-        var remaining = 4
-        fun done() {
-            remaining--
-            if (remaining <= 0) onReady?.invoke()
+        scope.launch {
+            materialManager.init()
+            isInitialized = true
+            onReady?.invoke()
         }
-
-        createPrimitiveModel("vertical", Vector3(0.06f, 1.035f, 0.06f), Color(0.7f, 0.7f, 0.7f), ::done)
-        createPrimitiveModel("ledger", Vector3(1.035f, 0.04f, 0.04f), Color(0.75f, 0.75f, 0.75f), ::done)
-        createPrimitiveModel("diagonal", Vector3(1.2f, 0.035f, 0.035f), Color(0.7f, 0.75f, 0.7f), ::done)
-        createPrimitiveModel("deck", Vector3(1.035f, 0.03f, 0.32f), Color(0.45f, 0.45f, 0.45f), ::done)
-    }
-
-    private fun createPrimitiveModel(type: String, size: Vector3, color: Color, onReady: () -> Unit) {
-        MaterialFactory.makeOpaqueWithColor(scene.view.context, color)
-            .thenAccept { material: Material ->
-                val cube = ShapeFactory.makeCube(size, Vector3.zero(), material)
-                modelCache[type] = cube
-                onReady()
-            }
-            .exceptionally {
-                onReady()
-                null
-            }
     }
 
     fun buildScene(elements: List<ScaffoldElement>) {
@@ -77,67 +59,106 @@ class SceneBuilder(private val scene: Scene) {
     fun updateColors(heatmap: List<Map<String, Any>>) {
         val colorById = heatmap.associate {
             val id = it["id"] as? String ?: ""
-            val color = it["color"] as? String ?: "gray"
-            id to color
+            val loadRatio = when (val color = it["color"] as? String ?: "gray") {
+                "red" -> 1.0
+                "orange", "yellow" -> 0.7
+                else -> 0.2
+            }
+            id to loadRatio
         }
-        colorById.forEach { (id, color) -> elementNodes[id]?.let { applyStressColor(it, color) } }
+        colorById.forEach { (id, loadRatio) -> updateElementColor(id, loadRatio) }
     }
 
-    /**
-     * Найти Node по ID элемента.
-     */
-    fun findNodeById(elementId: String): Node? = elementNodes[elementId]
+    fun findNodeById(elementId: String): Node? = elementNodes[elementId]?.node
 
-    /**
-     * Удалить элемент из сцены.
-     */
     fun removeElement(elementId: String) {
-        elementNodes[elementId]?.let { node ->
-            node.parent = null
+        elementNodes[elementId]?.let { elementNode ->
+            elementNode.node.setParent(null)
+            sceneNodes.remove(elementNode.node)
             elementNodes.remove(elementId)
-            sceneNodes.remove(node)
             allElements.removeAll { it.id == elementId }
         }
     }
 
-    /**
-     * Обновить цвета элементов на основе heatmap.
-     */
     fun updateHeatmap(heatmap: List<HeatmapItem>) {
-        heatmap.forEach { item ->
-            elementNodes[item.id]?.let { node ->
-                applyStressColor(node, item.color)
+        heatmap.forEach { updateElementColor(it.id, it.load_ratio) }
+    }
+
+    private fun createElement(element: ScaffoldElement) {
+        if (!isInitialized) {
+            return
+        }
+
+        val renderable = getOrCreateRenderable(element).makeCopy()
+
+        val node = Node().apply {
+            this.renderable = renderable
+
+            val midPoint = Vector3(
+                (element.start.x + element.end.x) / 2f,
+                (element.start.y + element.end.y) / 2f,
+                (element.start.z + element.end.z) / 2f
+            )
+            worldPosition = midPoint
+            worldRotation = calculateRotation(element.start, element.end)
+        }
+
+        node.setParent(scene)
+        sceneNodes.add(node)
+        elementNodes[element.id] = ElementNode(node = node, element = element, renderable = renderable)
+    }
+
+    private fun getOrCreateRenderable(element: ScaffoldElement): ModelRenderable {
+        val loadRatio = element.load_ratio ?: 0.0
+        val length = calculateLength(element.start, element.end)
+        val roundedLen = (length * 20).toInt()
+        val cacheKey = "${element.type}_${(loadRatio * 10).toInt()}_$roundedLen"
+
+        return renderableCache.getOrPut(cacheKey) {
+            val material = materialManager.getMaterial(element.type, loadRatio)
+            when (element.type) {
+                "standard", "vertical" -> LayherModels.createStandard(scene.view.context, length, material)
+                "ledger", "horizontal" -> LayherModels.createLedger(scene.view.context, length, material)
+                "bracing", "diagonal" -> LayherModels.createBracing(scene.view.context, length, material)
+                "deck", "platform" -> LayherModels.createDeck(scene.view.context, material)
+                else -> LayherModels.createLedger(scene.view.context, length, material)
             }
         }
     }
 
-    private fun createElement(element: ScaffoldElement) {
-        val baseModel = modelCache[element.type] ?: modelCache["ledger"] ?: return
-
-        val start = Vector3(element.start.x, element.start.y, element.start.z)
-        val end = Vector3(element.end.x, element.end.y, element.end.z)
-
-        val node = Node().apply { renderable = baseModel.makeCopy() }
-        val center = Vector3((start.x + end.x) / 2f, (start.y + end.y) / 2f, (start.z + end.z) / 2f)
-        node.worldPosition = center
-
-        val direction = Vector3.subtract(end, start)
-        val length = direction.length().coerceAtLeast(0.01f)
-        node.worldRotation = Quaternion.lookRotation(direction.normalized(), Vector3.up())
-        node.localScale = Vector3(1f, (length / 2.07f).coerceAtLeast(0.05f), 1f)
-
-        applyStressColor(node, element.stress_color ?: "gray")
-
-        node.setParent(scene)
-        sceneNodes.add(node)
-        elementNodes[element.id] = node
+    fun updateElementColor(elementId: String, loadRatio: Double) {
+        elementNodes[elementId]?.let { elementNode ->
+            val material = materialManager.getMaterial(elementNode.element.type, loadRatio)
+            elementNode.renderable.material = material
+        }
     }
 
-    private fun applyStressColor(node: Node, colorName: String) {
-        val color = stressColors[colorName] ?: stressColors["gray"] ?: return
-        val renderable = node.renderable as? ModelRenderable ?: return
-        val material = renderable.material.makeCopy()
-        material.setFloat4("baseColorTint", color)
-        renderable.material = material
+    private fun calculateLength(start: ElementPoint, end: ElementPoint): Float {
+        val dx = end.x - start.x
+        val dy = end.y - start.y
+        val dz = end.z - start.z
+        return sqrt(dx * dx + dy * dy + dz * dz).coerceAtLeast(0.05f)
     }
+
+    private fun calculateRotation(start: ElementPoint, end: ElementPoint): Quaternion {
+        val direction = Vector3(
+            end.x - start.x,
+            end.y - start.y,
+            end.z - start.z
+        ).normalized()
+
+        if (direction.y > 0.98f) return Quaternion.identity()
+        if (direction.y < -0.98f) return Quaternion.axisAngle(Vector3.right(), 180f)
+
+        val up = Vector3.up()
+        val angle = Math.acos(Vector3.dot(up, direction).toDouble()).toFloat()
+        val axis = Vector3.cross(up, direction).normalized()
+        return Quaternion.axisAngle(axis, Math.toDegrees(angle.toDouble()).toFloat())
+    }
+
+    private data class ElementNode(
+        val node: Node,
+        val element: ScaffoldElement,
+        val renderable: ModelRenderable
+    )
 }

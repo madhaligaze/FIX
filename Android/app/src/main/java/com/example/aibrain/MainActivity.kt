@@ -32,6 +32,7 @@ import com.google.ar.sceneform.math.Vector3
 import com.google.ar.sceneform.rendering.Color as SceneColor
 import com.example.aibrain.scene.PhysicsAnimator
 import com.example.aibrain.scene.SceneBuilder
+import com.example.aibrain.scene.LightingSetup
 import io.github.sceneview.ar.ArSceneView
 import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.*
@@ -147,6 +148,8 @@ class MainActivity : AppCompatActivity() {
     private var lastQualityScore = 0.0
     private val userMarkers = mutableListOf<Map<String, Float>>()
     private val anchorNodes = mutableListOf<AnchorNode>()
+    private var lightingSetup = false
+    private var mainAnchorNode: AnchorNode? = null
 
     // 3D Модель
     private var current3DModel: ModelingResponse? = null
@@ -284,6 +287,28 @@ class MainActivity : AppCompatActivity() {
             config.focusMode = Config.FocusMode.AUTO
             config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
             config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+        }
+
+        sceneView.renderer?.apply {
+            isShadowsEnabled = true
+            isScreenSpaceAmbientOcclusionEnabled = true
+            isBloomEnabled = true
+            isMultisampleAntiAliasingEnabled = true
+        }
+
+        if (mainAnchorNode == null) {
+            mainAnchorNode = AnchorNode().also { anchor ->
+                anchor.setParent(sceneView.scene)
+                anchorNodes.add(anchor)
+            }
+        }
+
+        sceneView.scene.addOnUpdateListener {
+            val anchor = mainAnchorNode
+            if (anchor != null && !lightingSetup) {
+                LightingSetup.setupLighting(sceneView, anchor)
+                lightingSetup = true
+            }
         }
 
         // Обновление координат камеры в реальном времени
