@@ -178,37 +178,58 @@ class VoxelWorld:
         rot = self._quat_to_rotation(*camera_pose[3:7])
         cam_t = np.array(camera_pose[:3], dtype=np.float32)
 
-        for v in range(0, height, max(1, int(pixel_step))):
-            for u in range(0, width, max(1, int(pixel_step))):
-                d = float(depth_m[v, u])
-                if d <= 0.0 or d > float(max_range):
-                    continue
-                if conf is not None and int(conf[v, u]) < int(confidence_threshold):
-                    continue
+        step = max(1, int(pixel_step))
+        u_coords = np.arange(0, width, step, dtype=np.int32)
+        v_coords = np.arange(0, height, step, dtype=np.int32)
+        uu, vv = np.meshgrid(u_coords, v_coords)
 
-                xc = (float(u) - float(cx_px)) * d / float(fx)
-                yc = (float(v) - float(cy_px)) * d / float(fy)
-                p_world = (rot @ np.array([xc, yc, d], dtype=np.float32)) + cam_t
+        sampled_depth = depth_m[vv, uu]
+        valid_mask = (sampled_depth > 0.0) & (sampled_depth <= float(max_range))
 
-                if not self._in_bounds_xyz(float(p_world[0]), float(p_world[1]), float(p_world[2])):
-                    continue
+        if conf is not None:
+            sampled_conf = conf[vv, uu]
+            valid_mask &= sampled_conf >= int(confidence_threshold)
 
-                stats["samples"] += 1.0
+        if not np.any(valid_mask):
+            self._last_depth_stats = stats
+            return stats
 
-                free_added, conflicts = self._mark_free_ray(cam_t, p_world)
-                stats["free_added"] += float(free_added)
-                stats["conflicts"] += float(conflicts)
+        u_valid = uu[valid_mask].astype(np.float32)
+        v_valid = vv[valid_mask].astype(np.float32)
+        d_valid = sampled_depth[valid_mask].astype(np.float32)
 
-                occ_coord = self._to_grid(float(p_world[0]), float(p_world[1]), float(p_world[2]))
-                if occ_coord in self.free:
-                    stats["conflicts"] += 1.0
-                    self.free.discard(occ_coord)
+        xc = (u_valid - float(cx_px)) * d_valid / float(fx)
+        yc = (v_valid - float(cy_px)) * d_valid / float(fy)
+        cam_points = np.stack((xc, yc, d_valid), axis=1)
+        world_points = (cam_points @ rot.T) + cam_t
 
-                if occ_coord not in self.occupied:
-                    self.occupied.add(occ_coord)
-                    self._types.setdefault(occ_coord, self.OCCUPIED)
-                    self._grid[occ_coord] = self._types.get(occ_coord, self.OCCUPIED)
-                    stats["occupied_added"] += 1.0
+        in_bounds_mask = (
+            (world_points[:, 0] >= float(self.bounds_min[0]))
+            & (world_points[:, 0] <= float(self.bounds_max[0]))
+            & (world_points[:, 1] >= float(self.bounds_min[1]))
+            & (world_points[:, 1] <= float(self.bounds_max[1]))
+            & (world_points[:, 2] >= float(self.bounds_min[2]))
+            & (world_points[:, 2] <= float(self.bounds_max[2]))
+        )
+
+        valid_world_points = world_points[in_bounds_mask]
+        stats["samples"] = float(valid_world_points.shape[0])
+
+        for p_world in valid_world_points:
+            free_added, conflicts = self._mark_free_ray(cam_t, p_world)
+            stats["free_added"] += float(free_added)
+            stats["conflicts"] += float(conflicts)
+
+            occ_coord = self._to_grid(float(p_world[0]), float(p_world[1]), float(p_world[2]))
+            if occ_coord in self.free:
+                stats["conflicts"] += 1.0
+                self.free.discard(occ_coord)
+
+            if occ_coord not in self.occupied:
+                self.occupied.add(occ_coord)
+                self._types.setdefault(occ_coord, self.OCCUPIED)
+                self._grid[occ_coord] = self._types.get(occ_coord, self.OCCUPIED)
+                stats["occupied_added"] += 1.0
 
         self._last_depth_stats = stats
         return stats

@@ -189,7 +189,7 @@ class MainActivity : AppCompatActivity() {
     private var loadingDialog: AlertDialog? = null
 
     private val api = Retrofit.Builder()
-        .baseUrl("http://100.119.60.35:8000/")
+        .baseUrl(BuildConfig.BACKEND_BASE_URL)
         .addConverterFactory(GsonConverterFactory.create())
         .build()
         .create(ApiService::class.java)

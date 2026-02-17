@@ -15,6 +15,9 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        val backendBaseUrl = (project.findProperty("backendBaseUrl") as String?) ?: "http://10.0.2.2:8000/"
+        buildConfigField("String", "BACKEND_BASE_URL", "\"${backendBaseUrl}\"")
     }
 
     buildTypes {
@@ -32,6 +35,10 @@ android {
     }
     kotlinOptions {
         jvmTarget = "1.8"
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     // Исключаем конфликтующие META-INF файлы из зависимостей AR-библиотек
