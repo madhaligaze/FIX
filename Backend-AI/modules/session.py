@@ -285,3 +285,7 @@ class SessionStorage:
     def active_count(self) -> int:
         """Количество активных сессий."""
         return len(self._sessions)
+
+
+# Совместимость с обновленным импортом в main.py
+from modules.session_manager import SessionManager  # noqa: E402

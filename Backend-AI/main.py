@@ -32,7 +32,8 @@ from modules.geometry import (
 from modules.physics import PhysicsEngine, quick_safety_check
 from modules.voxel_world import VoxelCollisionSolver
 from modules.builder import ScaffoldGenerator
-from modules.session_manager import CameraFrame, SessionManager
+from modules.session_manager import CameraFrame
+from modules.session import SessionManager
 
 # ── Новые модули v3.0 ───────────────────────────────────────────────────────
 try:
@@ -75,6 +76,8 @@ app.add_middleware(
 scaffold_generator = ScaffoldGenerator()
 physics_engine = PhysicsEngine()
 collision_solver = VoxelCollisionSolver(clearance=0.15)
+
+# Инициализация глобального менеджера сессий
 session_manager = SessionManager()
 
 
