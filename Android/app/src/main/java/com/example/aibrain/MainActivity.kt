@@ -168,6 +168,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var modeText: TextView
     private lateinit var btnUndo: Button
     private lateinit var btnRedo: Button
+    private var hasRedZones = false
 
     // ══════════════════════════════════════════════════════════════════════
     // СОСТОЯНИЕ - AR RULER
@@ -198,7 +199,7 @@ class MainActivity : AppCompatActivity() {
         setupClickListeners()
         initializeRuler()
         sceneBuilder = SceneBuilder(sceneView.scene)
-        physicsAnimator = PhysicsAnimator(sceneView, sceneBuilder)
+        physicsAnimator = PhysicsAnimator(sceneView, sceneBuilder, this)
 
         showLoadingDialog("Загрузка моделей...")
         lifecycleScope.launch {
@@ -399,7 +400,7 @@ class MainActivity : AppCompatActivity() {
             arRuler.clearAll()
         }
         if (::physicsAnimator.isInitialized) {
-            physicsAnimator.stopAll()
+            physicsAnimator.release()
         }
         if (::soundManager.isInitialized) {
             soundManager.release()
@@ -990,7 +991,6 @@ class MainActivity : AppCompatActivity() {
 
         if (viewModel.editMode.value == EditMode.SIMULATION) {
             if (response.collapsed.elements.isNotEmpty()) {
-                soundManager.play(SoundType.COLLAPSE)
                 physicsAnimator.animateFall(response.collapsed.elements)
                 showCollapsedNotification(response.collapsed.elements.size)
 
@@ -1006,6 +1006,11 @@ class MainActivity : AppCompatActivity() {
 
         if (!response.is_stable) {
             showWarning("⚠️ Структура нестабильна!")
+        } else {
+            hasRedZones = false
+            btnAnalyze.animate().cancel()
+            btnAnalyze.scaleX = 1.0f
+            btnAnalyze.scaleY = 1.0f
         }
     }
 
@@ -1075,6 +1080,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun highlightWouldCollapse(elementIds: List<String>) {
+        hasRedZones = elementIds.isNotEmpty()
+        if (hasRedZones) {
+            startPlayButtonPulse()
+        }
         showHint("⚠️ Могут упасть элементы: ${elementIds.size}")
         elementIds.forEach { id ->
             sceneBuilder.findNodeById(id)?.let { node ->
@@ -1126,21 +1135,73 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateModeUI(mode: EditMode) {
-        when (mode) {
-            EditMode.EDIT -> {
-                modeIndicator.setBackgroundResource(R.drawable.mode_edit_bg)
-                modeIcon.text = "✏️"
-                modeText.text = "Режим редактирования"
-                tvModeStatus.text = "MODE: EDIT"
-                physicsAnimator.stopAll()
+        modeIndicator.animate()
+            .alpha(0f)
+            .scaleX(0.8f)
+            .scaleY(0.8f)
+            .setDuration(100)
+            .withEndAction {
+                when (mode) {
+                    EditMode.EDIT -> {
+                        modeIndicator.setBackgroundResource(R.drawable.mode_edit_bg)
+                        modeIcon.text = "✏️"
+                        modeText.text = "Режим редактирования"
+                        tvModeStatus.text = "MODE: EDIT"
+                        soundManager.play(SoundType.WHOOSH, volume = 0.3f, pitch = 1.2f)
+                        physicsAnimator.stopAll()
+                    }
+                    EditMode.SIMULATION -> {
+                        modeIndicator.setBackgroundResource(R.drawable.mode_simulation_bg)
+                        modeIcon.text = "⚡"
+                        modeText.text = "Режим симуляции"
+                        tvModeStatus.text = "MODE: SIMULATION"
+                        soundManager.play(SoundType.WHOOSH, volume = 0.5f, pitch = 0.8f)
+                        vibrateShort()
+                        checkStructureStability()
+                    }
+                }
+
+                modeIndicator.animate()
+                    .alpha(1f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(150)
+                    .start()
             }
-            EditMode.SIMULATION -> {
-                modeIndicator.setBackgroundResource(R.drawable.mode_simulation_bg)
-                modeIcon.text = "⚡"
-                modeText.text = "Режим симуляции"
-                tvModeStatus.text = "MODE: SIMULATION"
-                checkStructureStability()
+            .start()
+    }
+
+    private fun startPlayButtonPulse() {
+        btnAnalyze.animate()
+            .scaleX(1.1f)
+            .scaleY(1.1f)
+            .setDuration(500)
+            .withEndAction {
+                btnAnalyze.animate()
+                    .scaleX(1.0f)
+                    .scaleY(1.0f)
+                    .setDuration(500)
+                    .withEndAction {
+                        if (hasRedZones) {
+                            startPlayButtonPulse()
+                        }
+                    }
+                    .start()
             }
+            .start()
+    }
+
+    private fun vibrateShort() {
+        val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        if (!vibrator.hasVibrator()) {
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(VibrationEffect.createOneShot(70, 120))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator.vibrate(70)
         }
     }
 
