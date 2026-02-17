@@ -262,6 +262,48 @@ class VoxelWorld:
             **coverage,
         }
 
+    def segment_unknown_ratio(
+        self,
+        start_world: Tuple[float, float, float],
+        end_world: Tuple[float, float, float],
+        step_m: Optional[float] = None,
+        clearance: float = 0.0,
+    ) -> float:
+        """Estimate UNKNOWN ratio along a segment.
+
+        UNKNOWN := cells that are neither in OCCUPIED nor in FREE.
+
+        Useful for scoring next-best-view proposals and conservative gating.
+        """
+        p1 = np.array(self._as_tuple(start_world), dtype=float)
+        p2 = np.array(self._as_tuple(end_world), dtype=float)
+        dist = float(np.linalg.norm(p2 - p1))
+        if dist <= 1e-9:
+            return 1.0
+
+        if step_m is None:
+            step_m = max(float(self.resolution), 1e-3)
+
+        steps = max(int(dist / float(step_m)), 1)
+        extra = max(0, int(float(clearance) / float(self.resolution)))
+
+        unknown = 0
+        total = 0
+        for i in range(steps + 1):
+            t = i / float(steps)
+            p = p1 + (p2 - p1) * t
+            vx, vy, vz = self._to_grid(*p)
+            for dx in range(-extra, extra + 1):
+                for dz in range(-extra, extra + 1):
+                    g = (vx + dx, vy, vz + dz)
+                    total += 1
+                    if (g not in self.occupied) and (g not in self.free):
+                        unknown += 1
+
+        if total <= 0:
+            return 1.0
+        return float(unknown) / float(total)
+
     def is_blocked(
         self,
         start: Union[Tuple[float, float, float], Dict[str, float]],
