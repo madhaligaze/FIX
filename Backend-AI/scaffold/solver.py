@@ -25,11 +25,17 @@ def _snap_to_catalog(length_m: float, catalog: tuple[float, ...]) -> float:
     return float(arr[j])
 
 
-def generate_scaffold(world_model, anchors: list[dict], policy) -> tuple[list[dict], list[dict]]:
+def generate_scaffold(
+    world_model,
+    anchors: list[dict],
+    policy,
+    *,
+    trace: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict], dict[str, Any]]:
     del world_model
-    solver_trace: list[dict] = []
+    event_trace = trace if trace is not None else []
     trace_solver_start(
-        solver_trace,
+        event_trace,
         {
             "grid_step_m": float(getattr(policy, "scaffold_grid_step_m", 2.0)),
             "default_height_m": float(getattr(policy, "scaffold_default_height_m", DEFAULT_SPEC.default_height_m)),
@@ -38,7 +44,7 @@ def generate_scaffold(world_model, anchors: list[dict], policy) -> tuple[list[di
 
     bounds = _work_bounds(anchors)
     if bounds is None:
-        return [], solver_trace
+        return [], {"solver": "grid_v1", "supports_used": 0, "elements": 0}
 
     lo, hi = bounds
     lo = lo - np.asarray([0.6, 0.6, 0.0], dtype=np.float32)
@@ -63,7 +69,7 @@ def generate_scaffold(world_model, anchors: list[dict], policy) -> tuple[list[di
         deck_levels = [min(2.0, height)]
     top_z = float(min(max(deck_levels), height))
 
-    trace_candidate_grid(solver_trace, {"nx": int(xs.size), "ny": int(ys.size), "step_m": float(step), "top_z_m": float(top_z)})
+    trace_candidate_grid(event_trace, {"nx": int(xs.size), "ny": int(ys.size), "step_m": float(step), "top_z_m": float(top_z)})
 
     elements: list[dict] = []
 
@@ -77,7 +83,7 @@ def generate_scaffold(world_model, anchors: list[dict], policy) -> tuple[list[di
             }
             elements.append(e)
     for i in range(min(3, len(elements))):
-        trace_element_added(solver_trace, elements[i], "grid_post")
+        trace_element_added(event_trace, elements[i], "grid_post")
 
     def P(ix: int, iy: int) -> list[float]:
         return [float(xs[ix]), float(ys[iy]), float(lo[2])]
@@ -97,7 +103,7 @@ def generate_scaffold(world_model, anchors: list[dict], policy) -> tuple[list[di
         }
         elements.append(e)
         if len(elements) < 12:
-            trace_element_added(solver_trace, e, reason)
+            trace_element_added(event_trace, e, reason)
 
     base_z = float(lo[2] + 0.3)
     for ix in range(nx):
@@ -119,7 +125,7 @@ def generate_scaffold(world_model, anchors: list[dict], policy) -> tuple[list[di
         }
         elements.append(e)
         if len(elements) < 20:
-            trace_element_added(solver_trace, e, reason)
+            trace_element_added(event_trace, e, reason)
 
     if bool(getattr(policy, "stability_require_diagonals", True)) and nx >= 2 and ny >= 2:
         add_brace(P(0, 0), P(nx - 1, 0), base_z, top_z, "brace_face_ymin")
@@ -134,7 +140,7 @@ def generate_scaffold(world_model, anchors: list[dict], policy) -> tuple[list[di
         "dims": {"box_min": [float(lo[0]), float(lo[1]), float(top_z)], "box_max": [float(hi[0]), float(hi[1]), float(top_z)]},
     }
     elements.append(deck)
-    trace_element_added(solver_trace, deck, "deck_top")
+    trace_element_added(event_trace, deck, "deck_top")
 
     stair = {
         "type": "stair",
@@ -142,6 +148,13 @@ def generate_scaffold(world_model, anchors: list[dict], policy) -> tuple[list[di
         "dims": {"to_z_m": float(top_z)},
     }
     elements.append(stair)
-    trace_element_added(solver_trace, stair, "stair_marker")
+    trace_element_added(event_trace, stair, "stair_marker")
 
-    return elements, solver_trace
+    solver_meta = {
+        "solver": "grid_v1",
+        "supports_used": int(len(anchors)),
+        "elements": int(len(elements)),
+        "step_m": float(step),
+        "top_z_m": float(top_z),
+    }
+    return elements, solver_meta

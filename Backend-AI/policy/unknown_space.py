@@ -97,6 +97,17 @@ def check_points_against_unknown(
     return violations
 
 
+def _unknown_ratio(stats: dict[str, Any]) -> float:
+    try:
+        u = float(stats.get("unknown", 0.0))
+        t = float(stats.get("total", 0.0))
+        if t <= 0.0:
+            return 1.0
+        return max(0.0, min(1.0, u / t))
+    except Exception:
+        return 1.0
+
+
 def apply_unknown_policy(world_model, anchors: list[dict], policy) -> dict[str, Any]:
     """
     STAGE 8: Unknown-space as first-class policy.
@@ -123,6 +134,19 @@ def apply_unknown_policy(world_model, anchors: list[dict], policy) -> dict[str, 
             item["scope"] = "boundary"
         violations.extend(v2)
 
+    unknown_summary = world_model.occupancy.stats(support_pts if support_pts else None)
+    near_ratio = _unknown_ratio(unknown_summary)
+
+    if mode == "forbid" and support_pts and near_ratio > float(getattr(policy, "unknown_ratio_near_support_max", 0.6)):
+        violations.append(
+            {
+                "type": "UNKNOWN_NEAR_SUPPORT",
+                "scope": "support",
+                "unknown_ratio": float(near_ratio),
+                "max_allowed": float(getattr(policy, "unknown_ratio_near_support_max", 0.6)),
+            }
+        )
+
     return {
         "mode": mode,
         "buffer_m": buffer_m,
@@ -132,7 +156,8 @@ def apply_unknown_policy(world_model, anchors: list[dict], policy) -> dict[str, 
             if mode in {"forbid", "buffer"}
         ],
         "violations": violations,
-        "unknown_summary": world_model.occupancy.stats(support_pts if support_pts else None),
+        "unknown_summary": unknown_summary,
+        "unknown_ratio_near_support": float(near_ratio),
         "counts": {
             "supports": int(len(support_pts)),
             "boundaries": int(len(boundary_pts)),
