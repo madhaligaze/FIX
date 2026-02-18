@@ -13,7 +13,7 @@ Main FastAPI Server - AI Brain Backend
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Dict, Optional, Any
 import base64
 import time
@@ -39,6 +39,26 @@ from modules.session_manager import CameraFrame, SessionManager
 from modules.monitoring import request_logger, performance_monitor
 from modules.cache_manager import global_cache
 from modules.validators import SessionUpdateAction, validate_session_exists, validate_structure_stability
+
+# Stage 13: Android measurement protocol + raw input capture
+from modules.measurement_protocol import (
+    SUPPORTED_PROTOCOL_VERSION,
+    validate_protocol_version,
+    validate_distance_m,
+    validate_world_point,
+    distance_between,
+)
+
+try:
+    from modules.raw_input_artifacts import (
+        save_incoming_frame,
+        save_incoming_measurements,
+        list_revision_raw_inputs,
+    )
+except Exception:  # pragma: no cover
+    save_incoming_frame = None
+    save_incoming_measurements = None
+    list_revision_raw_inputs = None
 
 # ── Новые модули v3.0 ───────────────────────────────────────────────────────
 try:
@@ -561,6 +581,9 @@ class FramePacketRequest(BaseModel):
     frame_id: str
     timestamp: Optional[float] = None
 
+    # Stage 13: protocol versioning (client -> backend)
+    protocol_version: int = Field(default=SUPPORTED_PROTOCOL_VERSION, ge=1)
+
     # Legacy fallback: RGB image (base64-encoded bytes, jpeg/png).
     # Preferred transport: multipart/form-data with binary file part "rgb_file".
     rgb_base64: Optional[str] = None
@@ -653,6 +676,55 @@ class AutoScaffoldRequest(BaseModel):
     ledger_len: float = 1.09
     standard_h: float = 2.07
     force_unlocked: bool = False
+
+
+# ── Stage 13: Measurements protocol models ───────────────────────────────
+
+
+class WorldPoint(BaseModel):
+    x: float
+    y: float
+    z: float
+
+
+class AnchorMeasurement(BaseModel):
+    anchor_id: str = Field(..., min_length=1, max_length=64)
+    world_point: WorldPoint
+    label: Optional[str] = None
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    source: str = Field(default="anchor")
+
+
+class TapeMeasurement(BaseModel):
+    measurement_id: Optional[str] = Field(default=None, max_length=64)
+    a_anchor_id: Optional[str] = Field(default=None, max_length=64)
+    b_anchor_id: Optional[str] = Field(default=None, max_length=64)
+    a_world_point: Optional[WorldPoint] = None
+    b_world_point: Optional[WorldPoint] = None
+    distance_m: Optional[float] = Field(default=None, ge=0.0)
+    sigma_m: float = Field(default=0.01, ge=0.0)
+    source: str = Field(default="tape")
+
+
+class MarkerObservation(BaseModel):
+    marker_id: str = Field(..., min_length=1, max_length=64)
+    world_point: WorldPoint
+    normal: Optional[WorldPoint] = None
+    size_m: Optional[float] = Field(default=None, ge=0.0)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    source: str = Field(default="marker")
+
+
+class MeasurementPacketRequest(BaseModel):
+    session_id: str
+    packet_id: Optional[str] = Field(default=None, max_length=64)
+    frame_id: Optional[str] = Field(default=None, max_length=128)
+    timestamp: Optional[float] = None
+    protocol_version: int = Field(default=SUPPORTED_PROTOCOL_VERSION, ge=1)
+
+    anchors: List[AnchorMeasurement] = Field(default_factory=list)
+    tapes: List[TapeMeasurement] = Field(default_factory=list)
+    markers: List[MarkerObservation] = Field(default_factory=list)
 
 
 # Pydantic v2: resolve forward refs via model_rebuild (update_forward_refs is deprecated)
@@ -774,6 +846,11 @@ async def ingest_frame_packet(request: FramePacketRequest):
         if not session:
             raise HTTPException(status_code=404, detail="Сессия не найдена")
 
+        # Stage 13: protocol compatibility gate
+        ok, err = validate_protocol_version(int(getattr(request, "protocol_version", SUPPORTED_PROTOCOL_VERSION)))
+        if not ok:
+            raise HTTPException(status_code=409, detail={"error": "unsupported_protocol", "message": err})
+
         # Decode RGB (legacy JSON base64 transport)
         rgb_bytes = _decode_maybe_base64(request.rgb_base64, "rgb_base64")
         if rgb_bytes is None:
@@ -782,6 +859,35 @@ async def ingest_frame_packet(request: FramePacketRequest):
         # Decode optional depth/conf
         depth_bytes = _decode_maybe_base64(request.depth_base64, "depth_base64")
         conf_bytes = _decode_maybe_base64(request.confidence_base64, "confidence_base64")
+
+        # Stage 13: save raw inputs (frame) into incoming_raw (will be moved into revision artifacts on snapshot commit)
+        if save_incoming_frame is not None:
+            try:
+                save_incoming_frame(
+                    session_id=request.session_id,
+                    frame_id=request.frame_id,
+                    rgb_bytes=rgb_bytes,
+                    depth_bytes=depth_bytes,
+                    conf_bytes=conf_bytes,
+                    meta={
+                        "protocol_version": int(getattr(request, "protocol_version", SUPPORTED_PROTOCOL_VERSION)),
+                        "timestamp": float(request.timestamp or time.time()),
+                        "intrinsics": {
+                            "width": int(request.width),
+                            "height": int(request.height),
+                            "fx": float(request.fx),
+                            "fy": float(request.fy),
+                            "cx_px": float(request.cx_px),
+                            "cy_px": float(request.cy_px),
+                        },
+                        "pose_world_from_camera": list(_normalize_camera_pose(request.pose_world_from_camera)),
+                        "depth_scale": float(request.depth_scale),
+                        "transport": "json_base64",
+                    },
+                    root_dir=str(session_manager.snapshot_dir),
+                )
+            except Exception:
+                pass
 
         # Ensure world models
         voxel_world = session.scene_context.ensure_voxel_world()
@@ -1106,6 +1212,106 @@ async def ingest_frame_packet_upload(
     if isinstance(out, dict):
         out["transport"] = "multipart"
     return out
+
+
+@app.get("/protocol/measurements")
+async def measurements_protocol_info():
+    return {
+        "protocol": "measurements",
+        "supported_protocol_version": SUPPORTED_PROTOCOL_VERSION,
+        "units": {"distance": "m", "coordinates": "world_m"},
+        "payload_fields": {
+            "anchors": "[{anchor_id, world_point{x,y,z}, label?, confidence?, source?}]",
+            "tapes": "[{measurement_id?, a_anchor_id?|a_world_point, b_anchor_id?|b_world_point, distance_m?, sigma_m?, source?}]",
+            "markers": "[{marker_id, world_point{x,y,z}, normal?, size_m?, confidence?, source?}]",
+        },
+    }
+
+
+@app.post("/session/measurements")
+async def ingest_measurements_packet(request: MeasurementPacketRequest):
+    session = session_manager.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+    ok, err = validate_protocol_version(int(getattr(request, "protocol_version", SUPPORTED_PROTOCOL_VERSION)))
+    if not ok:
+        raise HTTPException(status_code=409, detail={"error": "unsupported_protocol", "message": err})
+
+    payload = request.dict()
+
+    tape_warnings = []
+    for i, t in enumerate(payload.get("tapes", []) or []):
+        a = t.get("a_world_point")
+        b = t.get("b_world_point")
+        if a and b:
+            ok_a, err_a = validate_world_point(a, name=f"tapes[{i}].a_world_point")
+            ok_b, err_b = validate_world_point(b, name=f"tapes[{i}].b_world_point")
+            if not ok_a:
+                raise HTTPException(status_code=422, detail=err_a)
+            if not ok_b:
+                raise HTTPException(status_code=422, detail=err_b)
+            computed = float(distance_between(a, b))
+            if t.get("distance_m") is None:
+                t["distance_m"] = computed
+            else:
+                ok_d, err_d = validate_distance_m(t.get("distance_m"), name=f"tapes[{i}].distance_m")
+                if not ok_d:
+                    raise HTTPException(status_code=422, detail=err_d)
+                sigma = float(t.get("sigma_m") or 0.01)
+                tol = max(0.05, 3.0 * sigma)
+                if abs(float(t.get("distance_m")) - computed) > tol:
+                    tape_warnings.append(
+                        {
+                            "index": i,
+                            "warning": "distance_m_mismatch",
+                            "provided": float(t.get("distance_m")),
+                            "computed": computed,
+                            "tolerance": tol,
+                        }
+                    )
+
+    if save_incoming_measurements is not None:
+        try:
+            save_incoming_measurements(session_id=request.session_id, payload=payload, root_dir=str(session_manager.snapshot_dir))
+        except Exception:
+            pass
+
+    try:
+        if hasattr(session, "ingest_measurement_packet"):
+            session.ingest_measurement_packet(payload)
+        else:
+            session.scene_context.measurements.append(payload)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    session_manager.auto_save_session(request.session_id)
+    return {
+        "status": "ok",
+        "session_id": request.session_id,
+        "protocol_version": int(getattr(request, "protocol_version", SUPPORTED_PROTOCOL_VERSION)),
+        "anchors_received": len(payload.get("anchors", []) or []),
+        "tapes_received": len(payload.get("tapes", []) or []),
+        "markers_received": len(payload.get("markers", []) or []),
+        "warnings": tape_warnings,
+    }
+
+
+@app.get("/session/raw_inputs/{session_id}")
+async def list_raw_inputs(session_id: str, revision: Optional[str] = None):
+    """List revision-bound raw inputs. If revision is omitted, uses locked_snapshot_revision."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    rev = revision or getattr(session, "locked_snapshot_revision", None)
+    if not rev:
+        raise HTTPException(status_code=409, detail="No snapshot revision available. Lock/commit a snapshot first.")
+
+    if list_revision_raw_inputs is None:
+        raise HTTPException(status_code=500, detail="raw inputs listing not available")
+
+    return list_revision_raw_inputs(session_id=session_id, revision=str(rev), root_dir=str(session_manager.snapshot_dir))
 
 
 @app.post("/session/scan_plan")
