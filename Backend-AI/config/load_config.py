@@ -18,6 +18,7 @@ class StorageCfg(BaseModel):
 class WorldCfg(BaseModel):
     voxel_size_m: float = 0.20
     tsdf_trunc_m: float = 0.40
+    min_clearance_m: float = 0.20
 
 
 class ExportOverlaysCfg(BaseModel):
@@ -34,12 +35,49 @@ class PolicyCfg(BaseModel):
     policy_yaml_path: str | None = None
 
 
+class SecurityApiKeyCfg(BaseModel):
+    key: str
+    role: str = "operator"
+
+
+class SecurityCfg(BaseModel):
+    # If empty => dev mode (no auth), but middleware still runs.
+    api_keys: list[SecurityApiKeyCfg] = Field(default_factory=list)
+    audit_enabled: bool = True
+
+
+class RateLimitCfg(BaseModel):
+    enabled: bool = True
+    # Per API key if present, else per client IP.
+    window_seconds: int = 60
+    max_requests: int = 240
+
+
+class ObservabilityCfg(BaseModel):
+    json_logs: bool = True
+    metrics_enabled: bool = True
+    otel_enabled: bool = False
+    otel_service_name: str = "backend-ai"
+    # If empty => SDK will rely on OTEL_* env vars.
+    otel_exporter_otlp_endpoint: str | None = None
+
+
+class RetentionCfg(BaseModel):
+    enabled: bool = True
+    max_age_days: int = 14
+    cleanup_interval_minutes: int = 60
+
+
 class AppConfig(BaseModel):
     server: ServerCfg = Field(default_factory=ServerCfg)
     storage: StorageCfg = Field(default_factory=StorageCfg)
     world: WorldCfg = Field(default_factory=WorldCfg)
     export: ExportCfg = Field(default_factory=ExportCfg)
     policy: PolicyCfg = Field(default_factory=PolicyCfg)
+    security: SecurityCfg = Field(default_factory=SecurityCfg)
+    rate_limit: RateLimitCfg = Field(default_factory=RateLimitCfg)
+    observability: ObservabilityCfg = Field(default_factory=ObservabilityCfg)
+    retention: RetentionCfg = Field(default_factory=RetentionCfg)
 
 
 def load_app_config(path: Path) -> AppConfig:
