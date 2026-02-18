@@ -27,13 +27,11 @@ def request_scaffold(request: Request, session_id: str):
     state = request.app.state.runtime
     world = state.get_world(session_id)
     anchors = state.anchors.get(session_id, [])
+
     ready, score, reasons = compute_readiness(world, anchors, state.policy)
     scan_plan = generate_scan_plan(world, anchors)
     if not ready:
-        raise HTTPException(
-            status_code=409,
-            detail={"status": "NEEDS_SCAN", "reasons": reasons, "scan_plan": scan_plan, "score": score},
-        )
+        raise HTTPException(status_code=409, detail={"status": "NEEDS_SCAN", "reasons": reasons, "scan_plan": scan_plan, "score": score})
 
     elements, solver_trace = generate_scaffold(world, anchors, state.policy)
     valid, violations = collision_check(elements, world, state.policy)
@@ -44,11 +42,16 @@ def request_scaffold(request: Request, session_id: str):
 
     add_trace_event(state.traces.setdefault(session_id, []), "scaffold_generated", {"elements": len(elements)})
     state.traces[session_id].extend(solver_trace)
+
     overlays = world.compute_overlays(state.policy.__dict__)
     overlays["violations"] = violations
-    rev_id = state.store.lock_revision(session_id, world.serialize_state(), overlays, state.traces[session_id])
+
+    env_mesh_bytes = world.export_env_mesh_obj()
+    rev_id = state.store.lock_revision(session_id, world.serialize_state(), overlays, state.traces[session_id], env_mesh_bytes=env_mesh_bytes)
     state.last_rev[session_id] = rev_id
+
     bundle = build_scene_bundle(session_id, rev_id, world, anchors, elements, scan_plan, overlays)
     bundle["bom"] = bom_from_elements(elements)
+    bundle["env_mesh"]["present"] = bool(env_mesh_bytes)
     state.store.save_export(session_id, rev_id, bundle)
     return bundle
