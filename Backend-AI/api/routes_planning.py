@@ -27,7 +27,6 @@ def request_scaffold(request: Request, session_id: str):
     state = request.app.state.runtime
     world = state.get_world(session_id)
     anchors = state.anchors.get(session_id, [])
-
     ready, score, reasons = compute_readiness(world, anchors, state.policy)
     scan_plan = generate_scan_plan(world, anchors)
     if not ready:
@@ -50,8 +49,10 @@ def request_scaffold(request: Request, session_id: str):
     rev_id = state.store.lock_revision(session_id, world.serialize_state(), overlays, state.traces[session_id], env_mesh_bytes=env_mesh_bytes)
     state.last_rev[session_id] = rev_id
 
-    bundle = build_scene_bundle(session_id, rev_id, world, anchors, elements, scan_plan, overlays)
+    sg = getattr(state, "scene_graphs", {}).get(session_id)
+    bundle = build_scene_bundle(session_id, rev_id, world, anchors, elements, scan_plan, overlays, scene_graph=sg)
     bundle["bom"] = bom_from_elements(elements)
     bundle["env_mesh"]["present"] = bool(env_mesh_bytes)
+
     state.store.save_export(session_id, rev_id, bundle)
     return bundle

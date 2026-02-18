@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ValidationError
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from pydantic import BaseModel, ValidationError
 
+from api.ingest import ingest_frame
 from contracts.frame_packet import AnchorPoint, FramePacketMeta
 from policy.unknown_space import apply_unknown_policy
 from scanning.readiness import compute_readiness
-from api.ingest import ingest_frame
 
 router = APIRouter(tags=["session"])
 
@@ -25,6 +25,7 @@ def create_session(request: Request):
     state = request.app.state.runtime
     session_id = state.store.create_session()
     state.get_world(session_id)
+    state.get_scene_graph(session_id)
     state.anchors[session_id] = []
     state.traces[session_id] = []
     return {"session_id": session_id}
@@ -43,6 +44,7 @@ async def post_frame(
         meta_payload = FramePacketMeta.model_validate_json(await meta.read())
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     depth_bytes = await depth.read() if depth else None
     pointcloud_bytes = await pointcloud.read() if pointcloud else None
 
@@ -54,6 +56,7 @@ async def post_frame(
     session_id = meta_payload.session_id
     rgb_bytes = await rgb.read()
     meta_dict = meta_payload.model_dump()
+
     return ingest_frame(state, session_id, meta_payload.frame_id, meta_dict, rgb_bytes, depth_bytes, pointcloud_bytes)
 
 
@@ -83,6 +86,7 @@ def session_status(request: Request, session_id: str):
     anchors = state.anchors.get(session_id, [])
     ready, score, reasons = compute_readiness(world, anchors, state.policy)
     unknown = apply_unknown_policy(world, anchors, state.policy)
+    sg = state.get_scene_graph(session_id)
     return {
         "session_id": session_id,
         "ready": ready,
@@ -91,4 +95,5 @@ def session_status(request: Request, session_id: str):
         "metrics": world.serialize_state(),
         "unknown_policy": unknown,
         "perception_unavailable": state.perception_unavailable,
+        "scene_graph": sg.serialize(),
     }

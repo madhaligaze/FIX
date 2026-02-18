@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-
 import numpy as np
 import open3d as o3d
 from PIL import Image
@@ -20,7 +19,14 @@ class TSDFVolume:
             color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
         )
 
-    def integrate_depth(self, depth_u16: np.ndarray, intrinsics: dict, pose: dict, depth_scale: float, rgb_bytes: bytes | None = None) -> None:
+    def integrate_depth(
+        self,
+        depth_u16: np.ndarray,
+        intrinsics: dict,
+        pose: dict,
+        depth_scale: float,
+        rgb_bytes: bytes | None = None,
+    ) -> None:
         # Always update occupancy (cheap + readiness)
         self.occupancy.integrate_depth(depth_u16, intrinsics, pose, depth_scale)
 
@@ -56,8 +62,12 @@ class TSDFVolume:
             float(intrinsics["cx"]),
             float(intrinsics["cy"]),
         )
-        extrinsic = pose_to_matrix(pose).astype(np.float64)  # camera->world
-        self._vol.integrate(rgbd, intrinsic, extrinsic)
+
+        # Contract: meta.pose is camera->world (AR pose in world frame).
+        # Open3D TSDF integration expects extrinsic as world->camera, so invert.
+        T_cw = pose_to_matrix(pose).astype(np.float64)
+        T_wc = np.linalg.inv(T_cw)
+        self._vol.integrate(rgbd, intrinsic, T_wc)
 
     def extract_mesh(self) -> tuple[np.ndarray, np.ndarray]:
         mesh = self._vol.extract_triangle_mesh()
@@ -71,7 +81,7 @@ class TSDFVolume:
         verts, tris = self.extract_mesh()
         if verts.shape[0] == 0 or tris.shape[0] == 0:
             return b""
-        lines = []
+        lines: list[str] = []
         for v in verts:
             lines.append(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
         # OBJ is 1-indexed
