@@ -1,166 +1,201 @@
 from __future__ import annotations
 
-from typing import Any
+import math
+import random
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable
 
-import numpy as np
-
-from world.occupancy import UNKNOWN
-
-
-def _as3(p: Any) -> np.ndarray | None:
-    if isinstance(p, (list, tuple)) and len(p) == 3:
-        return np.asarray(p, dtype=np.float32).reshape(3)
-    return None
+from trace.decision_trace import add_constraint_eval
 
 
-def _nearby_unknown(world_model, point_w: np.ndarray, radius_m: float) -> bool:
+@dataclass(frozen=True)
+class UnknownPolicyConfig:
     """
-    Approximate 'distance to unknown' by scanning a voxel cube around the point.
-    Conservative: if any unknown voxel exists in radius, return True.
+    Stage 15: unknown-space policy as a first-class project setting.
+
+    mode:
+      - allow  : never gate on unknown (not recommended)
+      - forbid : hard fail if unknown fraction above threshold near critical points
+      - buffer : allow but require extra clearance away from unknown (conservative)
     """
-    occ = world_model.occupancy
-    r = float(max(0.0, radius_m))
-    if r <= 1e-6:
-        v = int(occ.query([point_w.tolist()])[0])
-        return v == int(UNKNOWN)
 
-    center = ((point_w - occ.origin) / float(occ.voxel_size)).astype(np.int32)
-    dr = int(np.ceil(r / float(occ.voxel_size)))
-    i0 = np.maximum(center - dr, 0)
-    i1 = np.minimum(center + dr + 1, np.asarray(occ.grid.shape, dtype=np.int32))
-    if np.any(i1 <= i0):
-        return True
+    mode: str = "buffer"
+    forbid_radius_m: float = 0.35
+    buffer_radius_m: float = 0.50
+    buffer_clearance_m: float = 0.15
+    max_unknown_fraction: float = 0.05
+    samples_per_region: int = 256
 
-    sub = occ.grid[i0[0] : i1[0], i0[1] : i1[1], i0[2] : i1[2]]
-    return bool(np.any(sub == UNKNOWN))
+    def validate(self) -> None:
+        if self.mode not in ("allow", "forbid", "buffer"):
+            raise ValueError(f"unknown_policy.mode must be allow|forbid|buffer, got: {self.mode}")
+        for k in ("forbid_radius_m", "buffer_radius_m", "buffer_clearance_m"):
+            v = float(getattr(self, k))
+            if not math.isfinite(v) or v < 0:
+                raise ValueError(f"unknown_policy.{k} must be finite and >= 0, got: {v}")
+        if not (0.0 <= float(self.max_unknown_fraction) <= 1.0):
+            raise ValueError(
+                f"unknown_policy.max_unknown_fraction must be within [0,1], got: {self.max_unknown_fraction}"
+            )
+        n = int(self.samples_per_region)
+        if n <= 0 or n > 100000:
+            raise ValueError(f"unknown_policy.samples_per_region must be in 1..100000, got: {n}")
 
 
-def check_points_against_unknown(
-    world_model,
-    points: list[list[float]],
+class UnknownSampler:
+    """
+    Adapter over your world model / occupancy / ESDF.
+
+    Provide a callable that returns one of:
+      - "unknown"
+      - "free"
+      - "occupied"
+    """
+
+    def __init__(self, sample_fn: Callable[[tuple[float, float, float]], str]):
+        self._sample_fn = sample_fn
+
+    def sample_label(self, p_w: tuple[float, float, float]) -> str:
+        v = self._sample_fn(p_w)
+        if v not in ("unknown", "free", "occupied"):
+            # normalize unknown responses to avoid crashing on custom backends
+            return "unknown"
+        return v
+
+
+def _rand_point_in_sphere(center: tuple[float, float, float], radius: float) -> tuple[float, float, float]:
+    # Rejection sampling inside unit sphere, then scale.
+    # Good enough for policy gating (not used for precision geometry).
+    cx, cy, cz = center
+    r = float(radius)
+    if r <= 0:
+        return center
+    while True:
+        x = random.uniform(-1.0, 1.0)
+        y = random.uniform(-1.0, 1.0)
+        z = random.uniform(-1.0, 1.0)
+        if x * x + y * y + z * z <= 1.0:
+            return (cx + x * r, cy + y * r, cz + z * r)
+
+
+def estimate_unknown_fraction(
+    sampler: UnknownSampler,
     *,
-    mode: str,
-    buffer_m: float,
-) -> list[dict[str, Any]]:
-    mode = str(mode or "forbid").strip().lower()
-    buf = float(max(0.0, buffer_m))
-    if mode == "allow":
-        return []
-
-    violations: list[dict[str, Any]] = []
-    for i, p in enumerate(points):
-        pw = _as3(p)
-        if pw is None:
-            continue
-
-        inside_unknown = _nearby_unknown(world_model, pw, radius_m=0.0)
-        near_unknown = _nearby_unknown(world_model, pw, radius_m=buf) if buf > 0 else inside_unknown
-
-        if mode == "forbid":
-            if inside_unknown:
-                violations.append({"type": "UNKNOWN_FORBIDDEN", "index": i, "point": p, "mode": mode})
-            elif buf > 0 and near_unknown:
-                violations.append(
-                    {
-                        "type": "UNKNOWN_BUFFER_FORBIDDEN",
-                        "index": i,
-                        "point": p,
-                        "buffer_m": buf,
-                        "mode": mode,
-                    }
-                )
-        elif mode == "buffer":
-            if (buf > 0 and near_unknown) or inside_unknown:
-                violations.append(
-                    {
-                        "type": "UNKNOWN_BUFFER_VIOLATION",
-                        "index": i,
-                        "point": p,
-                        "buffer_m": buf,
-                        "mode": mode,
-                    }
-                )
-        else:
-            if inside_unknown:
-                violations.append({"type": "UNKNOWN_FORBIDDEN", "index": i, "point": p, "mode": "forbid"})
-            elif buf > 0 and near_unknown:
-                violations.append(
-                    {
-                        "type": "UNKNOWN_BUFFER_FORBIDDEN",
-                        "index": i,
-                        "point": p,
-                        "buffer_m": buf,
-                        "mode": "forbid",
-                    }
-                )
-
-    return violations
+    center_w: tuple[float, float, float],
+    radius_m: float,
+    samples: int,
+) -> float:
+    if radius_m <= 0 or samples <= 0:
+        return 0.0
+    unknown = 0
+    for _ in range(samples):
+        p = _rand_point_in_sphere(center_w, radius_m)
+        if sampler.sample_label(p) == "unknown":
+            unknown += 1
+    return float(unknown) / float(samples)
 
 
-def _unknown_ratio(stats: dict[str, Any]) -> float:
-    try:
-        u = float(stats.get("unknown", 0.0))
-        t = float(stats.get("total", 0.0))
-        if t <= 0.0:
-            return 1.0
-        return max(0.0, min(1.0, u / t))
-    except Exception:
-        return 1.0
+@dataclass(frozen=True)
+class UnknownPolicyDecision:
+    ok: bool
+    mode: str
+    unknown_fraction: float
+    radius_m: float
+    required_clearance_m: float
+    reason: str | None = None
 
 
-def apply_unknown_policy(world_model, anchors: list[dict], policy) -> dict[str, Any]:
+def evaluate_unknown_policy(
+    cfg: UnknownPolicyConfig,
+    sampler: UnknownSampler,
+    *,
+    critical_points_w: Iterable[tuple[float, float, float]],
+    decision_id: str,
+    trace: list[dict[str, Any]] | None = None,
+) -> UnknownPolicyDecision:
     """
-    STAGE 8: Unknown-space as first-class policy.
-    Returns a structured report + violations for gating.
+    Returns a single conservative decision aggregated over all critical points:
+      - Forbid: fail if any point exceeds threshold
+      - Buffer: ok, but clearance may be increased if unknown exceeds threshold
+      - Allow: always ok
     """
-    mode = str(getattr(policy, "unknown_mode", "forbid")).strip().lower()
-    buffer_m = float(getattr(policy, "unknown_buffer_m", 0.5))
+    cfg.validate()
 
-    violations: list[dict[str, Any]] = []
-
-    supports = [a for a in anchors if a.get("kind") == "support" and a.get("position") is not None]
-    support_pts = [a["position"] for a in supports]
-    if support_pts and mode != "allow":
-        v = check_points_against_unknown(world_model, support_pts, mode=mode, buffer_m=buffer_m)
-        for item in v:
-            item["scope"] = "support"
-        violations.extend(v)
-
-    boundaries = [a for a in anchors if a.get("kind") == "boundary" and a.get("position") is not None]
-    boundary_pts = [a["position"] for a in boundaries]
-    if boundary_pts and mode in ("forbid", "buffer"):
-        v2 = check_points_against_unknown(world_model, boundary_pts, mode="buffer", buffer_m=buffer_m)
-        for item in v2:
-            item["scope"] = "boundary"
-        violations.extend(v2)
-
-    unknown_summary = world_model.occupancy.stats(support_pts if support_pts else None)
-    near_ratio = _unknown_ratio(unknown_summary)
-
-    if mode == "forbid" and support_pts and near_ratio > float(getattr(policy, "unknown_ratio_near_support_max", 0.6)):
-        violations.append(
-            {
-                "type": "UNKNOWN_NEAR_SUPPORT",
-                "scope": "support",
-                "unknown_ratio": float(near_ratio),
-                "max_allowed": float(getattr(policy, "unknown_ratio_near_support_max", 0.6)),
-            }
+    if cfg.mode == "allow":
+        return UnknownPolicyDecision(
+            ok=True,
+            mode=cfg.mode,
+            unknown_fraction=0.0,
+            radius_m=0.0,
+            required_clearance_m=0.0,
+            reason="mode=allow",
         )
 
-    return {
-        "mode": mode,
-        "buffer_m": buffer_m,
-        "forbidden_regions": [
-            {"type": "sphere", "center": p, "radius": buffer_m}
-            for p in support_pts
-            if mode in {"forbid", "buffer"}
-        ],
-        "violations": violations,
-        "unknown_summary": unknown_summary,
-        "unknown_ratio_near_support": float(near_ratio),
-        "counts": {
-            "supports": int(len(support_pts)),
-            "boundaries": int(len(boundary_pts)),
-            "violations": int(len(violations)),
-        },
-    }
+    if cfg.mode == "forbid":
+        radius = float(cfg.forbid_radius_m)
+    else:
+        radius = float(cfg.buffer_radius_m)
+
+    worst = 0.0
+    for pt in critical_points_w:
+        frac = estimate_unknown_fraction(
+            sampler,
+            center_w=pt,
+            radius_m=radius,
+            samples=int(cfg.samples_per_region),
+        )
+        worst = max(worst, frac)
+
+    ok = bool(worst <= float(cfg.max_unknown_fraction))
+    required_clearance = 0.0
+    reason: str | None = None
+
+    if cfg.mode == "forbid":
+        if not ok:
+            reason = "unknown_fraction_above_threshold"
+        else:
+            reason = "unknown_ok"
+    else:
+        # buffer mode
+        if not ok:
+            required_clearance = float(cfg.buffer_clearance_m)
+            reason = "unknown_requires_buffer"
+        else:
+            reason = "unknown_ok"
+
+    if trace is not None:
+        add_constraint_eval(
+            trace,
+            decision_id=decision_id,
+            constraint_id="unknown_space_policy",
+            ok=ok if cfg.mode == "forbid" else True,
+            reason=reason,
+            metrics={
+                "mode": cfg.mode,
+                "radius_m": radius,
+                "worst_unknown_fraction": worst,
+                "threshold": float(cfg.max_unknown_fraction),
+                "required_clearance_m": required_clearance,
+            },
+            severity="warning" if (cfg.mode == "forbid" and not ok) else "info",
+        )
+
+    # For buffer mode we do not fail; we increase clearance.
+    if cfg.mode == "buffer":
+        return UnknownPolicyDecision(
+            ok=True,
+            mode=cfg.mode,
+            unknown_fraction=worst,
+            radius_m=radius,
+            required_clearance_m=required_clearance,
+            reason=reason,
+        )
+
+    return UnknownPolicyDecision(
+        ok=ok,
+        mode=cfg.mode,
+        unknown_fraction=worst,
+        radius_m=radius,
+        required_clearance_m=0.0,
+        reason=reason,
+    )
