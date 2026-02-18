@@ -22,6 +22,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Switch
+import android.widget.ProgressBar
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -45,6 +46,10 @@ import io.github.sceneview.ar.ArSceneView
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import kotlinx.coroutines.*
+import okhttp3.OkHttpClient
+import okhttp3.logging.HttpLoggingInterceptor
+import java.util.ArrayDeque
+import java.util.concurrent.TimeUnit
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import kotlin.math.min
 import com.example.aibrain.measurement.ARRuler
@@ -85,7 +90,7 @@ class MainActivity : AppCompatActivity() {
     private enum class ConnectionStatus {
         UNKNOWN,
         ONLINE,
-        DEGRADED,
+        RECONNECTING,
         OFFLINE
     }
 
@@ -117,6 +122,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvModeStatus: TextView
     private lateinit var statusIndicator: View
     private lateinit var tvSystemStatus: TextView
+    private lateinit var pbQuality: ProgressBar
+    private lateinit var tvQuality: TextView
+    private lateinit var tvAiCritique: TextView
 
     // Основные кнопки
     private lateinit var btnStart: Button
@@ -168,12 +176,14 @@ class MainActivity : AppCompatActivity() {
     private var isStreaming = false
     private var streamJob: Job? = null
     private var healthJob: Job? = null
+    private var voxelPollJob: Job? = null
     private var connectionStatus: ConnectionStatus = ConnectionStatus.UNKNOWN
     private var lastConnectionDetail: String? = null
     private var consecutiveFailures = 0
     private var isReconnecting = false
     private var frameCount = 0
     private var lastQualityScore = 0.0
+    private val hintHistory: ArrayDeque<String> = ArrayDeque()
     private val userMarkers = mutableListOf<Map<String, Float>>()
     private val anchorNodes = mutableListOf<AnchorNode>()
     private var lightingSetup = false
@@ -291,6 +301,9 @@ class MainActivity : AppCompatActivity() {
         tvModeStatus = findViewById(R.id.tv_mode_status)
         statusIndicator = findViewById(R.id.status_indicator)
         tvSystemStatus = findViewById(R.id.tv_system_status)
+        pbQuality = findViewById(R.id.pb_quality)
+        tvQuality = findViewById(R.id.tv_quality)
+        tvAiCritique = findViewById(R.id.tv_ai_critique)
 
         // Основные кнопки
         btnStart = findViewById(R.id.btn_start)
@@ -389,6 +402,7 @@ class MainActivity : AppCompatActivity() {
         btnScan.setOnClickListener { onScanClicked() }
         btn3DModel.setOnClickListener { on3DModelClicked() }
         btnAnalyze.setOnClickListener { onAnalyzeClicked() }
+        tvAiHint.setOnClickListener { showHintHistoryDialog() }
 
         // Выбор вариантов
         btnVariant1.setOnClickListener { onVariantSelected(0) }
@@ -548,6 +562,20 @@ class MainActivity : AppCompatActivity() {
         val option = current3DModel?.options?.get(index)
         if (option != null) {
             showHint("✓ Вариант ${index + 1}: ${option.variant_name} | Надёжность: ${option.safety_score}%")
+            val critique = option.ai_critique?.joinToString("\n")?.trim().orEmpty()
+            if (critique.isNotBlank()) {
+                tvAiCritique.visibility = View.VISIBLE
+                tvAiCritique.text = critique
+            } else {
+                tvAiCritique.visibility = View.GONE
+            }
+
+            scope.launch {
+                sendLogEvent(
+                    "VARIANT_SELECTED",
+                    mapOf("variant_index" to index, "variant_name" to option.variant_name, "safety_score" to option.safety_score)
+                )
+            }
         }
     }
 
@@ -570,6 +598,20 @@ class MainActivity : AppCompatActivity() {
         transitionTo(AppState.RESULTS)
 
         scope.launch {
+            sendLogEvent(
+                "VARIANT_ACCEPTED",
+                mapOf("variant_index" to selectedVariantIndex, "variant_name" to option.variant_name)
+            )
+            delay(600)
+            currentSessionId?.let { sid ->
+                runCatching {
+                    val resp = api.exportLatest(sid)
+                    if (resp.isSuccessful && resp.body() != null) {
+                        val rev = resp.body()!!.revision_id ?: resp.body()!!.rev_id.orEmpty()
+                        if (rev.isNotBlank()) showHint("✓ Экспорт сформирован: ${rev.take(8)}")
+                    }
+                }
+            }
             delay(2000)
             showFinalResults(option)
         }
@@ -578,27 +620,24 @@ class MainActivity : AppCompatActivity() {
     private fun onSaveSessionClicked() {
         val sid = currentSessionId
         if (sid.isNullOrBlank()) {
-            showError("Сессия не активна")
+            showHint("⚠️ Нет активной сессии")
             return
         }
 
+        showHint("💾 Формирование export/latest...")
         scope.launch {
             try {
-                showLoadingDialog("Сохранение сессии...")
-                // Сначала синхронизируем точки опоры, если они есть
-                syncAnchorsToServer()
-
-                val resp = api.lockSession(LockPayload(session_id = sid))
-                if (resp.isSuccessful && resp.body() != null) {
-                    val body = resp.body()!!
-                    showHint("✓ Сессия сохранена (rev: ${body.rev_id})")
-                } else {
-                    showError("Не удалось сохранить: HTTP ${resp.code()}")
+                val resp = api.exportLatest(sid)
+                if (!resp.isSuccessful || resp.body() == null) {
+                    showError("export/latest: HTTP ${resp.code()}")
+                    return@launch
                 }
+
+                val rev = resp.body()!!.revision_id ?: resp.body()!!.rev_id.orEmpty()
+                sendLogEvent("SESSION_SAVED", mapOf("revision_id" to rev))
+                showHint("✓ Сессия сохранена: ${rev.take(8)}")
             } catch (e: Exception) {
                 showError("Ошибка сохранения: ${e.message}")
-            } finally {
-                hideLoadingDialog()
             }
         }
     }
@@ -660,8 +699,11 @@ class MainActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
             val sw = Switch(this).apply {
-                isChecked = layer.default_on ?: true
+                val key = "layer_visible_${layer.id}"
+                val def = layer.default_on ?: true
+                isChecked = settingsPrefs.getBoolean(key, def)
                 setOnCheckedChangeListener { _, checked ->
+                    settingsPrefs.edit().putBoolean(key, checked).apply()
                     layerGlbManager?.setVisible(layer.id, checked)
                 }
             }
@@ -713,7 +755,24 @@ class MainActivity : AppCompatActivity() {
 
     private fun rebuildApiClient() {
         val baseUrl = getCurrentServerUrl()
-        api = NetworkClient.buildApi(baseUrl)
+
+        val logging = HttpLoggingInterceptor().apply {
+            level = if (BuildConfig.DEBUG) HttpLoggingInterceptor.Level.BASIC else HttpLoggingInterceptor.Level.NONE
+        }
+
+        val client = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(25, TimeUnit.SECONDS)
+            .writeTimeout(25, TimeUnit.SECONDS)
+            .addInterceptor(logging)
+            .build()
+
+        api = retrofit2.Retrofit.Builder()
+            .baseUrl(baseUrl)
+            .client(client)
+            .addConverterFactory(retrofit2.converter.gson.GsonConverterFactory.create())
+            .build()
+            .create(ApiService::class.java)
 
         if (::viewModel.isInitialized) {
             viewModel.updateApiService(api)
@@ -753,7 +812,7 @@ class MainActivity : AppCompatActivity() {
 
         val (dotRes, label) = when (status) {
             ConnectionStatus.ONLINE -> R.drawable.ic_status_dot_green to "SYSTEM ONLINE"
-            ConnectionStatus.DEGRADED -> R.drawable.ic_status_dot_orange to "SYSTEM DEGRADED"
+            ConnectionStatus.RECONNECTING -> R.drawable.ic_status_dot_orange to "RECONNECTING..."
             ConnectionStatus.OFFLINE -> R.drawable.ic_status_dot_red to "SYSTEM OFFLINE"
             ConnectionStatus.UNKNOWN -> R.drawable.ic_status_dot_cyan to "SYSTEM"
         }
@@ -779,7 +838,7 @@ class MainActivity : AppCompatActivity() {
                         updateConnectionUi(ConnectionStatus.ONLINE, base)
                     } else {
                         // Если сейчас идет стрим - показываем деградацию, иначе OFFLINE
-                        val st = if (isStreaming) ConnectionStatus.DEGRADED else ConnectionStatus.OFFLINE
+                        val st = if (isStreaming) ConnectionStatus.RECONNECTING else ConnectionStatus.OFFLINE
                         updateConnectionUi(st, base)
                     }
                 }
@@ -1106,8 +1165,28 @@ class MainActivity : AppCompatActivity() {
         tvModeStatus.text = "РЕЖИМ: $status"
     }
 
+    private fun updateQualityUI(score: Double?) {
+        val v = score ?: return
+        lastQualityScore = v
+        val clamped = v.coerceIn(0.0, 100.0)
+        pbQuality.progress = clamped.toInt()
+        tvQuality.text = "${clamped.toInt()}%"
+    }
+
+    private fun showHintHistoryDialog() {
+        if (hintHistory.isEmpty()) return
+        val items = hintHistory.toList().reversed().take(12)
+        AlertDialog.Builder(this)
+            .setTitle("AI Log")
+            .setItems(items.toTypedArray(), null)
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
     private fun showHint(text: String) {
         tvAiHint.text = text
+        hintHistory.addLast(text)
+        while (hintHistory.size > 10) hintHistory.removeFirst()
     }
 
     private fun updateFrameCounter() {
@@ -1201,7 +1280,7 @@ class MainActivity : AppCompatActivity() {
                 lastError = e.message
             }
 
-            updateConnectionUi(ConnectionStatus.DEGRADED, base)
+            updateConnectionUi(ConnectionStatus.RECONNECTING, base)
             delay(SESSION_RETRY_DELAY_MS * attempt)
         }
 
@@ -1236,7 +1315,7 @@ class MainActivity : AppCompatActivity() {
                     delay(backoff)
                 } else if (consecutiveFailures > 0) {
                     val base = getCurrentServerUrl().trimEnd('/')
-                    updateConnectionUi(ConnectionStatus.DEGRADED, base)
+                    updateConnectionUi(ConnectionStatus.RECONNECTING, base)
                 }
 
                 updateFrameCounter()
@@ -1367,7 +1446,7 @@ class MainActivity : AppCompatActivity() {
             frameCount += 1
             val hints = body.ai_hints
             if (hints != null) {
-                lastQualityScore = hints.quality_score ?: lastQualityScore
+                updateQualityUI(hints.quality_score)
                 val msg = when {
                     !hints.warnings.isNullOrEmpty() -> hints.warnings.joinToString("\n")
                     !hints.instructions.isNullOrEmpty() -> hints.instructions.joinToString("\n")
@@ -1506,6 +1585,26 @@ class MainActivity : AppCompatActivity() {
         }
 
         showHint("✓ Точка добавлена: ${'$'}{userMarkers.size}")
+    }
+
+
+    private suspend fun sendLogEvent(event: String, data: Map<String, Any?> = emptyMap()) {
+        val sid = currentSessionId ?: return
+        runCatching {
+            api.logEvent(
+                sid,
+                LogPayload(
+                    event = event,
+                    timestamp_ms = System.currentTimeMillis(),
+                    data = data,
+                    device = LogDeviceInfo(
+                        model = Build.MODEL,
+                        manufacturer = Build.MANUFACTURER,
+                        sdk = Build.VERSION.SDK_INT
+                    )
+                )
+            )
+        }
     }
 
     private fun request3DReconstruction() {

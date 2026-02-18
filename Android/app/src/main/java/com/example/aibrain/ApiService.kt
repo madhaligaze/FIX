@@ -66,6 +66,12 @@ interface ApiService {
     suspend fun exportLatest(
         @Path("session_id") sessionId: String
     ): Response<SceneBundleResponse>
+
+    @POST("/session/log/{session_id}")
+    suspend fun logEvent(
+        @Path("session_id") sessionId: String,
+        @Body payload: LogPayload
+    ): Response<Unit>
 }
 
 // ── Ответ /session/start ──────────────────────────────────────────────────────
@@ -232,6 +238,19 @@ data class UiLayerFile(
 
 data class LayerFile(
     val path: String? = null
+)
+
+data class LogPayload(
+    val event: String,
+    val timestamp_ms: Long,
+    val data: Map<String, Any?> = emptyMap(),
+    val device: LogDeviceInfo? = null
+)
+
+data class LogDeviceInfo(
+    val model: String,
+    val manufacturer: String,
+    val sdk: Int
 )
 
 
