@@ -1584,7 +1584,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        showHint("✓ Точка добавлена: ${'$'}{userMarkers.size}")
+        showHint("✓ Точка добавлена: ${userMarkers.size}")
     }
 
 
