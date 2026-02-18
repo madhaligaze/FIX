@@ -1,0 +1,11 @@
+paths:
+  artifacts_root: "sessions"
+policy:
+  readiness_observed_ratio_min: 0.1
+  unknown_ratio_near_support_max: 0.6
+  unknown_mode: "forbid"
+  unknown_buffer_m: 0.5
+world:
+  voxel_size: 0.2
+  tsdf_trunc: 0.4
+  min_clearance_m: 0.2
