@@ -21,9 +21,10 @@ from modules.world_snapshot import DEFAULT_SNAPSHOT_DIR, SnapshotRef
 INCOMING_DIRNAME = "incoming_raw"
 
 
-def _incoming_root(session_id: str, root_dir: str = DEFAULT_SNAPSHOT_DIR) -> Path:
+def _incoming_root(session_id: str, root_dir: str = DEFAULT_SNAPSHOT_DIR, *, create: bool = True) -> Path:
     p = Path(root_dir) / session_id / INCOMING_DIRNAME
-    p.mkdir(parents=True, exist_ok=True)
+    if create:
+        p.mkdir(parents=True, exist_ok=True)
     return p
 
 
@@ -117,9 +118,9 @@ def save_incoming_measurements(*, session_id: str, payload: Dict[str, Any], root
 
 
 def finalize_incoming_raw_to_revision(*, session_id: str, revision: str, root_dir: str = DEFAULT_SNAPSHOT_DIR) -> Dict[str, Any]:
-    incoming = _incoming_root(session_id, root_dir)
+    incoming = _incoming_root(session_id, root_dir, create=False)
     if not incoming.exists():
-        return {"moved": 0}
+        return {"session_id": session_id, "revision": revision, "moved": 0, "paths": []}
 
     ref = SnapshotRef(session_id=session_id, revision=revision, root_dir=root_dir)
     target = ref.artifacts_dir / "raw_inputs"
