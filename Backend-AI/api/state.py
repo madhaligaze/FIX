@@ -35,3 +35,6 @@ class RuntimeState:
         if session_id not in self.scene_graphs:
             self.scene_graphs[session_id] = SceneGraph()
         return self.scene_graphs[session_id]
+
+    def policy_status(self) -> dict:
+        return {"policy": self.policy.__dict__, "source": self.config.get("policy_source")}

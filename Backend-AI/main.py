@@ -11,6 +11,7 @@ from api.routes_session import router as session_router
 from api.state import RuntimeState
 from config.loader import load_config
 from modules.detector_2d import Detector2D
+from policy.load_policy import find_policy_file, load_policy_from_yaml
 from policy.policy_config import PolicyConfig
 from session.session_store import SessionStore
 
@@ -19,6 +20,12 @@ def init_runtime() -> RuntimeState:
     config = load_config()
     store = SessionStore(config.get("paths", {}).get("artifacts_root", "sessions"))
     policy = PolicyConfig.from_config(config)
+    policy_file = find_policy_file()
+    if policy_file is not None:
+        policy = load_policy_from_yaml(policy_file)
+        config["policy_source"] = str(policy_file).replace("\\", "/")
+    else:
+        config["policy_source"] = None
     runtime = RuntimeState(config=config, store=store, policy=policy)
     runtime.perception_unavailable = not Detector2D().available
     return runtime

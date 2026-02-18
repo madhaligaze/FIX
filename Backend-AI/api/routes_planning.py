@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request
 
 from export.scene_bundle import build_scene_bundle
+from policy.policy_report import build_policy_report
 from policy.unknown_space import apply_unknown_policy
 from scaffold.bom import bom_from_elements
 from scaffold.solver import generate_scaffold
@@ -43,10 +44,12 @@ def request_scaffold(request: Request, session_id: str):
         scan_plan = list(needs_scan) + list(scan_plan)
 
     if not ready:
-        raise HTTPException(
-            status_code=409,
-            detail={"status": "NEEDS_SCAN", "reasons": reasons, "scan_plan": scan_plan, "score": score},
+        report = build_policy_report(
+            policy=state.policy,
+            readiness={"ready": False, "score": score, "reasons": reasons},
+            unknown=apply_unknown_policy(world, anchors, state.policy),
         )
+        raise HTTPException(status_code=409, detail={"status": "NEEDS_SCAN", "scan_plan": scan_plan, "report": report})
 
     elements, solver_trace = generate_scaffold(world, anchors, state.policy)
 
@@ -59,7 +62,13 @@ def request_scaffold(request: Request, session_id: str):
 
     if (not valid or violations) and bool(getattr(state.policy, "enforce_validators_strict", True)):
         add_trace_event(state.traces[session_id], "scaffold_blocked", {"violations": violations}, level="warn")
-        raise HTTPException(status_code=409, detail={"status": "UNSAFE", "violations": violations})
+        report = build_policy_report(
+            policy=state.policy,
+            readiness={"ready": True, "score": score, "reasons": reasons},
+            unknown=unknown,
+            validators={"valid": bool(valid), "violations": violations},
+        )
+        raise HTTPException(status_code=409, detail={"status": "UNSAFE", "violations": violations, "report": report})
 
     overlays = world.compute_overlays(state.policy.__dict__)
     overlays["violations"] = violations
@@ -79,6 +88,12 @@ def request_scaffold(request: Request, session_id: str):
     bundle["env_mesh"]["present"] = bool(env_mesh_bytes)
     bundle["trace"]["present"] = True
     bundle["trace"]["ndjson_size_bytes"] = None  # filled by client if needed
+    bundle["policy_report"] = build_policy_report(
+        policy=state.policy,
+        readiness={"ready": True, "score": score, "reasons": reasons},
+        unknown=unknown,
+        validators={"valid": bool(valid), "violations": violations},
+    )
     # Keep paths normalized for Android clients on Windows-hosted servers
     if "overlay_files" in bundle:
         # already normalized in build_scene_bundle

@@ -31,6 +31,12 @@ def create_session(request: Request):
     return {"session_id": session_id}
 
 
+@router.get("/policy/status")
+def policy_status(request: Request):
+    state = request.app.state.runtime
+    return state.policy_status()
+
+
 @router.post("/session/frame")
 async def post_frame(
     request: Request,
@@ -111,4 +117,5 @@ def session_status(request: Request, session_id: str):
         "scene_graph": sg.serialize(),
         "geometry_unavailable": not bool(world.metrics.get("tsdf_available", True)),
         "geometry_reason": world.metrics.get("tsdf_reason"),
+        "policy_source": state.config.get("policy_source"),
     }
