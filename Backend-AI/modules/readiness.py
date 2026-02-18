@@ -1,90 +1,96 @@
-"""Stage 7 - Readiness gating for planning/export.
-
-The main idea:
-- The pipeline must be able to say 'not enough information yet' and refuse to
-  generate/approve scaffold layouts that depend on uncertain geometry.
-- This is implemented as a conservative gate based on:
-    1) UNKNOWN ratio inside the target region (target_box)
-    2) (optional) reprojection consistency stats from Stage 5
-
-This is not 'AI magic'. It's guardrails that prevent confident nonsense.
-"""
+"""Stage 7: Readiness gate."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
-class ReadinessThresholds:
-    max_unknown_ratio: float = 0.45
+class ReadinessProfile:
     max_miss_rate: float = 0.20
     max_mismatch_rate: float = 0.12
     max_median_abs_error_m: float = 0.07
+    max_unknown_ratio: float = 0.45
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_miss_rate": float(self.max_miss_rate),
+            "max_mismatch_rate": float(self.max_mismatch_rate),
+            "max_median_abs_error_m": float(self.max_median_abs_error_m),
+            "max_unknown_ratio": float(self.max_unknown_ratio),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "ReadinessProfile":
+        data = data or {}
+        return cls(
+            max_miss_rate=float(data.get("max_miss_rate", cls.max_miss_rate)),
+            max_mismatch_rate=float(data.get("max_mismatch_rate", cls.max_mismatch_rate)),
+            max_median_abs_error_m=float(data.get("max_median_abs_error_m", cls.max_median_abs_error_m)),
+            max_unknown_ratio=float(data.get("max_unknown_ratio", cls.max_unknown_ratio)),
+        )
+
+
+ReadinessThresholds = ReadinessProfile
 
 
 def compute_readiness(
-    voxel_world: Any,
-    target_center: Tuple[float, float, float],
-    target_half_extents: Tuple[float, float, float],
+    *,
     reprojection: Optional[Dict[str, Any]] = None,
-    thresholds: Optional[ReadinessThresholds] = None,
+    unknown_ratio: Optional[float] = None,
+    profile: Optional[ReadinessProfile] = None,
+    voxel_world: Any = None,
+    target_center: Optional[Tuple[float, float, float]] = None,
+    target_half_extents: Optional[Tuple[float, float, float]] = None,
+    thresholds: Optional[ReadinessProfile] = None,
 ) -> Dict[str, Any]:
-    th = thresholds or ReadinessThresholds()
+    profile = profile or thresholds or ReadinessProfile()
+    reasons: List[str] = []
 
-    cx, cy, cz = map(float, target_center)
-    hx, hy, hz = map(float, target_half_extents)
-
-    unknown_ratio = None
-    if voxel_world is not None:
+    if unknown_ratio is None and voxel_world is not None and target_center is not None and target_half_extents is not None:
         try:
-            unknown_ratio = float(
-                voxel_world.unknown_fraction_in_box(
-                    (cx, cy, cz),
-                    (hx, hy, hz),
-                    sample_step_vox=2,
-                )
-            )
+            unknown_ratio = float(voxel_world.unknown_fraction_in_box(target_center, target_half_extents))
         except Exception:
             unknown_ratio = None
 
-    reasons = []
-    if unknown_ratio is None:
-        reasons.append("no_voxel_world")
-    elif unknown_ratio > float(th.max_unknown_ratio):
-        reasons.append("too_much_unknown")
+    miss_rate = None
+    mismatch_rate = None
+    median_abs = None
 
-    # Reprojection (Stage 5) - optional but recommended
-    miss_rate = mismatch_rate = median_abs_error_m = None
     if reprojection:
-        miss_rate = float(reprojection.get("miss_rate", 0.0))
-        mismatch_rate = float(reprojection.get("mismatch_rate", 0.0))
-        median_abs_error_m = float(reprojection.get("median_abs_error_m", 0.0))
+        miss_rate = reprojection.get("miss_rate")
+        mismatch_rate = reprojection.get("mismatch_rate")
+        median_abs = reprojection.get("median_abs_error_m")
 
-        if miss_rate > float(th.max_miss_rate):
-            reasons.append("reprojection_miss_high")
-        if mismatch_rate > float(th.max_mismatch_rate):
-            reasons.append("reprojection_mismatch_high")
-        if median_abs_error_m > float(th.max_median_abs_error_m):
-            reasons.append("reprojection_error_high")
+        if miss_rate is not None and float(miss_rate) > profile.max_miss_rate:
+            reasons.append("miss_rate")
+        if mismatch_rate is not None and float(mismatch_rate) > profile.max_mismatch_rate:
+            reasons.append("mismatch_rate")
+        if median_abs is not None and float(median_abs) > profile.max_median_abs_error_m:
+            reasons.append("median_abs_error")
+
+    if unknown_ratio is not None and float(unknown_ratio) > profile.max_unknown_ratio:
+        reasons.append("unknown_ratio")
 
     ready = len(reasons) == 0
 
     return {
         "ready_to_lock": bool(ready),
         "reasons": reasons,
-        "unknown_ratio": unknown_ratio,
-        "thresholds": {
-            "max_unknown_ratio": float(th.max_unknown_ratio),
-            "max_miss_rate": float(th.max_miss_rate),
-            "max_mismatch_rate": float(th.max_mismatch_rate),
-            "max_median_abs_error_m": float(th.max_median_abs_error_m),
+        "profile": profile.to_dict(),
+        "observed": {
+            "miss_rate": miss_rate,
+            "mismatch_rate": mismatch_rate,
+            "median_abs_error_m": median_abs,
+            "unknown_ratio": unknown_ratio,
         },
+        "unknown_ratio": unknown_ratio,
+        "thresholds": profile.to_dict(),
         "reprojection": {
             "miss_rate": miss_rate,
             "mismatch_rate": mismatch_rate,
-            "median_abs_error_m": median_abs_error_m,
+            "median_abs_error_m": median_abs,
         }
         if reprojection
         else None,

@@ -60,19 +60,23 @@ from modules.debug_dumper import DebugDumper
 
 # ── Stage 5/6: self-critique + active scanning ─────────────────────────────
 try:
-    from modules.reprojection_check import run_reprojection_check
-    from modules.active_scanning import propose_views
-    from modules.readiness import ReadinessThresholds, compute_readiness
+    from modules.reprojection_check import run_reprojection_check, check_reprojection
+    from modules.active_scanning import propose_views, build_scan_plan
+    from modules.readiness import ReadinessThresholds, ReadinessProfile, compute_readiness
+    from modules.readiness_calibration import extract_reprojection_metrics_from_frames, suggest_thresholds, calibrate_profile
 
     VALIDATION_AVAILABLE = True
 except Exception:
     run_reprojection_check = None
+    check_reprojection = None
     propose_views = None
+    build_scan_plan = None
     ReadinessThresholds = None
+    ReadinessProfile = None
     compute_readiness = None
+    calibrate_profile = None
     VALIDATION_AVAILABLE = False
 
-from modules.readiness_calibration import extract_reprojection_metrics_from_frames, suggest_thresholds
 
 # Stage 9/10: reproducible world snapshots
 try:
@@ -499,10 +503,19 @@ class SessionUnlockRequest(BaseModel):
 
 class ReadinessCalibrateRequest(BaseModel):
     session_id: str
-    target_box: Optional[Dict[str, Any]] = None
+    window: int = 80
+    safety_margin: float = 1.25
+    apply: bool = True
 
 
 # ─── v3.0 Models ────────────────────────────────────────────────────────────
+
+
+
+class ReadinessSetRequest(BaseModel):
+    session_id: str
+    profile: Dict[str, Any]
+
 
 class DepthStreamRequest(BaseModel):
     """Стриминг карты глубины с ARCore Depth API."""
@@ -576,9 +589,15 @@ class FramePacketRequest(BaseModel):
     # Enable / disable vision (2D detector + lifting)
     enable_vision: bool = True
 
+    # Stage 5-7: self-check (reprojection) + scan guidance + readiness
+    enable_self_check: bool = True
+    target_center: Optional[Point3D] = None
+    target_half_extents: Optional[Point3D] = None
+
 
 class LockWorldRequest(BaseModel):
     session_id: str
+    force: bool = False
 
 
 class TargetBoxModel(BaseModel):
@@ -587,20 +606,12 @@ class TargetBoxModel(BaseModel):
 
 
 class ScanPlanRequest(BaseModel):
-    """Запрос плана активного досканирования (Stage 6/7)."""
-
     session_id: str
-    target_box: Optional[TargetBoxModel] = None
     max_views: int = 3
     distance_m: float = 1.6
-    angles_deg: List[float] = Field(default_factory=lambda: [0.0, 25.0, -25.0, 55.0, -55.0, 180.0])
-    distance_multipliers: List[float] = Field(default_factory=lambda: [1.0, 1.25])
-    gain_weight: float = 8.0
-    gain_samples: int = 220
-    max_unknown_ratio: float = 0.45
-    max_miss_rate: float = 0.20
-    max_mismatch_rate: float = 0.12
-    max_median_abs_error_m: float = 0.07
+    suggestions: Optional[List[Dict[str, Any]]] = None
+    target_center: Optional[Point3D] = None
+    target_half_extents: Optional[Point3D] = None
 
 
 class StructureModifyRequest(BaseModel):
@@ -875,30 +886,76 @@ async def ingest_frame_packet(request: FramePacketRequest):
             det3d = out.get("det3d", [])
             world_objects = out.get("world_objects", [])
             scan_suggestions_model = out.get("scan_suggestions", [])
-            # Persist stable objects in scene_context
             session.scene_context.world_objects = world_objects
-            # For legacy/debug: keep raw 3D dets in all_detected_objects
             session.scene_context.all_detected_objects.extend(det3d)
 
-        # Merge scan suggestions from perception + reprojection
         if scan_suggestions_model:
             scan_suggestions.extend(scan_suggestions_model)
 
-        # Persist Stage diagnostics in the session context
-        session.scene_context.last_reprojection = reprojection or {}
-        session.scene_context.last_scan_suggestions = scan_suggestions or []
+        # Stage 5-7: additional self-check + scan planning + readiness
+        unknown_ratio = None
+        if voxel_world is not None and request.target_center and request.target_half_extents:
+            try:
+                c = (float(request.target_center.x), float(request.target_center.y), float(request.target_center.z))
+                h = (float(request.target_half_extents.x), float(request.target_half_extents.y), float(request.target_half_extents.z))
+                unknown_ratio = float(voxel_world.unknown_fraction_in_box(c, h))
+            except Exception:
+                unknown_ratio = None
 
-        pose = _normalize_camera_pose(request.pose_world_from_camera)
-        scan_plan = _compute_scan_plan(
-            session=session,
-            current_pose=pose,
-            target_box=_box_from_points(
-                [s.get("point") or s for s in (scan_suggestions or []) if isinstance((s.get("point") or s), dict)],
-                margin_m=2.0,
-            ),
-            max_views=3,
-            distance_m=1.6,
-        )
+        if bool(request.enable_self_check) and voxel_world is not None and depth_bytes is not None and check_reprojection is not None:
+            try:
+                rc = check_reprojection(
+                    voxel_world=voxel_world,
+                    depth_bytes=depth_bytes,
+                    width=request.width,
+                    height=request.height,
+                    fx=request.fx,
+                    fy=request.fy,
+                    cx_px=request.cx_px,
+                    cy_px=request.cy_px,
+                    pose7=_normalize_camera_pose(request.pose_world_from_camera),
+                    depth_scale=request.depth_scale,
+                    pixel_step=12,
+                    max_range=8.0,
+                    mismatch_abs_thresh_m=0.12,
+                    max_suggestions=160,
+                )
+                reprojection = rc.get("reprojection", rc) or {}
+                sgs = rc.get("scan_suggestions", []) or []
+                if sgs:
+                    scan_suggestions = list(scan_suggestions or []) + list(sgs)
+            except Exception as e:
+                reprojection = {"error": str(e)}
+
+        session.scene_context.last_reprojection = reprojection or {}
+        if reprojection:
+            session.scene_context.reprojection_history.append(reprojection)
+            if len(session.scene_context.reprojection_history) > 240:
+                session.scene_context.reprojection_history = session.scene_context.reprojection_history[-240:]
+
+        session.scene_context.last_scan_suggestions = list(scan_suggestions or [])
+
+        scan_plan = {}
+        if voxel_world is not None and scan_suggestions and build_scan_plan is not None:
+            try:
+                scan_plan = build_scan_plan(
+                    voxel_world=voxel_world,
+                    suggestions=scan_suggestions,
+                    max_views=3,
+                    distance_m=1.6,
+                )
+            except Exception as e:
+                scan_plan = {"error": str(e)}
+        session.scene_context.last_scan_plan = scan_plan or {}
+
+        readiness = {}
+        try:
+            profile = ReadinessProfile.from_dict(session.scene_context.readiness_profile)
+            readiness = compute_readiness(reprojection=reprojection, unknown_ratio=unknown_ratio, profile=profile)
+            session.scene_context.last_readiness = readiness
+        except Exception as e:
+            readiness = {"error": str(e)}
+            session.scene_context.last_readiness = readiness
 
         # Lightweight local unknown-space estimate for UI guidance
         try:
@@ -919,10 +976,12 @@ async def ingest_frame_packet(request: FramePacketRequest):
             camera_position=_normalize_camera_pose(request.pose_world_from_camera),
             ar_points=[],
             quality_metrics={
-                "geometry": geom_stats,
-                "mesh": mesh_info,
+                "geometry_stats": geom_stats,
+                "mesh_info": mesh_info,
                 "reprojection": reprojection,
                 "scan_suggestions": scan_suggestions,
+                "scan_plan": scan_plan,
+                "readiness": readiness,
             },
             detected_objects=det3d,
         )
@@ -944,6 +1003,8 @@ async def ingest_frame_packet(request: FramePacketRequest):
             "mesh_info": mesh_info,
             "scan_suggestions": scan_suggestions,
             "scan_plan": scan_plan,
+            "reprojection": reprojection,
+            "readiness": readiness,
         }
 
     except HTTPException:
@@ -1023,58 +1084,49 @@ async def ingest_frame_packet_upload(
 
 
 @app.post("/session/scan_plan")
-async def get_scan_plan(request: ScanPlanRequest):
-    """Return an active scanning plan for the operator (Stage 6/7)."""
+async def build_scan_plan_endpoint(request: ScanPlanRequest):
+    """Build scan plan from latest suggestions (or provided suggestions)."""
     session = session_manager.get_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Сессия не найдена")
 
-    tb = None
-    if request.target_box is not None:
-        tb = {
-            "center": {
-                "x": float(request.target_box.center.x),
-                "y": float(request.target_box.center.y),
-                "z": float(request.target_box.center.z),
-            },
-            "half_extents": {
-                "x": float(request.target_box.half_extents.x),
-                "y": float(request.target_box.half_extents.y),
-                "z": float(request.target_box.half_extents.z),
-            },
-        }
-    else:
-        sugg = getattr(session.scene_context, "last_scan_suggestions", []) or []
-        pts = []
-        for s in sugg:
-            p = s.get("point") or s
-            if isinstance(p, dict):
-                pts.append(p)
-        tb = _box_from_points(pts, margin_m=2.0)
+    voxel_world = session.scene_context.ensure_voxel_world()
+    suggestions = request.suggestions if request.suggestions is not None else session.scene_context.last_scan_suggestions
 
-    th = None
-    if ReadinessThresholds is not None:
-        th = ReadinessThresholds(
-            max_unknown_ratio=float(request.max_unknown_ratio),
-            max_miss_rate=float(request.max_miss_rate),
-            max_mismatch_rate=float(request.max_mismatch_rate),
-            max_median_abs_error_m=float(request.max_median_abs_error_m),
+    if not voxel_world or not suggestions:
+        return {"status": "empty", "session_id": request.session_id, "scan_plan": {"clusters": [], "next_best_views": []}}
+
+    try:
+        scan_plan = build_scan_plan(
+            voxel_world=voxel_world,
+            suggestions=suggestions,
+            max_views=int(request.max_views),
+            distance_m=float(request.distance_m),
         )
+    except Exception as e:
+        scan_plan = {"error": str(e)}
 
-    plan = _compute_scan_plan(
-        session=session,
-        current_pose=None,
-        target_box=tb,
-        max_views=int(request.max_views),
-        distance_m=float(request.distance_m),
-        angles_deg=list(request.angles_deg or []),
-        distance_multipliers=list(request.distance_multipliers or []),
-        gain_weight=float(request.gain_weight),
-        gain_samples=int(request.gain_samples),
-        thresholds=th,
-    )
+    unknown_ratio = None
+    if request.target_center and request.target_half_extents and voxel_world:
+        try:
+            c = (float(request.target_center.x), float(request.target_center.y), float(request.target_center.z))
+            h = (float(request.target_half_extents.x), float(request.target_half_extents.y), float(request.target_half_extents.z))
+            unknown_ratio = float(voxel_world.unknown_fraction_in_box(c, h))
+        except Exception:
+            unknown_ratio = None
 
-    return {"status": "ok", "session_id": request.session_id, "scan_plan": plan}
+    readiness = session.scene_context.last_readiness
+    try:
+        profile = ReadinessProfile.from_dict(session.scene_context.readiness_profile)
+        readiness = compute_readiness(reprojection=session.scene_context.last_reprojection, unknown_ratio=unknown_ratio, profile=profile)
+        session.scene_context.last_readiness = readiness
+    except Exception:
+        pass
+
+    session.scene_context.last_scan_plan = scan_plan or {}
+    session_manager.auto_save_session(request.session_id)
+
+    return {"status": "ok", "session_id": request.session_id, "scan_plan": scan_plan, "readiness": readiness}
 
 
 @app.post("/session/lock_world")
@@ -1082,6 +1134,20 @@ async def lock_world(request: LockWorldRequest):
     session = session_manager.get_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+    if not bool(request.force):
+        r = session.scene_context.last_readiness or {}
+        if r and (r.get("ready_to_lock") is False):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "NOT_READY_TO_LOCK",
+                    "reasons": r.get("reasons", []),
+                    "profile": r.get("profile"),
+                    "observed": r.get("observed"),
+                    "hint": "Сделайте дополнительный скан по scan_plan и/или улучшите покрытие.",
+                },
+            )
 
     mesh_version = session.lock_world()
     session.status = "LOCKED_WORLD"
@@ -1109,17 +1175,37 @@ async def get_session_state(session_id: str):
 
 
 @app.post("/session/readiness/calibrate")
-async def calibrate_readiness(request: ReadinessCalibrateRequest):
+async def readiness_calibrate(request: ReadinessCalibrateRequest):
+    """Suggest (and optionally apply) readiness thresholds from recent history."""
     session = session_manager.get_session(request.session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    metrics = summarize_session_metrics(session)
-    suggested = suggest_thresholds_from_session(session, target_box=request.target_box)
-    return {
-        "session_id": request.session_id,
-        "metrics_summary": metrics,
-        "suggested_thresholds": suggested,
-    }
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+    try:
+        default = ReadinessProfile.from_dict(session.scene_context.readiness_profile)
+        out = calibrate_profile(
+            history=session.scene_context.reprojection_history,
+            default=default,
+            window=int(request.window),
+            safety_margin=float(request.safety_margin),
+        )
+        if bool(request.apply):
+            session.scene_context.readiness_profile = dict(out.get("suggested_profile", {}))
+            session_manager.auto_save_session(request.session_id)
+        return {"status": "ok", "session_id": request.session_id, **out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/session/readiness/set")
+async def readiness_set(request: ReadinessSetRequest):
+    session = session_manager.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+
+    session.scene_context.readiness_profile = dict(request.profile or {})
+    session_manager.auto_save_session(request.session_id)
+    return {"status": "ok", "session_id": request.session_id, "readiness_profile": session.scene_context.readiness_profile}
 
 
 @app.post("/session/lock")

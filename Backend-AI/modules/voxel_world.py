@@ -600,11 +600,18 @@ class VoxelWorld:
         direction_world: Tuple[float, float, float],
         max_dist: float = 8.0,
         step: Optional[float] = None,
+        unknown_is_blocked: bool = False,
+        include_safety: bool = True,
+        return_unknown_hit: bool = False,
     ) -> Optional[float]:
         """Approximate raycast against OCCUPIED voxels.
 
         Returns distance to first OCCUPIED voxel along the ray, or None if nothing hit.
-        UNKNOWN is *not* treated as a hit (it is handled separately in scoring).
+
+        Compatibility:
+        - if return_unknown_hit=False: returns Optional[float]
+        - if return_unknown_hit=True: returns Optional[Tuple[float, bool]]
+          where bool indicates whether hit happened on UNKNOWN.
         """
         ox, oy, oz = map(float, origin_world)
         dx, dy, dz = map(float, direction_world)
@@ -622,17 +629,59 @@ class VoxelWorld:
             x = ox + dx * dist
             y = oy + dy * dist
             z = oz + dz * dist
+            if not self._in_bounds_xyz(x, y, z):
+                dist += step
+                continue
             g = self._to_grid(x, y, z)
+            if include_safety and g in self._safety_occupied:
+                return (dist, False) if return_unknown_hit else dist
             if g in self.occupied:
-                return dist
+                return (dist, False) if return_unknown_hit else dist
+            if unknown_is_blocked and g not in self.free:
+                return (dist, True) if return_unknown_hit else dist
             dist += step
         return None
+
+    def unknown_ratio_along_ray(
+        self,
+        origin_world: Tuple[float, float, float],
+        direction_world: Tuple[float, float, float],
+        max_dist: float = 8.0,
+        step: Optional[float] = None,
+    ) -> float:
+        """Estimate UNKNOWN ratio along a ray segment."""
+        ox, oy, oz = map(float, origin_world)
+        dx, dy, dz = map(float, direction_world)
+        nrm = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if nrm <= 1e-9:
+            return 1.0
+        dx, dy, dz = dx / nrm, dy / nrm, dz / nrm
+        if step is None:
+            step = max(float(self.resolution), 1e-3)
+
+        unknown = 0
+        total = 0
+        dist = 0.0
+        while dist <= float(max_dist):
+            x = ox + dx * dist
+            y = oy + dy * dist
+            z = oz + dz * dist
+            if self._in_bounds_xyz(x, y, z):
+                g = self._to_grid(x, y, z)
+                total += 1
+                if g not in self.occupied and g not in self.free:
+                    unknown += 1
+            dist += float(step)
+        if total <= 0:
+            return 1.0
+        return float(unknown) / float(total)
 
     def unknown_fraction_in_box(
         self,
         center_world: Tuple[float, float, float],
         half_extents_m: Tuple[float, float, float],
         sample_step_vox: int = 2,
+        step: Optional[float] = None,
     ) -> float:
         """Estimate UNKNOWN fraction in an axis-aligned box.
 
@@ -641,6 +690,9 @@ class VoxelWorld:
         """
         cx, cy, cz = center_world
         hx, hy, hz = half_extents_m
+
+        if step is not None:
+            sample_step_vox = max(1, int(round(float(step) / max(float(self.resolution), 1e-9))))
 
         # Convert to grid bounds
         gmin = self._to_grid(cx - hx, cy - hy, cz - hz)
