@@ -7,6 +7,8 @@ from api.ingest import ingest_frame
 from contracts.frame_packet import AnchorPoint, FramePacketMeta
 from policy.unknown_space import apply_unknown_policy
 from scanning.readiness import compute_readiness
+from validation.frame_validation import validate_and_normalize_frame_meta
+
 
 router = APIRouter(tags=["session"])
 
@@ -39,6 +41,7 @@ def create_session(request: Request):
     state.get_scene_graph(session_id)
     state.anchors[session_id] = []
     state.traces[session_id] = []
+    state.last_timestamp[session_id] = float("-inf")
     return {"session_id": session_id}
 
 
@@ -52,24 +55,46 @@ async def post_frame(
 ):
     state = request.app.state.runtime
 
+    raw_meta_bytes = await meta.read()
     try:
-        meta_payload = FramePacketMeta.model_validate_json(await meta.read())
+        meta_payload = FramePacketMeta.model_validate_json(raw_meta_bytes)
     except ValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail={"status": "INVALID_META", "errors": exc.errors()}) from exc
 
+    rgb_bytes = await rgb.read()
     depth_bytes = await depth.read() if depth else None
     pointcloud_bytes = await pointcloud.read() if pointcloud else None
 
     if meta_payload.depth_meta and depth_bytes is None:
-        raise HTTPException(status_code=400, detail="depth file is required when depth_meta is provided")
+        raise HTTPException(status_code=400, detail={"status": "MISSING_FILE", "field": "depth"})
     if meta_payload.pointcloud_meta and pointcloud_bytes is None:
-        raise HTTPException(status_code=400, detail="pointcloud file is required when pointcloud_meta is provided")
+        raise HTTPException(status_code=400, detail={"status": "MISSING_FILE", "field": "pointcloud"})
 
     session_id = meta_payload.session_id
-    rgb_bytes = await rgb.read()
-    meta_dict = meta_payload.model_dump()
+    last_ts = state.last_timestamp.get(session_id)
 
-    return ingest_frame(state, session_id, meta_payload.frame_id, meta_dict, rgb_bytes, depth_bytes, pointcloud_bytes)
+    meta_dict = meta_payload.model_dump()
+    validated_meta, errors = validate_and_normalize_frame_meta(
+        meta_dict,
+        rgb_bytes=rgb_bytes,
+        last_timestamp=last_ts,
+    )
+    if errors:
+        raise HTTPException(status_code=400, detail={"status": "INVALID_FRAMEPACKET", "errors": errors})
+
+    # Update monotonic timestamp state (STAGE A)
+    state.last_timestamp[session_id] = float(validated_meta["timestamp"])
+
+    return ingest_frame(
+        state,
+        session_id,
+        meta_payload.frame_id,
+        meta_dict,
+        rgb_bytes,
+        depth_bytes,
+        pointcloud_bytes,
+        validated_meta=validated_meta,
+    )
 
 
 @router.post("/session/anchors")
@@ -124,6 +149,8 @@ def session_status(request: Request, session_id: str):
         "scene_graph": sg.serialize(),
         "geometry_unavailable": (not bool(world.metrics.get("tsdf_available", True))),
         "geometry_reason": world.metrics.get("tsdf_reason"),
+        "tracking_quality": world.metrics.get("tracking_quality", "UNKNOWN"),
+        "tracking_reasons": world.metrics.get("tracking_reasons", []),
         "policy_source": getattr(state, "policy_source", None),
         "config_source": getattr(state, "config_source", None),
     }

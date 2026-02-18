@@ -17,7 +17,6 @@ export:
     occupancy_npz: true
     occupancy_slice_png: true
 
-# Policy YAML location can be overridden per deployment.
-# If null, policy/load_policy.py will search its default locations.
+# Optional: point to an explicit policy YAML per deployment.
 policy:
   policy_yaml_path: null

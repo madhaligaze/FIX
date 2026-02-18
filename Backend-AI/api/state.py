@@ -15,7 +15,9 @@ from world.world_model import WorldModel
 class RuntimeState:
     config: AppConfig = field(default_factory=AppConfig)
     config_source: str | None = None
+
     store: SessionStore = field(default_factory=SessionStore)
+
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     policy_source: str | None = None
 
@@ -26,6 +28,10 @@ class RuntimeState:
     traces: dict[str, list[dict]] = field(default_factory=dict)
     last_rev: dict[str, str] = field(default_factory=dict)
     restored_revision_state: dict[str, dict] = field(default_factory=dict)
+
+    # STAGE A: monotonic timestamp tracking per session
+    last_timestamp: dict[str, float] = field(default_factory=dict)
+
     perception_unavailable: bool = False
 
     @classmethod
@@ -48,7 +54,6 @@ class RuntimeState:
                 policy_file = candidate
         if policy_file is None:
             policy_file = find_policy_file()
-
         if policy_file is not None:
             policy = load_policy_from_yaml(policy_file)
             policy_source = str(policy_file).replace("\\", "/")
