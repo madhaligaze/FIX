@@ -31,6 +31,7 @@ def build_quality_report(
     unknown_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
     ctx = getattr(session, "scene_context", None)
+    lifecycle_state = getattr(session, "lifecycle_state", None)
     readiness = getattr(ctx, "last_readiness", None) if ctx else None
     reprojection = getattr(ctx, "last_reprojection", None) if ctx else None
     scan_plan = getattr(ctx, "last_scan_plan", None) if ctx else None
@@ -39,7 +40,7 @@ def build_quality_report(
         "session_id": session_id,
         "revision": revision,
         "created_at": time.time(),
-        "lifecycle_state": getattr(session, "lifecycle_state", None).value if getattr(session, "lifecycle_state", None) else getattr(session, "status", "UNKNOWN"),
+        "lifecycle_state": getattr(lifecycle_state, "value", str(lifecycle_state)) if lifecycle_state else getattr(session, "status", "UNKNOWN"),
         "world_locked": bool(getattr(session, "world_locked", False)),
         "mesh_version": getattr(session, "locked_mesh_version", None) or getattr(session, "mesh_version", None),
         "planned_elements_count": int(planned_elements_count or 0),
