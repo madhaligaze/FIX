@@ -45,6 +45,7 @@ class SessionStore:
         world_model_state: dict[str, Any],
         overlays: dict[str, Any],
         trace: list[dict[str, Any]],
+        env_mesh: str | None = None,
         env_mesh_bytes: bytes | None = None,
     ) -> str:
         rev_id = str(uuid4())
@@ -52,8 +53,10 @@ class SessionStore:
         save_json(base / "world_state.json", world_model_state)
         save_json(base / "overlays.json", overlays)
         save_json(base / "trace.json", trace)
-        if env_mesh_bytes:
+        if env_mesh_bytes is not None:
             save_bytes(base / "env_mesh.obj", env_mesh_bytes)
+        elif env_mesh:
+            save_bytes(base / "env_mesh.obj", env_mesh.encode("utf-8"))
         return rev_id
 
     def save_export(self, session_id: str, rev_id: str, scene_bundle: dict[str, Any]) -> Path:

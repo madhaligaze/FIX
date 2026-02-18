@@ -27,7 +27,7 @@ class TSDFVolume:
         depth_scale: float,
         rgb_bytes: bytes | None = None,
     ) -> None:
-        # Always update occupancy (cheap + readiness)
+        # Keep occupancy up to date for readiness + unknown gating.
         self.occupancy.integrate_depth(depth_u16, intrinsics, pose, depth_scale)
 
         h, w = depth_u16.shape
@@ -44,16 +44,16 @@ class TSDFVolume:
             except Exception:
                 color_img = None
         if color_img is None:
-            color_np = np.zeros((h, w, 3), dtype=np.uint8)
-            color_img = o3d.geometry.Image(color_np)
+            color_img = o3d.geometry.Image(np.zeros((h, w, 3), dtype=np.uint8))
 
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color=color_img,
             depth=depth_o3d,
             depth_scale=1.0,
-            depth_trunc=10.0,
+            depth_trunc=12.0,
             convert_rgb_to_intensity=False,
         )
+
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
             int(intrinsics["width"]),
             int(intrinsics["height"]),
@@ -63,8 +63,7 @@ class TSDFVolume:
             float(intrinsics["cy"]),
         )
 
-        # Contract: meta.pose is camera->world (AR pose in world frame).
-        # Open3D TSDF integration expects extrinsic as world->camera, so invert.
+        # Contract: pose is camera->world. Open3D expects world->camera, so invert.
         T_cw = pose_to_matrix(pose).astype(np.float64)
         T_wc = np.linalg.inv(T_cw)
         self._vol.integrate(rgbd, intrinsic, T_wc)
@@ -84,7 +83,6 @@ class TSDFVolume:
         lines: list[str] = []
         for v in verts:
             lines.append(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
-        # OBJ is 1-indexed
-        for f in tris:
+        for f in tris:  # OBJ is 1-indexed
             lines.append(f"f {int(f[0])+1} {int(f[1])+1} {int(f[2])+1}")
         return ("\n".join(lines) + "\n").encode("utf-8")

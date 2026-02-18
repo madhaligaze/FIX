@@ -3,10 +3,15 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
-from world.occupancy import FREE, OCCUPIED, UNKNOWN
+from world.occupancy import OCCUPIED, UNKNOWN
 
 
 class ESDF:
+    """
+    Euclidean Signed Distance (unsigned distance here) over the voxel grid.
+    Conservative: UNKNOWN treated as OCCUPIED for clearance queries.
+    """
+
     def __init__(self) -> None:
         self._dist_m: np.ndarray | None = None
         self._origin: np.ndarray | None = None
@@ -17,7 +22,6 @@ class ESDF:
         self._dirty = True
 
     def build_from_occupancy(self, grid: np.ndarray, origin: np.ndarray, voxel_size: float) -> None:
-        # Conservative: treat UNKNOWN as OCCUPIED for clearance queries
         occ_mask = (grid == OCCUPIED) | (grid == UNKNOWN)
         free_mask = ~occ_mask
         dist_vox = distance_transform_edt(free_mask)
@@ -30,9 +34,9 @@ class ESDF:
         if self._dirty or self._dist_m is None:
             self.build_from_occupancy(grid, origin, voxel_size)
         assert self._dist_m is not None and self._origin is not None and self._voxel_size is not None
-        pts = np.array(points, dtype=np.float32)
-        idx = ((pts - self._origin) / self._voxel_size).astype(int)
-        shp = np.array(self._dist_m.shape)
+        pts = np.asarray(points, dtype=np.float32)
+        idx = ((pts - self._origin) / self._voxel_size).astype(np.int32)
+        shp = np.asarray(self._dist_m.shape, dtype=np.int32)
         out: list[float] = []
         for i in idx:
             if np.any(i < 0) or np.any(i >= shp):
