@@ -56,7 +56,6 @@ async def post_frame(
     session_id = meta_payload.session_id
     rgb_bytes = await rgb.read()
     meta_dict = meta_payload.model_dump()
-
     return ingest_frame(state, session_id, meta_payload.frame_id, meta_dict, rgb_bytes, depth_bytes, pointcloud_bytes)
 
 
@@ -74,9 +73,16 @@ def lock_session(request: Request, payload: LockPayload):
     state = request.app.state.runtime
     world = state.get_world(payload.session_id)
     overlays = world.compute_overlays(state.policy.__dict__)
-    rev_id = state.store.lock_revision(payload.session_id, world.serialize_state(), overlays, state.traces.get(payload.session_id, []))
+    env_mesh_bytes = world.export_env_mesh_obj()
+    rev_id = state.store.lock_revision(
+        payload.session_id,
+        world.serialize_state(),
+        overlays,
+        state.traces.get(payload.session_id, []),
+        env_mesh_bytes=env_mesh_bytes,
+    )
     state.last_rev[payload.session_id] = rev_id
-    return {"session_id": payload.session_id, "rev_id": rev_id}
+    return {"session_id": payload.session_id, "rev_id": rev_id, "env_mesh_present": bool(env_mesh_bytes)}
 
 
 @router.get("/session/{session_id}/status")
