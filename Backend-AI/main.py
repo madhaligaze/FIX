@@ -50,6 +50,8 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def _guard(request: Request, call_next):
         cfg = app.state.runtime.config
+        role = require_api_key(request)
+
         rl_cfg = getattr(cfg, "rate_limit", None)
         enabled = True if rl_cfg is None else bool(getattr(rl_cfg, "enabled", True))
         if enabled:
@@ -59,8 +61,6 @@ def create_app() -> FastAPI:
                 if metrics_mod.RATE_LIMITED_TOTAL is not None:
                     metrics_mod.RATE_LIMITED_TOTAL.labels(request.url.path).inc()
                 raise
-
-        role = require_api_key(request)
         try:
             sec = getattr(cfg, "security", None)
             audit_enabled = True if sec is None else bool(getattr(sec, "audit_enabled", True))
