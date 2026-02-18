@@ -181,10 +181,7 @@ def _load_latest_export(state, session_id: str) -> dict[str, Any] | None:
             rev_id = json.loads(latest_path.read_text(encoding="utf-8")).get("rev_id")
     if not rev_id:
         return None
-    try:
-        return state.store.load_export(session_id, rev_id)
-    except FileNotFoundError:
-        return None
+    return state.store.load_export(session_id, rev_id)
 
 
 def _legacy_element_to_android(element: dict[str, Any]) -> dict[str, Any]:
@@ -352,9 +349,8 @@ def legacy_update(request: Request, session_id: str, payload: dict[str, Any] | N
     rev_id = state.last_rev.get(session_id)
     if not rev_id:
         raise HTTPException(status_code=409, detail={"status": "NO_MODEL"})
-    try:
-        export_bundle = state.store.load_export(session_id, rev_id)
-    except FileNotFoundError:
+    export_bundle = state.store.load_export(session_id, rev_id)
+    if export_bundle is None:
         raise HTTPException(status_code=409, detail={"status": "NO_MODEL"})
 
     scaffold = [item for item in (export_bundle.get("scaffold") or []) if isinstance(item, dict)]
@@ -434,9 +430,8 @@ def legacy_preview_remove(request: Request, session_id: str, element_id: str | N
     rev_id = state.last_rev.get(session_id)
     if not rev_id:
         raise HTTPException(status_code=409, detail={"status": "NO_MODEL"})
-    try:
-        export_bundle = state.store.load_export(session_id, rev_id)
-    except FileNotFoundError:
+    export_bundle = state.store.load_export(session_id, rev_id)
+    if export_bundle is None:
         raise HTTPException(status_code=409, detail={"status": "NO_MODEL"})
     scaffold = export_bundle.get("scaffold") or []
     target = None

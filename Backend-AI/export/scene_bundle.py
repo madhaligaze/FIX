@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
+
+from export.overlays_export import export_occupancy_npz, export_occupancy_slice_png
 
 
 def build_scene_bundle(
@@ -19,6 +22,13 @@ def build_scene_bundle(
         payload = scene_graph.serialize()
         objects = payload.get("objects", [])
         meta = payload.get("meta", {})
+
+    # STAGE 7 overlays: provide stable files for Android overlay rendering
+    # These are stored under sessions/<session_id>/world/<rev_id>/...
+    world_dir = Path("sessions") / session_id / "world" / rev_id
+    occ_npz = export_occupancy_npz(world_model, world_dir / "occupancy.npz")
+    occ_png = export_occupancy_slice_png(world_model, world_dir / "occupancy_z.png", axis="z", frac=0.2)
+
     return {
         "session_id": session_id,
         "revision_id": rev_id,
@@ -36,4 +46,10 @@ def build_scene_bundle(
         "overlays": overlays,
         "scan_hints": scan_plan,
         "world": world_model.serialize_state(),
+        "overlay_files": {
+            "occupancy": {"npz": {"path": str(occ_npz["path"]).replace("\\", "/")}},
+            "occupancy_slice": (
+                {"png": {"path": str(occ_png["path"]).replace("\\", "/")}} if occ_png else {"png": None}
+            ),
+        },
     }

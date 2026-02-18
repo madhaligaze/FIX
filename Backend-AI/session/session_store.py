@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -61,15 +62,31 @@ class SessionStore:
             save_bytes(base / "env_mesh.obj", env_mesh.encode("utf-8"))
         return rev_id
 
-    def save_export(self, session_id: str, rev_id: str, scene_bundle: dict[str, Any]) -> Path:
-        path = self.session_root(session_id) / "exports" / rev_id / "scene_bundle.json"
-        save_json(path, scene_bundle)
-        latest = self.session_root(session_id) / "exports" / "latest.json"
-        save_json(latest, {"rev_id": rev_id})
-        return path
+    def save_export(self, session_id: str, rev_id: str, bundle: dict[str, Any]) -> None:
+        """
+        Persist export bundle as the stable handoff artifact for Android.
+        """
+        base = ensure_dirs(self.session_root(session_id) / "exports" / rev_id)
+        save_json(base / "scene_bundle.json", bundle)
+        # Backward compatibility for legacy code paths.
+        save_json(self.session_root(session_id) / "exports" / "latest.json", {"rev_id": rev_id})
 
-    def load_export(self, session_id: str, rev_id: str) -> dict[str, Any]:
-        import json
-
+    def load_export(self, session_id: str, rev_id: str) -> dict[str, Any] | None:
         path = self.session_root(session_id) / "exports" / rev_id / "scene_bundle.json"
-        return json.loads(path.read_text(encoding="utf-8"))
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def list_exports(self, session_id: str) -> list[str]:
+        root = self.session_root(session_id) / "exports"
+        if not root.exists():
+            return []
+        out: list[str] = []
+        for d in root.iterdir():
+            if d.is_dir():
+                out.append(d.name)
+        out.sort()
+        return out

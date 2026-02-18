@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from api.routes_export import router as export_router
 from api.routes_legacy import router as legacy_router
@@ -14,15 +15,6 @@ from policy.policy_config import PolicyConfig
 from session.session_store import SessionStore
 
 
-app = FastAPI(title="Backend-AI", version="5.0.0")
-
-app.add_middleware(
-    GZipMiddleware,
-    minimum_size=1000,
-    compresslevel=5,
-)
-
-
 def init_runtime() -> RuntimeState:
     config = load_config()
     store = SessionStore(config.get("paths", {}).get("artifacts_root", "sessions"))
@@ -32,14 +24,31 @@ def init_runtime() -> RuntimeState:
     return runtime
 
 
-app.state.runtime = init_runtime()
+def create_app() -> FastAPI:
+    app = FastAPI(title="Backend-AI", version="5.0.0")
 
-app.include_router(session_router)
-app.include_router(planning_router)
-app.include_router(export_router)
-app.include_router(legacy_router)
+    app.add_middleware(
+        GZipMiddleware,
+        minimum_size=1000,
+        compresslevel=5,
+    )
+
+    app.state.runtime = init_runtime()
+
+    app.include_router(session_router)
+    app.include_router(planning_router)
+    app.include_router(export_router)
+    app.include_router(legacy_router)
+
+    # Serve artifacts (sessions/...) for Android to fetch env mesh, overlays, and traces
+    # Note: path is relative to process cwd; RuntimeState/session_store uses same convention.
+    app.mount("/sessions", StaticFiles(directory="sessions"), name="sessions")
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "version": app.version, "modules": {"legacy": True, "pipeline": True}}
+
+    return app
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "version": app.version, "modules": {"legacy": True, "pipeline": True}}
+app = create_app()

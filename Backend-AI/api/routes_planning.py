@@ -78,7 +78,11 @@ def request_scaffold(request: Request, session_id: str):
     bundle["bom"] = bom_from_elements(elements)
     bundle["env_mesh"]["present"] = bool(env_mesh_bytes)
     bundle["trace"]["present"] = True
-    bundle["trace"]["ndjson_size_bytes"] = None
+    bundle["trace"]["ndjson_size_bytes"] = None  # filled by client if needed
+    # Keep paths normalized for Android clients on Windows-hosted servers
+    if "overlay_files" in bundle:
+        # already normalized in build_scene_bundle
+        pass
 
     state.store.save_export(session_id, rev_id, bundle)
     return bundle
