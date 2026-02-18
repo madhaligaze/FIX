@@ -46,8 +46,6 @@ import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import kotlinx.coroutines.*
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
 import kotlin.math.min
 import com.example.aibrain.measurement.ARRuler
 import com.example.aibrain.measurement.MeasurementType
@@ -593,12 +591,12 @@ class MainActivity : AppCompatActivity() {
                 val resp = api.lockSession(LockPayload(session_id = sid))
                 if (resp.isSuccessful && resp.body() != null) {
                     val body = resp.body()!!
-                    showHint("✓ Сессия сохранена (rev: ${'$'}{body.rev_id})")
+                    showHint("✓ Сессия сохранена (rev: ${body.rev_id})")
                 } else {
-                    showError("Не удалось сохранить: HTTP ${'$'}{resp.code()}")
+                    showError("Не удалось сохранить: HTTP ${resp.code()}")
                 }
             } catch (e: Exception) {
-                showError("Ошибка сохранения: ${'$'}{e.message}")
+                showError("Ошибка сохранения: ${e.message}")
             } finally {
                 hideLoadingDialog()
             }
@@ -1369,10 +1367,10 @@ class MainActivity : AppCompatActivity() {
             frameCount += 1
             val hints = body.ai_hints
             if (hints != null) {
-                lastQualityScore = hints.quality_score
+                lastQualityScore = hints.quality_score ?: lastQualityScore
                 val msg = when {
-                    !hints.warnings.isNullOrBlank() -> hints.warnings
-                    !hints.instructions.isNullOrBlank() -> hints.instructions
+                    !hints.warnings.isNullOrEmpty() -> hints.warnings.joinToString("\n")
+                    !hints.instructions.isNullOrEmpty() -> hints.instructions.joinToString("\n")
                     else -> null
                 }
                 if (!msg.isNullOrBlank()) {
