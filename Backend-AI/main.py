@@ -2401,9 +2401,12 @@ async def finalize_model(session_id: str):
 
         try:
             from modules.revision_artifacts import artifact_path, save_json_artifact
+            from modules.export_manifest import add_artifact, add_event
+            from modules.quality_report import save_quality_report
 
             mesh_path = artifact_path(session_id=session_id, revision=revision, filename=f"scaffold_mesh_{revision}.gltf")
             mesh_builder.export_gltf(mesh, mesh_path)
+            add_artifact(session_id=session_id, revision=revision, kind="mesh_gltf", filename=f"scaffold_mesh_{revision}.gltf")
             save_json_artifact(
                 session_id=session_id,
                 revision=revision,
@@ -2422,6 +2425,17 @@ async def finalize_model(session_id: str):
                     },
                 },
             )
+            try:
+                save_quality_report(
+                    session_id=session_id,
+                    revision=revision,
+                    session=session,
+                    planned_elements_count=len(full_structure),
+                    unknown_policy=str(getattr(request, "unknown_policy", "")) if "request" in locals() else None,
+                )
+            except Exception:
+                pass
+            add_event(session_id=session_id, revision=revision, name="generation_done", payload={"mesh": f"scaffold_mesh_{revision}.gltf", "elements": len(full_structure)})
         except Exception:
             pass
 
@@ -2647,6 +2661,8 @@ async def export_session_bom(
     bom = _build_layher_bom_from_elements(elements)
 
     from modules.revision_artifacts import artifact_path, save_json_artifact
+    from modules.export_manifest import add_artifact, add_event
+    from modules.quality_report import save_quality_report
 
     safe_project = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (project_name or "project"))
     base_name = f"BOM_{safe_project}_{revision}"
@@ -2655,6 +2671,7 @@ async def export_session_bom(
         csv_data = bom_exporter.export_to_csv(bom, project_name)
         out_path = artifact_path(session_id=session_id, revision=revision, filename=f"{base_name}.csv")
         Path(out_path).write_bytes(csv_data.encode("utf-8") if isinstance(csv_data, str) else csv_data)
+        add_artifact(session_id=session_id, revision=revision, kind="bom_csv", filename=f"{base_name}.csv", meta={"project_name": project_name, "elements_count": len(elements)})
         save_json_artifact(
             session_id=session_id,
             revision=revision,
@@ -2668,12 +2685,19 @@ async def export_session_bom(
                 "timestamp": time.time(),
             },
         )
+        # Always write a quality report alongside exports for audit.
+        try:
+            save_quality_report(session_id=session_id, revision=revision, session=session, planned_elements_count=len(elements))
+        except Exception:
+            pass
+        add_event(session_id=session_id, revision=revision, name="export_bom", payload={"format": format, "file": f"{base_name}.csv"})
         return FileResponse(str(out_path), media_type="text/csv", filename=f"{base_name}.csv")
 
     if format == "xlsx":
         out_path = artifact_path(session_id=session_id, revision=revision, filename=f"{base_name}.xlsx")
         if not bom_exporter.export_to_excel(bom, str(out_path), project_name):
             raise HTTPException(status_code=500, detail="Excel export failed")
+        add_artifact(session_id=session_id, revision=revision, kind="bom_xlsx", filename=f"{base_name}.xlsx", meta={"project_name": project_name, "elements_count": len(elements)})
         save_json_artifact(
             session_id=session_id,
             revision=revision,
@@ -2687,12 +2711,18 @@ async def export_session_bom(
                 "timestamp": time.time(),
             },
         )
+        try:
+            save_quality_report(session_id=session_id, revision=revision, session=session, planned_elements_count=len(elements))
+        except Exception:
+            pass
+        add_event(session_id=session_id, revision=revision, name="export_bom", payload={"format": format, "file": f"{base_name}.xlsx"})
         return FileResponse(str(out_path), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=f"{base_name}.xlsx")
 
     if format == "pdf":
         out_path = artifact_path(session_id=session_id, revision=revision, filename=f"{base_name}.pdf")
         if not bom_exporter.export_to_pdf(bom, str(out_path), project_name):
             raise HTTPException(status_code=500, detail="PDF export failed")
+        add_artifact(session_id=session_id, revision=revision, kind="bom_pdf", filename=f"{base_name}.pdf", meta={"project_name": project_name, "elements_count": len(elements)})
         save_json_artifact(
             session_id=session_id,
             revision=revision,
@@ -2706,9 +2736,50 @@ async def export_session_bom(
                 "timestamp": time.time(),
             },
         )
+        try:
+            save_quality_report(session_id=session_id, revision=revision, session=session, planned_elements_count=len(elements))
+        except Exception:
+            pass
+        add_event(session_id=session_id, revision=revision, name="export_bom", payload={"format": format, "file": f"{base_name}.pdf"})
         return FileResponse(str(out_path), media_type="application/pdf", filename=f"{base_name}.pdf")
 
     raise HTTPException(status_code=400, detail=f"Unsupported format: {format}")
+
+
+@app.get("/session/manifest/{session_id}")
+async def get_revision_manifest(session_id: str, snapshot_revision: Optional[str] = None):
+    """Stage 12: Return manifest.json for the requested snapshot revision."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    revision = _require_snapshot_revision(session, snapshot_revision)
+    _restore_revision_world(session_id, revision)
+    from modules.export_manifest import load_manifest
+
+    return load_manifest(session_id, revision)
+
+
+@app.get("/session/quality_report/{session_id}")
+async def get_quality_report(session_id: str, snapshot_revision: Optional[str] = None):
+    """Stage 12: Return quality report JSON (generate if missing)."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    revision = _require_snapshot_revision(session, snapshot_revision)
+    _restore_revision_world(session_id, revision)
+    from modules.quality_report import save_quality_report, build_quality_report
+    from modules.revision_artifacts import artifact_path
+
+    filename = f"quality_report_{revision}.json"
+    path = artifact_path(session_id=session_id, revision=revision, filename=filename)
+    if Path(path).exists():
+        return FileResponse(path, media_type="application/json", filename=filename)
+    try:
+        save_quality_report(session_id=session_id, revision=revision, session=session, planned_elements_count=len(session.current_structure or []))
+        return FileResponse(path, media_type="application/json", filename=filename)
+    except Exception:
+        # fallback: return computed report inline
+        return build_quality_report(session_id=session_id, revision=revision, session=session, planned_elements_count=len(session.current_structure or []))
 
 
 @app.post("/session/inspect/{session_id}")
