@@ -22,7 +22,6 @@ def scan_plan(request: Request, session_id: str):
     sg = state.get_scene_graph(session_id)
     needs_scan = (sg.meta or {}).get("needs_scan", [])
     plan = generate_scan_plan(world, anchors)
-    # Attach stage-4 needs_scan hints if present.
     if needs_scan:
         plan = list(needs_scan) + list(plan)
     return {"scan_plan": plan}
@@ -66,5 +65,7 @@ def request_scaffold(request: Request, session_id: str):
     bundle = build_scene_bundle(session_id, rev_id, world, anchors, elements, scan_plan, overlays, scene_graph=sg)
     bundle["bom"] = bom_from_elements(elements)
     bundle["env_mesh"]["present"] = bool(env_mesh_bytes)
+    bundle["trace"]["present"] = True
+    bundle["trace"]["ndjson_size_bytes"] = None  # filled by client if needed
     state.store.save_export(session_id, rev_id, bundle)
     return bundle

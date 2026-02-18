@@ -82,7 +82,12 @@ def lock_session(request: Request, payload: LockPayload):
         env_mesh_bytes=env_mesh_bytes,
     )
     state.last_rev[payload.session_id] = rev_id
-    return {"session_id": payload.session_id, "rev_id": rev_id, "env_mesh_present": bool(env_mesh_bytes)}
+    return {
+        "session_id": payload.session_id,
+        "rev_id": rev_id,
+        "env_mesh_present": bool(env_mesh_bytes),
+        "trace_ndjson": f"sessions/{payload.session_id}/world/{rev_id}/trace.ndjson",
+    }
 
 
 @router.get("/session/{session_id}/status")

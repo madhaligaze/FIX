@@ -35,7 +35,15 @@ def ingest_frame(
     hypotheses, needs_scan = propose_anchor_linear_hypotheses(world, anchors, runtime.policy)
     if hypotheses:
         sg.meta["linear_hypotheses"] = hypotheses
-        add_trace_event(runtime.traces[session_id], "linear_hypotheses_updated", {"count": len(hypotheses)})
+        stop_counts: dict[str, int] = {}
+        for h in hypotheses:
+            sr = ((h.get("proposal") or {}).get("stop_reason")) or "UNKNOWN"
+            stop_counts[str(sr)] = int(stop_counts.get(str(sr), 0)) + 1
+        add_trace_event(
+            runtime.traces[session_id],
+            "linear_hypotheses_updated",
+            {"count": len(hypotheses), "stop_reasons": stop_counts},
+        )
     if needs_scan:
         sg.meta["needs_scan"] = needs_scan
         add_trace_event(runtime.traces[session_id], "needs_scan_hints", {"count": len(needs_scan)})

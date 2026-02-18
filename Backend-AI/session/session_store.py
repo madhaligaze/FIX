@@ -5,6 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from session.artifacts import ensure_dirs, save_bytes, save_json
+from trace.decision_trace import trace_to_ndjson_bytes
 
 
 class SessionStore:
@@ -53,6 +54,7 @@ class SessionStore:
         save_json(base / "world_state.json", world_model_state)
         save_json(base / "overlays.json", overlays)
         save_json(base / "trace.json", trace)
+        save_bytes(base / "trace.ndjson", trace_to_ndjson_bytes(trace))
         if env_mesh_bytes is not None:
             save_bytes(base / "env_mesh.obj", env_mesh_bytes)
         elif env_mesh:

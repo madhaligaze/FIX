@@ -29,23 +29,31 @@ def propose_extension(
     end = b.copy()
     stop_reason = "MAX_LEN"
     needs_scan = None
+    constraint_trace: list[dict[str, Any]] = []
 
     for i in range(1, n + 1):
         q = b + d * (i * step)
         if not world_model.occupancy.in_bounds(q):
             stop_reason = "OUT_OF_SCOPE"
+            constraint_trace.append({"step": i, "point": q.tolist(), "stop": True, "reason": "OUT_OF_SCOPE"})
             break
         occ = world_model.occupancy.query([q.tolist()])[0]
         if occ == int(UNKNOWN) and getattr(policy, "unknown_mode", "forbid") != "allow":
             stop_reason = "UNKNOWN"
             needs_scan = make_scan_hint(q.tolist(), look_at=b.tolist(), note="Scan missing area to confirm extension")
             end = q
+            constraint_trace.append({"step": i, "point": q.tolist(), "occ": int(occ), "stop": True, "reason": "UNKNOWN"})
             break
         dist = world_model.query_distance([q.tolist()])[0]
         if dist < float(policy.min_clearance_m):
             stop_reason = "COLLISION"
+            constraint_trace.append(
+                {"step": i, "point": q.tolist(), "occ": int(occ), "dist_m": float(dist), "stop": True, "reason": "COLLISION"}
+            )
             break
         end = q
+        if len(constraint_trace) < 40:
+            constraint_trace.append({"step": i, "point": q.tolist(), "occ": int(occ), "dist_m": float(dist), "stop": False})
 
     conf = 0.6
     if stop_reason == "COLLISION":
@@ -63,6 +71,7 @@ def propose_extension(
         "confidence": float(conf),
         "stop_reason": stop_reason,
         "needs_scan": needs_scan,
+        "constraint_trace": constraint_trace,
     }
 
 
