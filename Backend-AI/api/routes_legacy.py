@@ -4,15 +4,16 @@ import base64
 import json
 import time
 from typing import Any
-from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 
 from api.ingest import ingest_frame
+from export.scene_bundle import build_scene_bundle
 from contracts.frame_packet import FramePacketMeta
 from contracts.legacy_stream import LegacyStreamPayload
 from policy.unknown_space import apply_unknown_policy
+from scaffold.bom import bom_from_elements
 from scaffold.solver import generate_scaffold
 from scaffold.validators import collision_check
 from scanning.next_best_view import generate_scan_plan
@@ -187,24 +188,24 @@ def _load_latest_export(state, session_id: str) -> dict[str, Any] | None:
 
 
 def _legacy_element_to_android(element: dict[str, Any]) -> dict[str, Any]:
+    element_type = str(element.get("type", "beam"))
     if "start" in element and "end" in element:
         start = element.get("start") or [0.0, 0.0, 0.0]
         end = element.get("end") or [0.0, 0.0, 0.0]
     else:
         pos = (((element.get("pose") or {}).get("pos")) or [0.0, 0.0, 0.0])
-        dims = element.get("dims") or {}
-        length_x = float(dims.get("x", 0.0) or 0.0)
-        length_y = float(dims.get("y", 0.0) or 0.0)
-        length_z = float(dims.get("z", 0.0) or 0.0)
-        axis = max([(length_x, 0), (length_y, 1), (length_z, 2)], key=lambda x: x[0])[1]
-        half = [0.0, 0.0, 0.0]
-        half[axis] = max(length_x, length_y, length_z) / 2.0
-        start = [float(pos[0] - half[0]), float(pos[1] - half[1]), float(pos[2] - half[2])]
-        end = [float(pos[0] + half[0]), float(pos[1] + half[1]), float(pos[2] + half[2])]
+        if element_type == "post":
+            dims = element.get("dims") or {}
+            z = float(dims.get("z", 0.0) or 0.0)
+            start = [float(pos[0]), float(pos[1]), float(pos[2])]
+            end = [float(pos[0]), float(pos[1]), float(pos[2] + z)]
+        else:
+            start = [float(pos[0]), float(pos[1]), float(pos[2])]
+            end = [float(pos[0]), float(pos[1]), float(pos[2])]
 
     return {
         "id": str(element.get("id", "")),
-        "type": str(element.get("type", "beam")),
+        "type": element_type,
         "start": [float(start[0]), float(start[1]), float(start[2])],
         "end": [float(end[0]), float(end[1]), float(end[2])],
         "meta": element.get("meta") or {},
@@ -212,17 +213,18 @@ def _legacy_element_to_android(element: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.get("/session/voxels/{session_id}")
-def legacy_voxels(request: Request, session_id: str):
+def legacy_voxels(request: Request, session_id: str, max_count: int = 5000, stride: int = 1):
     state = request.app.state.runtime
     world = state.get_world(session_id)
     occupancy = world.occupancy
     grid = occupancy.grid
-    max_emit = 20000
+    max_emit = max(0, int(max_count))
+    step = max(1, int(stride))
 
     occupied_idx = (grid == OCCUPIED).nonzero()
     occupied_positions = list(zip(occupied_idx[0], occupied_idx[1], occupied_idx[2]))
     total_count = len(occupied_positions)
-    emitted = occupied_positions[:max_emit]
+    emitted = occupied_positions[::step][:max_emit]
 
     voxels = []
     for x_i, y_i, z_i in emitted:
@@ -270,26 +272,14 @@ def legacy_model(request: Request, session_id: str):
     if not ready:
         return {
             "status": "NEEDS_SCAN",
-            "options": [
-                {
-                    "variant_name": "Scan required",
-                    "material_info": "",
-                    "safety_score": 0,
-                    "ai_critique": [str(reason) for reason in reasons],
-                    "elements": [],
-                    "full_structure": {"elements": []},
-                    "stats": {
-                        "total_nodes": 0,
-                        "total_beams": 0,
-                        "total_weight_kg": 0,
-                        "collisions_fixed": 0,
-                    },
-                    "physics": {"status": "ERROR"},
-                }
-            ],
+            "options": [],
+            "scan_plan": generate_scan_plan(world, anchors),
+            "reasons": [str(reason) for reason in reasons],
+            "score": score,
         }
 
     try:
+        scan_plan = generate_scan_plan(world, anchors)
         elements, _trace = generate_scaffold(world, anchors, state.policy)
         valid, violations = collision_check(elements, world, state.policy)
         unknown = apply_unknown_policy(world, anchors, state.policy)
@@ -297,30 +287,39 @@ def legacy_model(request: Request, session_id: str):
         if not valid:
             violations.append("SCHEMA_OR_COLLISION_INVALID")
 
+        overlays = world.compute_overlays(state.policy.__dict__)
+        overlays["violations"] = violations
+        rev_id = state.store.lock_revision(session_id, world.serialize_state(), overlays, state.traces.setdefault(session_id, []))
+        state.last_rev[session_id] = rev_id
+        bundle = build_scene_bundle(session_id, rev_id, world, anchors, elements, scan_plan, overlays)
+        bundle["bom"] = bom_from_elements(elements)
+        state.store.save_export(session_id, rev_id, bundle)
+
         score_norm = float(score) if isinstance(score, (int, float)) else 0.0
         score_norm = score_norm / 100.0 if score_norm > 1.0 else score_norm
         safety_score = max(0, min(100, int(score_norm * 100) - 10 * len(violations)))
         android_elements = [_legacy_element_to_android(el) for el in elements]
         unique_nodes = {tuple(e["start"]) for e in android_elements} | {tuple(e["end"]) for e in android_elements}
         return {
-            "status": "ok",
+            "status": "OK",
             "options": [
                 {
-                    "variant_name": "Auto",
-                    "material_info": "LAYHER",
+                    "variant_name": "default",
+                    "material_info": "layher",
                     "safety_score": safety_score,
                     "ai_critique": [str(v) for v in violations],
                     "elements": android_elements,
-                    "full_structure": {"elements": android_elements},
+                    "full_structure": android_elements,
                     "stats": {
                         "total_nodes": len(unique_nodes),
                         "total_beams": len(android_elements),
                         "total_weight_kg": 0,
-                        "collisions_fixed": 0,
+                        "collisions_fixed": len(violations),
                     },
                     "physics": {"status": "OK"},
                 }
             ],
+            "bundle": bundle,
         }
     except Exception as exc:
         return {
@@ -349,38 +348,118 @@ def legacy_model(request: Request, session_id: str):
 def legacy_update(request: Request, session_id: str, payload: dict[str, Any] | None = None):
     state = request.app.state.runtime
     started = time.perf_counter()
-    _ = _load_latest_export(state, session_id)
     action_payload = payload or {}
+    rev_id = state.last_rev.get(session_id)
+    if not rev_id:
+        raise HTTPException(status_code=409, detail={"status": "NO_MODEL"})
+    try:
+        export_bundle = state.store.load_export(session_id, rev_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=409, detail={"status": "NO_MODEL"})
+
+    scaffold = [item for item in (export_bundle.get("scaffold") or []) if isinstance(item, dict)]
+    action = str(action_payload.get("action") or "noop").lower()
+    element_id = action_payload.get("element_id")
+    element_data = action_payload.get("element_data")
+    affected_elements: list[str] = []
+    warning = ""
+
+    if action == "remove" and element_id is not None:
+        before = len(scaffold)
+        scaffold = [item for item in scaffold if str(item.get("id")) != str(element_id)]
+        if len(scaffold) != before:
+            affected_elements = [str(element_id)]
+        else:
+            warning = "element not found"
+    elif action == "add":
+        if isinstance(element_data, dict):
+            scaffold.append(element_data)
+            affected_elements = [str(element_data.get("id", ""))]
+        else:
+            warning = "missing element_data"
+    elif action == "replace" and element_id is not None:
+        replaced = False
+        for idx, item in enumerate(scaffold):
+            if str(item.get("id")) == str(element_id):
+                if isinstance(element_data, dict):
+                    scaffold[idx] = element_data
+                    affected_elements = [str(element_id)]
+                else:
+                    warning = "missing element_data"
+                replaced = True
+                break
+        if not replaced:
+            warning = "element not found"
+
+    export_bundle["scaffold"] = scaffold
+    android_elements = [_legacy_element_to_android(el) for el in scaffold]
+    export_bundle["android_options"] = [
+        {
+            "variant_name": "default",
+            "material_info": "layher",
+            "safety_score": 100,
+            "ai_critique": [warning] if warning else [],
+            "elements": android_elements,
+            "full_structure": android_elements,
+            "stats": {
+                "total_nodes": len({tuple(e["start"]) for e in android_elements} | {tuple(e["end"]) for e in android_elements}),
+                "total_beams": len(android_elements),
+                "total_weight_kg": 0,
+                "collisions_fixed": 0,
+            },
+            "physics": {"status": "OK"},
+        }
+    ]
+
     state.traces.setdefault(session_id, [])
-    add_trace_event(state.traces[session_id], "legacy_update_noop", {"session_id": session_id, "action": action_payload})
+    add_trace_event(state.traces[session_id], "legacy_update", {"session_id": session_id, "action": action_payload, "warning": warning})
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     return {
-        "status": "ok",
+        "status": "OK",
         "is_stable": True,
         "physics_status": "OK",
-        "heatmap": [],
-        "affected_elements": [],
+        "heatmap": [{"id": str(item.get("id", "")), "color": "green", "load_ratio": 0.0} for item in scaffold[:50]],
+        "affected_elements": affected_elements,
         "collapsed": {"nodes": [], "elements": []},
         "processing_time_ms": elapsed_ms,
+        "warning": warning,
+        "bundle": export_bundle,
+        "options": export_bundle.get("android_options"),
     }
 
 
 @router.post("/session/preview_remove/{session_id}")
 def legacy_preview_remove(request: Request, session_id: str, element_id: str | None = None):
     state = request.app.state.runtime
-    export_bundle = _load_latest_export(state, session_id) or {}
+    rev_id = state.last_rev.get(session_id)
+    if not rev_id:
+        raise HTTPException(status_code=409, detail={"status": "NO_MODEL"})
+    try:
+        export_bundle = state.store.load_export(session_id, rev_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=409, detail={"status": "NO_MODEL"})
     scaffold = export_bundle.get("scaffold") or []
-    found = False
+    target = None
     if element_id:
-        found = any(str(item.get("id")) == str(element_id) for item in scaffold if isinstance(item, dict))
+        target = next((item for item in scaffold if isinstance(item, dict) and str(item.get("id")) == str(element_id)), None)
+    is_critical = bool((target or {}).get("type") == "post")
+    remaining = [item for item in scaffold if isinstance(item, dict) and str(item.get("id")) != str(element_id)]
+    if len(scaffold) > 0 and len(remaining) == 0:
+        is_critical = True
+    would_collapse = [str(element_id)] if is_critical and element_id else []
+    warning = ""
+    if element_id and not target:
+        warning = "element not found"
+    elif would_collapse:
+        warning = "Removing this element may collapse scaffold"
 
     return {
-        "status": "ok",
+        "status": "OK",
         "element_id": element_id,
-        "is_critical": False,
-        "would_collapse": [],
-        "collapse_count": 0,
-        "warning": "" if found else "element not found",
+        "is_critical": is_critical,
+        "would_collapse": would_collapse,
+        "collapse_count": len(would_collapse),
+        "warning": warning,
     }
 
 
