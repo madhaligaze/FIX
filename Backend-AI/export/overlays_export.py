@@ -6,6 +6,8 @@ from typing import Any
 import numpy as np
 import trimesh
 
+from world.occupancy import FREE, UNKNOWN
+
 
 def export_occupancy_npz(world_model, out_path: Path) -> dict[str, Any]:
     """
@@ -66,64 +68,138 @@ def export_occupancy_slice_png(
 
 
 
-def _voxel_boxes_glb_bytes(indices: np.ndarray, origin: np.ndarray, voxel_size: float, color_rgba: tuple[int, int, int, int]) -> bytes:
-    scene = trimesh.Scene()
-    if indices.size == 0:
-        return scene.export(file_type="glb")
+def _voxel_boxes_mesh(
+    *,
+    indices_ijk: np.ndarray,
+    origin: np.ndarray,
+    voxel_size: float,
+) -> trimesh.Trimesh:
+    """
+    Build a single mesh consisting of axis-aligned voxel cubes for each ijk.
 
-    rgba = np.asarray(color_rgba, dtype=np.uint8)
-    extents = np.array([voxel_size, voxel_size, voxel_size], dtype=np.float32)
-    for idx in indices:
-        center = origin + (idx.astype(np.float32) + 0.5) * float(voxel_size)
-        b = trimesh.creation.box(extents=extents)
-        b.apply_translation(center)
-        b.visual.vertex_colors = np.tile(rgba, (len(b.vertices), 1))
-        scene.add_geometry(b)
-    return scene.export(file_type="glb")
+    indices_ijk: (N,3) int array in occupancy grid coordinates.
+    origin: world-space origin of grid.
+    voxel_size: meters.
+    """
+    indices_ijk = np.asarray(indices_ijk, dtype=np.int32).reshape(-1, 3)
+    origin = np.asarray(origin, dtype=np.float32).reshape(3)
+    s = float(voxel_size)
 
+    base = trimesh.creation.box(extents=(s, s, s))
+    meshes: list[trimesh.Trimesh] = []
+    for i, j, k in indices_ijk:
+        cx, cy, cz = origin + (np.asarray([i, j, k], dtype=np.float32) + 0.5) * s
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, 3] = [float(cx), float(cy), float(cz)]
+        meshes.append(base.copy().apply_transform(transform))
 
-def export_unknown_heatmap_glb(world_model, out_path: Path) -> dict[str, Any]:
-    from world.occupancy import UNKNOWN
+    if not meshes:
+        return trimesh.Trimesh(
+            vertices=np.zeros((0, 3), dtype=np.float32),
+            faces=np.zeros((0, 3), dtype=np.int64),
+            process=False,
+        )
 
-    occ = world_model.occupancy
-    grid = occ.grid.astype(np.uint8)
-    unknown = grid == UNKNOWN
-    # boundary unknown: unknown with at least one known 6-neighbor
-    known = ~unknown
-    boundary = np.zeros_like(unknown, dtype=bool)
-    for axis in range(3):
-        boundary |= unknown & np.roll(known, 1, axis=axis)
-        boundary |= unknown & np.roll(known, -1, axis=axis)
-    boundary[0, :, :] = False
-    boundary[-1, :, :] = False
-    boundary[:, 0, :] = False
-    boundary[:, -1, :] = False
-    boundary[:, :, 0] = False
-    boundary[:, :, -1] = False
-
-    idx = np.argwhere(boundary)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    glb = _voxel_boxes_glb_bytes(idx, occ.origin.astype(np.float32), float(occ.voxel_size), (54, 124, 255, 130))
-    out_path.write_bytes(glb)
-    return {"format": "glb", "path": str(out_path).replace('\\', '/'), "count": int(idx.shape[0])}
+    return trimesh.util.concatenate(meshes)
 
 
-def export_clearance_violations_glb(world_model, out_path: Path, *, min_clearance_m: float) -> dict[str, Any]:
+
+def export_unknown_heatmap_glb(
+    world_model,
+    out_path: Path,
+    *,
+    stride: int = 2,
+    max_voxels: int = 25000,
+) -> dict[str, Any]:
+    """
+    Export unknown-space overlay as GLB geometry (voxel cubes).
+
+    Conservative: visualizes UNKNOWN voxels from occupancy.
+    """
     occ = world_model.occupancy
     g = occ.grid
-    shp = g.shape
-    coords = np.indices(shp).reshape(3, -1).T.astype(np.int32)
-    pts = occ.origin[None, :] + (coords.astype(np.float32) + 0.5) * float(occ.voxel_size)
-    dists = np.asarray(world_model.query_distance(pts.tolist()), dtype=np.float32)
-    bad = dists < float(min_clearance_m)
-    idx = coords[bad]
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    glb = _voxel_boxes_glb_bytes(idx, occ.origin.astype(np.float32), float(occ.voxel_size), (255, 80, 80, 170))
+
+    s = max(1, int(stride))
+    unknown = g == UNKNOWN
+    if s > 1:
+        unknown = unknown[::s, ::s, ::s]
+
+    idx = np.argwhere(unknown)
+    if idx.shape[0] > int(max_voxels):
+        sel = np.random.choice(idx.shape[0], size=int(max_voxels), replace=False)
+        idx = idx[sel]
+
+    if s > 1:
+        idx = idx * s
+
+    mesh = _voxel_boxes_mesh(indices_ijk=idx, origin=occ.origin, voxel_size=float(occ.voxel_size))
+    scene = trimesh.Scene()
+    scene.add_geometry(mesh, node_name="unknown_heatmap")
+    glb = scene.export(file_type="glb")
     out_path.write_bytes(glb)
+
+    return {"format": "glb", "path": str(out_path), "stride": s, "count": int(idx.shape[0])}
+
+
+
+def export_clearance_violations_glb(
+    world_model,
+    out_path: Path,
+    *,
+    min_clearance_m: float,
+    stride: int = 2,
+    max_voxels: int = 25000,
+) -> dict[str, Any]:
+    """
+    Export clearance violations as GLB geometry (voxel cubes).
+
+    A voxel is a violation if it is FREE but ESDF distance < min_clearance_m.
+    """
+    occ = world_model.occupancy
+    g = occ.grid
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    esdf = getattr(world_model, "esdf", None)
+    dist = None
+    try:
+        if esdf is not None:
+            esdf.build_from_occupancy(g, np.asarray(occ.origin, dtype=np.float32), float(occ.voxel_size))
+            dist = getattr(esdf, "_dist_m", None)
+    except Exception:
+        dist = None
+
+    if dist is None:
+        scene = trimesh.Scene()
+        out_path.write_bytes(scene.export(file_type="glb"))
+        return {"format": "glb", "path": str(out_path), "count": 0, "reason": "esdf_unavailable"}
+
+    dist = np.asarray(dist, dtype=np.float32)
+    s = max(1, int(stride))
+
+    free = g == FREE
+    viol = free & (dist < float(min_clearance_m))
+    if s > 1:
+        viol = viol[::s, ::s, ::s]
+
+    idx = np.argwhere(viol)
+    if idx.shape[0] > int(max_voxels):
+        sel = np.random.choice(idx.shape[0], size=int(max_voxels), replace=False)
+        idx = idx[sel]
+
+    if s > 1:
+        idx = idx * s
+
+    mesh = _voxel_boxes_mesh(indices_ijk=idx, origin=occ.origin, voxel_size=float(occ.voxel_size))
+    scene = trimesh.Scene()
+    scene.add_geometry(mesh, node_name="clearance_violations")
+    glb = scene.export(file_type="glb")
+    out_path.write_bytes(glb)
+
     return {
         "format": "glb",
-        "path": str(out_path).replace('\\', '/'),
+        "path": str(out_path),
+        "stride": s,
         "count": int(idx.shape[0]),
         "min_clearance_m": float(min_clearance_m),
     }
