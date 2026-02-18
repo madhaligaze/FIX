@@ -19,16 +19,31 @@ def _build_policy_config(raw: dict) -> PolicyConfig:
         "unknown_ratio_near_support_max": float(
             raw.get("unknown_ratio_near_support_max", defaults.unknown_ratio_near_support_max)
         ),
-        "scaffold_grid_step_m": float(raw.get("scaffold_grid_step_m", defaults.scaffold_grid_step_m)),
+        "min_viewpoints": int(raw.get("min_viewpoints", defaults.min_viewpoints)),
+        "min_views_per_support": int(
+            raw.get("min_views_per_support", defaults.min_views_per_support)
+        ),
+        "min_views_per_anchor": int(raw.get("min_views_per_anchor", defaults.min_views_per_anchor)),
+        "scaffold_grid_step_m": float(
+            raw.get("scaffold_grid_step_m", defaults.scaffold_grid_step_m)
+        ),
         "scaffold_max_bay_m": float(raw.get("scaffold_max_bay_m", defaults.scaffold_max_bay_m)),
         "scaffold_min_bay_m": float(raw.get("scaffold_min_bay_m", defaults.scaffold_min_bay_m)),
-        "scaffold_default_height_m": float(raw.get("scaffold_default_height_m", defaults.scaffold_default_height_m)),
+        "scaffold_default_height_m": float(
+            raw.get("scaffold_default_height_m", defaults.scaffold_default_height_m)
+        ),
         "scaffold_deck_levels_m": [
             float(x) for x in raw.get("scaffold_deck_levels_m", defaults.scaffold_deck_levels_m)
         ],
-        "access_min_corridor_m": float(raw.get("access_min_corridor_m", defaults.access_min_corridor_m)),
-        "stability_require_diagonals": bool(raw.get("stability_require_diagonals", defaults.stability_require_diagonals)),
-        "enforce_validators_strict": bool(raw.get("enforce_validators_strict", defaults.enforce_validators_strict)),
+        "access_min_corridor_m": float(
+            raw.get("access_min_corridor_m", defaults.access_min_corridor_m)
+        ),
+        "stability_require_diagonals": bool(
+            raw.get("stability_require_diagonals", defaults.stability_require_diagonals)
+        ),
+        "enforce_validators_strict": bool(
+            raw.get("enforce_validators_strict", defaults.enforce_validators_strict)
+        ),
     }
     return PolicyConfig(**data)
 

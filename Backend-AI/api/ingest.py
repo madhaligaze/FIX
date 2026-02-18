@@ -38,11 +38,11 @@ def ingest_frame(
     world.update_from_frame(validated_meta or meta_dict, rgb_bytes, depth_bytes, pointcloud_bytes)
     add_trace_event(runtime.traces[session_id], "frame_ingested", {"frame_id": frame_id})
 
-    fit = update_scene_graph_from_world(sg, world, every_n_frames=5)
-    if fit:
-        add_trace_event(runtime.traces[session_id], "scene_graph_plane_updated", {"plane_id": "plane_dominant_0", **fit})
-
     anchors = runtime.anchors.get(session_id, [])
+    fit = update_scene_graph_from_world(sg, world, anchors=anchors, every_n_frames=5)
+    if fit:
+        add_trace_event(runtime.traces[session_id], "scene_graph_updated", fit)
+
     hypotheses, needs_scan = propose_anchor_linear_hypotheses(world, anchors, runtime.policy)
     if hypotheses:
         sg.meta["linear_hypotheses"] = hypotheses

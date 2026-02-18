@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -25,6 +27,39 @@ class SessionStore:
 
     def session_root(self, session_id: str) -> Path:
         return self.root / session_id
+
+    def prune_sessions(self, *, max_age_days: int) -> dict[str, int]:
+        """Delete whole session directories older than max_age_days by mtime."""
+        try:
+            max_age_days = int(max_age_days)
+        except Exception:
+            max_age_days = 14
+
+        if max_age_days <= 0:
+            return {"deleted": 0, "kept": 0}
+
+        cutoff = float(time.time()) - float(max_age_days) * 86400.0
+        deleted = 0
+        kept = 0
+        for d in self.root.iterdir():
+            if not d.is_dir():
+                continue
+            try:
+                mtime = float(d.stat().st_mtime)
+            except Exception:
+                kept += 1
+                continue
+
+            if mtime < cutoff:
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                    deleted += 1
+                except Exception:
+                    kept += 1
+            else:
+                kept += 1
+
+        return {"deleted": int(deleted), "kept": int(kept)}
 
     def save_frame(
         self,
