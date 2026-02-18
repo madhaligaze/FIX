@@ -4,8 +4,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-
-from session.artifacts import ensure_dirs, save_bytes, save_json, save_numpy
+from session.artifacts import ensure_dirs, save_bytes, save_json
 
 
 class SessionStore:
@@ -46,15 +45,15 @@ class SessionStore:
         world_model_state: dict[str, Any],
         overlays: dict[str, Any],
         trace: list[dict[str, Any]],
-        env_mesh: str | None = None,
+        env_mesh_bytes: bytes | None = None,
     ) -> str:
         rev_id = str(uuid4())
         base = ensure_dirs(self.session_root(session_id) / "world" / rev_id)
         save_json(base / "world_state.json", world_model_state)
         save_json(base / "overlays.json", overlays)
         save_json(base / "trace.json", trace)
-        if env_mesh:
-            save_bytes(base / "env_mesh.obj", env_mesh.encode("utf-8"))
+        if env_mesh_bytes:
+            save_bytes(base / "env_mesh.obj", env_mesh_bytes)
         return rev_id
 
     def save_export(self, session_id: str, rev_id: str, scene_bundle: dict[str, Any]) -> Path:
