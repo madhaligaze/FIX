@@ -52,6 +52,16 @@ interface ApiService {
         @Path("session_id") sessionId: String
     ): Response<VoxelResponse>
 
+    @POST("/session/anchors")
+    suspend fun postAnchors(
+        @Body payload: AnchorPayload
+    ): Response<AnchorsResponse>
+
+    @POST("/session/lock")
+    suspend fun lockSession(
+        @Body payload: LockPayload
+    ): Response<LockResponse>
+
     @GET("/session/{session_id}/export/latest")
     suspend fun exportLatest(
         @Path("session_id") sessionId: String
@@ -222,4 +232,37 @@ data class UiLayerFile(
 
 data class LayerFile(
     val path: String? = null
+)
+
+
+// ── /session/anchors ─────────────────────────────────────────────────────
+data class AnchorPayload(
+    val session_id: String,
+    val anchors: List<AnchorPointRequest>
+)
+
+data class AnchorPointRequest(
+    val id: String,
+    val kind: String,
+    val position: List<Float>,
+    val confidence: Float = 1.0f
+)
+
+data class AnchorsResponse(
+    val status: String,
+    val count: Int
+)
+
+// ── /session/lock ─────────────────────────────────────────────────────
+data class LockPayload(
+    val session_id: String
+)
+
+data class LockResponse(
+    val session_id: String,
+    val rev_id: String,
+    val env_mesh_present: Boolean? = null,
+    val trace_ndjson: String? = null,
+    val tsdf_available: Boolean? = null,
+    val tsdf_reason: String? = null
 )

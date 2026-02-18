@@ -84,6 +84,13 @@ class MainActivity : AppCompatActivity() {
         RESULTS         // Финальные результаты
     }
 
+    private enum class ConnectionStatus {
+        UNKNOWN,
+        ONLINE,
+        DEGRADED,
+        OFFLINE
+    }
+
     companion object {
         private const val MAX_SESSION_RETRY = 5
         private const val SESSION_RETRY_DELAY_MS = 1_500L
@@ -110,6 +117,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvCoordZ: TextView
     private lateinit var tvPointsCount: TextView
     private lateinit var tvModeStatus: TextView
+    private lateinit var statusIndicator: View
+    private lateinit var tvSystemStatus: TextView
 
     // Основные кнопки
     private lateinit var btnStart: Button
@@ -159,6 +168,10 @@ class MainActivity : AppCompatActivity() {
     private var appState = AppState.IDLE
     private var currentSessionId: String? = null
     private var isStreaming = false
+    private var streamJob: Job? = null
+    private var healthJob: Job? = null
+    private var connectionStatus: ConnectionStatus = ConnectionStatus.UNKNOWN
+    private var lastConnectionDetail: String? = null
     private var consecutiveFailures = 0
     private var isReconnecting = false
     private var frameCount = 0
@@ -262,6 +275,9 @@ class MainActivity : AppCompatActivity() {
 
         viewModel.saveSnapshot(sceneBuilder.getAllElements(), "Исходное состояние")
 
+        startHealthLoop()
+        updateConnectionUi(ConnectionStatus.UNKNOWN, "")
+
         transitionTo(AppState.IDLE)
     }
 
@@ -275,6 +291,8 @@ class MainActivity : AppCompatActivity() {
         tvCoordZ = findViewById(R.id.tv_coord_z)
         tvPointsCount = findViewById(R.id.tv_points_count)
         tvModeStatus = findViewById(R.id.tv_mode_status)
+        statusIndicator = findViewById(R.id.status_indicator)
+        tvSystemStatus = findViewById(R.id.tv_system_status)
 
         // Основные кнопки
         btnStart = findViewById(R.id.btn_start)
@@ -422,6 +440,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopStreaming()
+        stopHealthLoop()
         scope.cancel()
         clearARAnchors()
 
@@ -558,13 +578,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onSaveSessionClicked() {
-        showHint("💾 Сохранение сессии...")
+        val sid = currentSessionId
+        if (sid.isNullOrBlank()) {
+            showError("Сессия не активна")
+            return
+        }
+
         scope.launch {
             try {
-                delay(500)
-                showHint("✓ Сессия сохранена: ${currentSessionId?.take(8)}")
+                showLoadingDialog("Сохранение сессии...")
+                // Сначала синхронизируем точки опоры, если они есть
+                syncAnchorsToServer()
+
+                val resp = api.lockSession(LockPayload(session_id = sid))
+                if (resp.isSuccessful && resp.body() != null) {
+                    val body = resp.body()!!
+                    showHint("✓ Сессия сохранена (rev: ${'$'}{body.rev_id})")
+                } else {
+                    showError("Не удалось сохранить: HTTP ${'$'}{resp.code()}")
+                }
             } catch (e: Exception) {
-                showHint("❌ Ошибка сохранения: ${e.message}")
+                showError("Ошибка сохранения: ${'$'}{e.message}")
+            } finally {
+                hideLoadingDialog()
             }
         }
     }
@@ -679,14 +715,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun rebuildApiClient() {
         val baseUrl = getCurrentServerUrl()
-        api = Retrofit.Builder()
-            .baseUrl(baseUrl)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(ApiService::class.java)
+        api = NetworkClient.buildApi(baseUrl)
 
         if (::viewModel.isInitialized) {
             viewModel.updateApiService(api)
+        }
+        if (::statusIndicator.isInitialized && ::tvSystemStatus.isInitialized) {
+            updateConnectionUi(ConnectionStatus.UNKNOWN, "${baseUrl}")
         }
     }
 
@@ -707,6 +742,79 @@ class MainActivity : AppCompatActivity() {
 
         val withTrailingSlash = if (withScheme.endsWith('/')) withScheme else "$withScheme/"
         return withTrailingSlash.toHttpUrlOrNull()?.toString()
+    }
+
+
+    // ══════════════════════════════════════════════════════════════════════
+    // СЕТЬ / СТАТУС СЕРВЕРА
+    // ══════════════════════════════════════════════════════════════════════
+
+    private fun updateConnectionUi(status: ConnectionStatus, detail: String? = null) {
+        connectionStatus = status
+        lastConnectionDetail = detail
+
+        val (dotRes, label) = when (status) {
+            ConnectionStatus.ONLINE -> R.drawable.ic_status_dot_green to "SYSTEM ONLINE"
+            ConnectionStatus.DEGRADED -> R.drawable.ic_status_dot_orange to "SYSTEM DEGRADED"
+            ConnectionStatus.OFFLINE -> R.drawable.ic_status_dot_red to "SYSTEM OFFLINE"
+            ConnectionStatus.UNKNOWN -> R.drawable.ic_status_dot_cyan to "SYSTEM"
+        }
+
+        statusIndicator.setBackgroundResource(dotRes)
+        tvSystemStatus.text = if (detail.isNullOrBlank()) label else (label + " | " + detail)
+    }
+
+    private fun startHealthLoop() {
+        healthJob?.cancel()
+        healthJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                val ok = try {
+                    val r = api.healthCheck()
+                    r.isSuccessful
+                } catch (_: Exception) {
+                    false
+                }
+
+                withContext(Dispatchers.Main) {
+                    val base = getCurrentServerUrl().trimEnd('/')
+                    if (ok) {
+                        updateConnectionUi(ConnectionStatus.ONLINE, base)
+                    } else {
+                        // Если сейчас идет стрим - показываем деградацию, иначе OFFLINE
+                        val st = if (isStreaming) ConnectionStatus.DEGRADED else ConnectionStatus.OFFLINE
+                        updateConnectionUi(st, base)
+                    }
+                }
+
+                delay(3_000L)
+            }
+        }
+    }
+
+    private fun stopHealthLoop() {
+        healthJob?.cancel()
+        healthJob = null
+    }
+
+    private suspend fun syncAnchorsToServer() {
+        val sid = currentSessionId ?: return
+        val anchors = userMarkers.mapIndexed { index, m ->
+            val x = m["x"] ?: 0f
+            val y = m["y"] ?: 0f
+            val z = m["z"] ?: 0f
+            AnchorPointRequest(
+                id = "a" + (index + 1),
+                kind = "support",
+                position = listOf(x, y, z),
+                confidence = 1.0f
+            )
+        }
+        if (anchors.isEmpty()) return
+
+        val resp = api.postAnchors(AnchorPayload(session_id = sid, anchors = anchors))
+        if (!resp.isSuccessful) {
+            throw IllegalStateException("/session/anchors HTTP " + resp.code())
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1040,32 +1148,368 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun vibrate(durationMs: Long = 50) {
-        // TODO: Реализация вибрации
-    }
-
-    // Заглушки для методов которые еще не реализованы полностью
-    private suspend fun doStartSession() {
         try {
-            val response = api.startSession()
-            if (response.isSuccessful && response.body() != null) {
-                val sessionId = response.body()!!.session_id
-                currentSessionId = sessionId
-                viewModel.setSessionId(sessionId)
-                showHint("✓ Сессия создана")
-                transitionTo(AppState.SCANNING)
+            val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE))
             } else {
-                showError("Не удалось создать сессию: ${response.code()}")
-                transitionTo(AppState.IDLE)
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(durationMs)
             }
-        } catch (e: Exception) {
-            showError("Ошибка старта сессии: ${e.message}")
-            transitionTo(AppState.IDLE)
+        } catch (_: Exception) {
+            // Ignore
         }
     }
-    private suspend fun sendFrame(): Boolean { return false }
-    private fun stopStreaming() { /* ... */ }
-    private suspend fun doRequestModeling() { /* ... */ }
-    private fun placeAnchor() { /* ... */ }
+
+    private suspend fun doStartSession() {
+        val base = getCurrentServerUrl().trimEnd('/')
+        updateConnectionUi(ConnectionStatus.UNKNOWN, base)
+
+        var lastError: String? = null
+        for (attempt in 1..MAX_SESSION_RETRY) {
+            try {
+                // Быстрый health-check до создания сессии
+                val healthOk = try {
+                    api.healthCheck().isSuccessful
+                } catch (_: Exception) {
+                    false
+                }
+
+                if (!healthOk) {
+                    updateConnectionUi(ConnectionStatus.OFFLINE, base)
+                    lastError = "HEALTH_FAIL"
+                    delay(SESSION_RETRY_DELAY_MS * attempt)
+                    continue
+                }
+
+                val response = api.startSession()
+                if (response.isSuccessful && response.body() != null) {
+                    val sessionId = response.body()!!.session_id
+                    currentSessionId = sessionId
+                    viewModel.setSessionId(sessionId)
+
+                    consecutiveFailures = 0
+                    frameCount = 0
+
+                    updateConnectionUi(ConnectionStatus.ONLINE, base)
+                    showHint("✓ Сессия создана")
+                    transitionTo(AppState.SCANNING)
+                    startStreamingLoop()
+                    return
+                } else {
+                    lastError = "HTTP " + response.code()
+                }
+            } catch (e: Exception) {
+                lastError = e.message
+            }
+
+            updateConnectionUi(ConnectionStatus.DEGRADED, base)
+            delay(SESSION_RETRY_DELAY_MS * attempt)
+        }
+
+        showError("Не удалось создать сессию: " + (lastError ?: "UNKNOWN"))
+        transitionTo(AppState.IDLE)
+    }
+
+    private fun startStreamingLoop() {
+        if (isStreaming) return
+        val sid = currentSessionId ?: return
+
+        isStreaming = true
+        streamJob?.cancel()
+        streamJob = scope.launch {
+            while (isActive && isStreaming && currentSessionId == sid) {
+                val ok = try {
+                    withContext(Dispatchers.IO) { sendFrame() }
+                } catch (_: Exception) {
+                    false
+                }
+
+                if (!ok) {
+                    consecutiveFailures += 1
+                } else {
+                    consecutiveFailures = 0
+                }
+
+                if (consecutiveFailures >= MAX_FAIL_RECONNECT) {
+                    val base = getCurrentServerUrl().trimEnd('/')
+                    updateConnectionUi(ConnectionStatus.OFFLINE, base)
+                    val backoff = min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * consecutiveFailures.toLong())
+                    delay(backoff)
+                } else if (consecutiveFailures > 0) {
+                    val base = getCurrentServerUrl().trimEnd('/')
+                    updateConnectionUi(ConnectionStatus.DEGRADED, base)
+                }
+
+                updateFrameCounter()
+                updateCameraCoordinates()
+                delay(STREAM_INTERVAL_MS)
+            }
+        }
+    }
+
+    private suspend fun sendFrame(): Boolean {
+        val sid = currentSessionId ?: return false
+
+        // 1) Сбор данных кадра с main thread
+        val payload = withContext(Dispatchers.Main) {
+            val frame = try {
+                sceneView.arSession?.update()
+            } catch (_: Exception) {
+                null
+            } ?: return@withContext null
+
+            try {
+                val cam = frame.camera
+                if (cam.trackingState != TrackingState.TRACKING) return@withContext null
+
+                // RGB
+                val image = try {
+                    frame.acquireCameraImage()
+                } catch (_: Exception) {
+                    null
+                } ?: return@withContext null
+
+                val rgbBase64 = try {
+                    ImageUtils.imageToBase64(image)
+                } finally {
+                    try { image.close() } catch (_: Exception) { }
+                }
+
+                // Intrinsics
+                val intr = cam.imageIntrinsics
+                val focal = intr.focalLength
+                val pp = intr.principalPoint
+                val dims = intr.imageDimensions
+
+                val fx = focal[0].toDouble()
+                val fy = focal[1].toDouble()
+                val cx = pp[0].toDouble()
+                val cy = pp[1].toDouble()
+                val w = dims[0].toInt()
+                val h = dims[1].toInt()
+
+                // Pose
+                val pose = cam.pose
+                val q = FloatArray(4)
+                pose.getRotationQuaternion(q, 0)
+                val position = listOf(pose.tx(), pose.ty(), pose.tz())
+                val quaternion = listOf(q[0], q[1], q[2], q[3])
+
+                // Point cloud
+                val pc = try {
+                    frame.acquirePointCloud()
+                } catch (_: Exception) {
+                    null
+                }
+
+                val points: List<List<Float>> = if (pc != null) {
+                    try {
+                        val buf = pc.points
+                        val total = buf.remaining() / 4
+                        val cap = 3000
+                        val step = maxOf(1, total / cap)
+                        val out = ArrayList<List<Float>>(min(total, cap))
+                        var i = 0
+                        while (i < total) {
+                            val baseIdx = i * 4
+                            val x = buf.get(baseIdx)
+                            val y = buf.get(baseIdx + 1)
+                            val z = buf.get(baseIdx + 2)
+                            out.add(listOf(x, y, z))
+                            i += step
+                        }
+                        out
+                    } finally {
+                        try { pc.release() } catch (_: Exception) { }
+                    }
+                } else {
+                    emptyList()
+                }
+
+                hashMapOf<String, Any>(
+                    "frame_id" to ("frm_" + frameCount),
+                    "timestamp" to (System.currentTimeMillis() / 1000.0),
+                    "rgb_base64" to rgbBase64,
+                    "intrinsics" to mapOf(
+                        "fx" to fx,
+                        "fy" to fy,
+                        "cx" to cx,
+                        "cy" to cy,
+                        "width" to w,
+                        "height" to h
+                    ),
+                    "pose" to mapOf(
+                        "position" to position,
+                        "quaternion" to quaternion
+                    ),
+                    "point_cloud" to points
+                )
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        if (payload == null) return true // кадр не готов - не считаем это сетевой ошибкой
+
+        // 2) Отправка
+        val resp = try {
+            api.streamData(sid, payload)
+        } catch (_: Exception) {
+            return false
+        }
+
+        if (!resp.isSuccessful) {
+            return false
+        }
+
+        val body = resp.body() ?: return true
+
+        withContext(Dispatchers.Main) {
+            frameCount += 1
+            val hints = body.ai_hints
+            if (hints != null) {
+                lastQualityScore = hints.quality_score
+                val msg = when {
+                    !hints.warnings.isNullOrBlank() -> hints.warnings
+                    !hints.instructions.isNullOrBlank() -> hints.instructions
+                    else -> null
+                }
+                if (!msg.isNullOrBlank()) {
+                    showHint(msg)
+                }
+
+                if (userMarkers.size >= MIN_POINTS_FOR_MODEL) {
+                    btnAnalyze.isEnabled = true
+                }
+            }
+        }
+
+        return true
+    }
+
+    private fun stopStreaming() {
+        isStreaming = false
+        streamJob?.cancel()
+        streamJob = null
+    }
+
+    private suspend fun doRequestModeling() {
+        val sid = currentSessionId
+        if (sid.isNullOrBlank()) {
+            withContext(Dispatchers.Main) {
+                showError("Сессия не активна")
+                transitionTo(AppState.IDLE)
+            }
+            return
+        }
+
+        stopStreaming()
+
+        try {
+            // На всякий случай отправляем anchors
+            syncAnchorsToServer()
+        } catch (_: Exception) {
+            // Ignore
+        }
+
+        val response = try {
+            api.startModeling(sid)
+        } catch (e: Exception) {
+            withContext(Dispatchers.Main) {
+                showError("Ошибка моделирования: " + (e.message ?: "UNKNOWN"))
+                transitionTo(AppState.SCANNING)
+            }
+            return
+        }
+
+        if (!response.isSuccessful || response.body() == null) {
+            withContext(Dispatchers.Main) {
+                showError("Моделирование не удалось: HTTP " + response.code())
+                transitionTo(AppState.SCANNING)
+            }
+            return
+        }
+
+        val model = response.body()!!
+        withContext(Dispatchers.Main) {
+            current3DModel = model
+            selectedVariantIndex = 0
+            transitionTo(AppState.SELECTING)
+
+            // Подписи на кнопках вариантов
+            val opts = model.options.orEmpty()
+            btnVariant1.text = opts.getOrNull(0)?.variant_name ?: "Вариант 1"
+            btnVariant2.text = opts.getOrNull(1)?.variant_name ?: "Вариант 2"
+            btnVariant3.text = opts.getOrNull(2)?.variant_name ?: "Вариант 3"
+
+            // Показать первый вариант
+            visualizeScaffoldVariant(0)
+        }
+    }
+
+    private fun placeAnchor() {
+        if (userMarkers.size >= MAX_POINTS) {
+            showHint("⚠️ Достигнут лимит точек")
+            return
+        }
+
+        val frame = try {
+            sceneView.arSession?.update()
+        } catch (_: Exception) {
+            null
+        } ?: return
+
+        val x = sceneView.width / 2f
+        val y = sceneView.height / 2f
+
+        val hit = frame.hitTest(x, y).firstOrNull { hitResult ->
+            val trackable = hitResult.trackable
+            (trackable is Plane) && trackable.isPoseInPolygon(hitResult.hitPose)
+        }
+
+        if (hit == null) {
+            showHint("⚠️ Не найдено место для точки")
+            return
+        }
+
+        val anchor = hit.createAnchor()
+        val anchorNode = AnchorNode(anchor).apply {
+            setParent(sceneView.scene)
+        }
+
+        // Маленький визуальный маркер
+        val marker = Node().apply {
+            parent = anchorNode
+            localScale = Vector3(0.05f, 0.05f, 0.05f)
+            renderable = ModelAssets.getCopy(ModelAssets.ModelType.WEDGE_NODE)
+        }
+
+        anchorNodes.add(anchorNode)
+
+        val p = anchor.pose
+        userMarkers.add(mapOf(
+            "x" to p.tx(),
+            "y" to p.ty(),
+            "z" to p.tz()
+        ))
+
+        updatePointsCount()
+        btnAnalyze.isEnabled = userMarkers.size >= MIN_POINTS_FOR_MODEL
+        vibrate(35)
+
+        // Синхронизируем anchors фоном
+        scope.launch {
+            try {
+                syncAnchorsToServer()
+            } catch (_: Exception) {
+                // Ignore
+            }
+        }
+
+        showHint("✓ Точка добавлена: ${'$'}{userMarkers.size}")
+    }
+
     private fun request3DReconstruction() {
         val option = current3DModel?.options?.getOrNull(selectedVariantIndex)
         val elements = option?.elements.orEmpty().ifEmpty { option?.full_structure.orEmpty() }
