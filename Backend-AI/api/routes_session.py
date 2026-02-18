@@ -87,6 +87,8 @@ def lock_session(request: Request, payload: LockPayload):
         "rev_id": rev_id,
         "env_mesh_present": bool(env_mesh_bytes),
         "trace_ndjson": f"sessions/{payload.session_id}/world/{rev_id}/trace.ndjson",
+        "tsdf_available": bool(world.metrics.get("tsdf_available", True)),
+        "tsdf_reason": world.metrics.get("tsdf_reason"),
     }
 
 
@@ -107,4 +109,6 @@ def session_status(request: Request, session_id: str):
         "unknown_policy": unknown,
         "perception_unavailable": state.perception_unavailable,
         "scene_graph": sg.serialize(),
+        "geometry_unavailable": not bool(world.metrics.get("tsdf_available", True)),
+        "geometry_reason": world.metrics.get("tsdf_reason"),
     }
