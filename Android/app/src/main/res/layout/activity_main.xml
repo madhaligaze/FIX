@@ -171,6 +171,48 @@
         android:layout_marginTop="60dp"
         android:background="@drawable/gradient_line_cyan" />
 
+    <!-- Quality Bar -->
+    <LinearLayout
+        android:id="@+id/quality_bar"
+        android:layout_width="match_parent"
+        android:layout_height="32dp"
+        android:layout_gravity="top"
+        android:layout_marginTop="64dp"
+        android:orientation="horizontal"
+        android:paddingStart="20dp"
+        android:paddingEnd="20dp"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="QUALITY"
+            android:textColor="#7A00F5FF"
+            android:textSize="10sp"
+            android:fontFamily="monospace"
+            android:layout_marginEnd="10dp" />
+
+        <ProgressBar
+            android:id="@+id/pb_quality"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="0dp"
+            android:layout_height="8dp"
+            android:layout_weight="1"
+            android:max="100"
+            android:progress="0"
+            android:indeterminate="false" />
+
+        <TextView
+            android:id="@+id/tv_quality"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="0%"
+            android:textColor="#FF00F5FF"
+            android:textSize="10sp"
+            android:fontFamily="monospace"
+            android:layout_marginStart="10dp" />
+    </LinearLayout>
+
 
     <!-- Mode Indicator -->
     <LinearLayout
@@ -179,7 +221,7 @@
         android:layout_height="wrap_content"
         android:layout_gravity="top|start"
         android:layout_marginStart="16dp"
-        android:layout_marginTop="76dp"
+        android:layout_marginTop="102dp"
         android:orientation="horizontal"
         android:gravity="center"
         android:background="@drawable/mode_edit_bg">
@@ -758,6 +800,17 @@
             android:fontFamily="monospace"
             android:textStyle="bold"
             android:layout_marginBottom="16dp" />
+
+        <TextView
+            android:id="@+id/tv_ai_critique"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#E6FFFFFF"
+            android:textSize="12sp"
+            android:layout_marginBottom="14dp"
+            android:lineSpacingExtra="2dp"
+            android:visibility="gone" />
 
         <!-- Variant Buttons -->
         <LinearLayout
