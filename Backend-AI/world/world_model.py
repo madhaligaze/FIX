@@ -23,7 +23,13 @@ class WorldModel:
         self.tsdf = TSDFVolume(self.occupancy, truncation=tsdf_trunc)
         self.esdf = ESDF()
         self.viewpoints: list[dict[str, Any]] = []  # [{"position":[3], "timestamp":float, "frame_id":str}]
-        self.metrics: dict[str, Any] = {"frames": 0, "last_update": None, "viewpoints": 0}
+        self.metrics: dict[str, Any] = {
+            "frames": 0,
+            "last_update": None,
+            "viewpoints": 0,
+            "tsdf_available": bool(self.tsdf.available),
+            "tsdf_reason": self.tsdf.unavailable_reason,
+        }
 
     def _push_viewpoint(self, frame_meta: dict[str, Any]) -> None:
         pose = frame_meta.get("pose") or {}
@@ -69,6 +75,9 @@ class WorldModel:
 
         self.metrics["frames"] += 1
         self.metrics["last_update"] = time.time()
+        # Keep TSDF status current in case env changes (container, missing deps, etc.)
+        self.metrics["tsdf_available"] = bool(self.tsdf.available)
+        self.metrics["tsdf_reason"] = self.tsdf.unavailable_reason
 
     def query_distance(self, points: list[list[float]]) -> list[float]:
         return self.esdf.query_distance(points, self.occupancy.grid, self.occupancy.origin, self.occupancy.voxel_size)

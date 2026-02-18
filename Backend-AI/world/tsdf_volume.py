@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import io
+from typing import Any
+
 import numpy as np
-import open3d as o3d
-from PIL import Image
 
 from world.occupancy import OccupancyGrid
 from world.transform import pose_to_matrix
@@ -13,6 +13,23 @@ class TSDFVolume:
     def __init__(self, occupancy: OccupancyGrid, truncation: float) -> None:
         self.occupancy = occupancy
         self.truncation = float(truncation)
+        self.available: bool = True
+        self.unavailable_reason: str | None = None
+        self._o3d: Any | None = None
+        self._pil_image: Any | None = None
+        self._vol: Any | None = None
+
+        # Never silently fail: TSDF can be unavailable, but the API must expose that status.
+        try:
+            import open3d as o3d  # type: ignore
+            from PIL import Image  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            self.available = False
+            self.unavailable_reason = f"TSDF backend unavailable: {type(exc).__name__}: {exc}"
+            return
+
+        self._o3d = o3d
+        self._pil_image = Image
         self._vol = o3d.pipelines.integration.ScalableTSDFVolume(
             voxel_length=float(self.occupancy.voxel_size),
             sdf_trunc=float(self.truncation),
@@ -29,6 +46,12 @@ class TSDFVolume:
     ) -> None:
         # Keep occupancy up to date for readiness + unknown gating.
         self.occupancy.integrate_depth(depth_u16, intrinsics, pose, depth_scale)
+
+        if not self.available or self._vol is None or self._o3d is None:
+            return
+
+        o3d = self._o3d
+        Image = self._pil_image
 
         h, w = depth_u16.shape
         depth_m = (depth_u16.astype(np.float32) * float(depth_scale)).astype(np.float32)
@@ -69,6 +92,8 @@ class TSDFVolume:
         self._vol.integrate(rgbd, intrinsic, T_wc)
 
     def extract_mesh(self) -> tuple[np.ndarray, np.ndarray]:
+        if not self.available or self._vol is None:
+            return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.int32)
         mesh = self._vol.extract_triangle_mesh()
         if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
             return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.int32)
