@@ -12,13 +12,9 @@ from api.routes_legacy import router as legacy_router
 from api.routes_planning_v2 import router as planning_router
 from api.routes_session_v2 import router as session_router
 from api.state import RuntimeState
+from observability import metrics as metrics_mod
 from observability.logging import setup_json_logging
-from observability.metrics import (
-    RATE_LIMITED_TOTAL,
-    metrics_middleware,
-    metrics_response,
-    setup_metrics,
-)
+from observability.metrics import metrics_middleware, metrics_response, setup_metrics
 from observability.tracing import setup_tracing
 from security.audit import write_audit_event
 from security.auth import require_api_key
@@ -34,17 +30,21 @@ def init_runtime() -> RuntimeState:
 
 def create_app() -> FastAPI:
     setup_json_logging(level="INFO")
-    setup_metrics()
-
     app = FastAPI(title="Backend-AI", version="5.1.0")
     app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
     app.state.runtime = init_runtime()
+    obs_cfg = getattr(app.state.runtime.config, "observability", None)
+    metrics_enabled = True if obs_cfg is None else bool(getattr(obs_cfg, "metrics_enabled", True))
+    if metrics_enabled:
+        setup_metrics()
 
     setup_tracing(app, app.state.runtime.config)
     app.state.rate_limiter = build_rate_limiter(app.state.runtime.config)
 
     @app.middleware("http")
     async def _metrics(request: Request, call_next):
+        if not metrics_enabled:
+            return await call_next(request)
         return await metrics_middleware(request, call_next)
 
     @app.middleware("http")
@@ -56,8 +56,8 @@ def create_app() -> FastAPI:
             try:
                 app.state.rate_limiter.check(request)
             except Exception:
-                if RATE_LIMITED_TOTAL is not None:
-                    RATE_LIMITED_TOTAL.labels(request.url.path).inc()
+                if metrics_mod.RATE_LIMITED_TOTAL is not None:
+                    metrics_mod.RATE_LIMITED_TOTAL.labels(request.url.path).inc()
                 raise
 
         role = require_api_key(request)
@@ -90,6 +90,8 @@ def create_app() -> FastAPI:
 
     @app.get("/metrics")
     def metrics():
+        if not metrics_enabled:
+            return {"status": "disabled"}
         return metrics_response()
 
     @app.get("/health")
