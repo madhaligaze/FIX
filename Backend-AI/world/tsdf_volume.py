@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import numpy as np
 
 from world.occupancy import OccupancyGrid
