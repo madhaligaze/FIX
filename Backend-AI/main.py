@@ -1447,6 +1447,11 @@ async def generate_variants(request: GenerateRequest):
             except Exception:
                 pass
 
+            # Keep session state consistent with classic generation path.
+            session.add_variant(variant)
+            session.save_structure(variant.get('elements', []), revision=revision)
+            session_manager.auto_save_session(session_id)
+
             blocked = sum(1 for b in variant.get('beams', []) if b.get('blocked'))
             return {
                 'status': 'success',
