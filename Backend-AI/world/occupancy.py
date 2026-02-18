@@ -120,3 +120,35 @@ class OccupancyGrid:
             "observed_ratio": float(observed) / float(total),
             "unknown_ratio": float(unknown) / float(total),
         }
+
+    def stats_aabb(self, box_min: list[float], box_max: list[float]) -> dict[str, float]:
+        """
+        Stats inside axis-aligned bounding box in world coords.
+        Returns observed_ratio/unknown_ratio and absolute voxel counts.
+        """
+        bmin = np.asarray(box_min, dtype=np.float32).reshape(3)
+        bmax = np.asarray(box_max, dtype=np.float32).reshape(3)
+        lo = np.minimum(bmin, bmax)
+        hi = np.maximum(bmin, bmax)
+
+        i0 = self._to_idx(lo[None, :]).reshape(3)
+        i1 = self._to_idx(hi[None, :]).reshape(3)
+        # inclusive->exclusive padding
+        i0 = np.maximum(i0, 0)
+        i1 = np.minimum(i1 + 1, np.asarray(self.grid.shape, dtype=np.int32))
+        if np.any(i1 <= i0):
+            return {"observed_ratio": 0.0, "unknown_ratio": 1.0, "vox_total": 0.0, "vox_unknown": 0.0, "vox_observed": 0.0}
+
+        sub = self.grid[i0[0] : i1[0], i0[1] : i1[1], i0[2] : i1[2]].reshape(-1)
+        total = int(sub.size)
+        if total <= 0:
+            return {"observed_ratio": 0.0, "unknown_ratio": 1.0, "vox_total": 0.0, "vox_unknown": 0.0, "vox_observed": 0.0}
+        unknown = int(np.sum(sub == UNKNOWN))
+        observed = int(np.sum(sub != UNKNOWN))
+        return {
+            "observed_ratio": float(observed) / float(total),
+            "unknown_ratio": float(unknown) / float(total),
+            "vox_total": float(total),
+            "vox_unknown": float(unknown),
+            "vox_observed": float(observed),
+        }
