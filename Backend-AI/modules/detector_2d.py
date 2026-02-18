@@ -1,24 +1,8 @@
 # modules/detector_2d.py
-"""
-2D detector wrapper (Stage 2)
------------------------------
-
-Goal: provide a simple, optional 2D detector interface:
-
-    detector = Detector2D(...)
-    dets = detector.infer(image_bytes)
-
-Output format (Det2D-like dicts):
-    {class_label, bbox_xyxy, score, mask_rle(optional)=None}
-
-Notes:
-- This module must NOT hard-require cv2. It uses Pillow + numpy.
-- If ultralytics is missing, returns [] (graceful fallback).
-"""
 from __future__ import annotations
 
-import logging
 import io
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -53,33 +37,27 @@ class Detector2D:
     def __init__(self, cfg: Optional[DetectorConfig] = None) -> None:
         self.cfg = cfg or DetectorConfig()
         self.model = None
+        self._status = {"ok": True, "code": "READY", "message": "detector ready"}
         if not _PIL_OK:
-            logger.warning("Pillow is not available; Detector2D will be disabled.")
+            self._status = {"ok": False, "code": "PIL_MISSING", "message": "Pillow is not installed"}
             return
         if not _YOLO_OK:
-            logger.info("ultralytics is not available; Detector2D will run in fallback mode (no detections).")
+            self._status = {"ok": False, "code": "YOLO_MISSING", "message": "ultralytics is not installed"}
             return
         try:
             self.model = YOLO(self.cfg.model_path)
-            logger.info("2D detector loaded: %s", self.cfg.model_path)
-        except Exception as e:
-            logger.warning("Failed to load YOLO model (%s): %s", self.cfg.model_path, e)
-            self.model = None
+        except Exception as exc:
+            self._status = {"ok": False, "code": "MODEL_LOAD_FAILED", "message": str(exc)}
 
     @property
     def available(self) -> bool:
         return self.model is not None
 
-    def infer(self, image_bytes: bytes) -> List[Dict[str, Any]]:
+    def infer_with_status(self, image_bytes: bytes) -> Dict[str, Any]:
         if self.model is None:
-            return []
-        if not _PIL_OK:
-            return []
-
-        # Load image as RGB numpy
+            return {"status": self._status, "detections": []}
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-        img_np = np.array(img)  # H,W,3 RGB
+        img_np = np.array(img)
 
         try:
             results = self.model.predict(
@@ -89,39 +67,34 @@ class Detector2D:
                 max_det=self.cfg.max_det,
                 verbose=False,
             )
-        except Exception as e:
-            logger.warning("Detector2D inference failed: %s", e)
-            return []
+        except Exception as exc:
+            return {
+                "status": {"ok": False, "code": "INFER_FAILED", "message": str(exc)},
+                "detections": [],
+            }
 
         dets: List[Dict[str, Any]] = []
-        if not results:
-            return dets
+        if results:
+            r0 = results[0]
+            names = getattr(r0, "names", {}) or {}
+            boxes = getattr(r0, "boxes", None)
+            xyxy = getattr(boxes, "xyxy", None) if boxes is not None else None
+            cls = getattr(boxes, "cls", None) if boxes is not None else None
+            conf = getattr(boxes, "conf", None) if boxes is not None else None
+            if xyxy is not None and cls is not None and conf is not None:
+                for (x1, y1, x2, y2), c, s in zip(xyxy.cpu().numpy(), cls.cpu().numpy(), conf.cpu().numpy()):
+                    c_int = int(c)
+                    label = names.get(c_int, f"class_{c_int}")
+                    dets.append(
+                        {
+                            "class_label": str(label),
+                            "bbox_xyxy": [float(x1), float(y1), float(x2), float(y2)],
+                            "score": float(s),
+                            "mask_rle": None,
+                        }
+                    )
 
-        r0 = results[0]
-        names = getattr(r0, "names", {}) or {}
-        boxes = getattr(r0, "boxes", None)
-        if boxes is None:
-            return dets
+        return {"status": {"ok": True, "code": "READY", "message": "ok"}, "detections": dets}
 
-        xyxy = getattr(boxes, "xyxy", None)
-        cls = getattr(boxes, "cls", None)
-        conf = getattr(boxes, "conf", None)
-        if xyxy is None or cls is None or conf is None:
-            return dets
-
-        xyxy = xyxy.cpu().numpy()
-        cls = cls.cpu().numpy()
-        conf = conf.cpu().numpy()
-
-        for (x1, y1, x2, y2), c, s in zip(xyxy, cls, conf):
-            c_int = int(c)
-            label = names.get(c_int, f"class_{c_int}")
-            dets.append(
-                {
-                    "class_label": str(label),
-                    "bbox_xyxy": [float(x1), float(y1), float(x2), float(y2)],
-                    "score": float(s),
-                    "mask_rle": None,
-                }
-            )
-        return dets
+    def infer(self, image_bytes: bytes) -> List[Dict[str, Any]]:
+        return self.infer_with_status(image_bytes)["detections"]
