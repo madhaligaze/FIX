@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  backend-ai:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./sessions:/app/Backend-AI/sessions
+    restart: unless-stopped

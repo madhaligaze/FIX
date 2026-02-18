@@ -1,3 +1,11 @@
+# ---- Stage D readiness knobs ----
+min_views_per_anchor: 3
+
+# ---- Stage J minimal security ----
+# If api_keys is empty -> dev mode (no auth).
+security:
+  api_keys: []
+
 # ---- Project-level policy knobs (Stage 15: first-class safety/physics policy) ----
 # Unknown-space handling around anchors / supports / critical zones.
 # mode:
