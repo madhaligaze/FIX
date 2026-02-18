@@ -35,7 +35,12 @@ def ingest_frame(
     )
 
     # Always prefer validated_meta for geometry integration.
-    world.update_from_frame(validated_meta or meta_dict, rgb_bytes, depth_bytes, pointcloud_bytes)
+    meta_for_geom = dict(validated_meta or meta_dict)
+    try:
+        meta_for_geom["_tracking_cfg"] = getattr(runtime.config, "tracking").model_dump()
+    except Exception:
+        pass
+    world.update_from_frame(meta_for_geom, rgb_bytes, depth_bytes, pointcloud_bytes)
     add_trace_event(runtime.traces[session_id], "frame_ingested", {"frame_id": frame_id})
 
     anchors = runtime.anchors.get(session_id, [])
