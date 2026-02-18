@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import trimesh
 
 
 def export_occupancy_npz(world_model, out_path: Path) -> dict[str, Any]:
@@ -62,3 +63,67 @@ def export_occupancy_slice_png(
     pil = Image.fromarray(img, mode="L")
     pil.save(str(out_path))
     return {"format": "png", "path": str(out_path), "axis": axis, "frac": frac}
+
+
+
+def _voxel_boxes_glb_bytes(indices: np.ndarray, origin: np.ndarray, voxel_size: float, color_rgba: tuple[int, int, int, int]) -> bytes:
+    scene = trimesh.Scene()
+    if indices.size == 0:
+        return scene.export(file_type="glb")
+
+    rgba = np.asarray(color_rgba, dtype=np.uint8)
+    extents = np.array([voxel_size, voxel_size, voxel_size], dtype=np.float32)
+    for idx in indices:
+        center = origin + (idx.astype(np.float32) + 0.5) * float(voxel_size)
+        b = trimesh.creation.box(extents=extents)
+        b.apply_translation(center)
+        b.visual.vertex_colors = np.tile(rgba, (len(b.vertices), 1))
+        scene.add_geometry(b)
+    return scene.export(file_type="glb")
+
+
+def export_unknown_heatmap_glb(world_model, out_path: Path) -> dict[str, Any]:
+    from world.occupancy import UNKNOWN
+
+    occ = world_model.occupancy
+    grid = occ.grid.astype(np.uint8)
+    unknown = grid == UNKNOWN
+    # boundary unknown: unknown with at least one known 6-neighbor
+    known = ~unknown
+    boundary = np.zeros_like(unknown, dtype=bool)
+    for axis in range(3):
+        boundary |= unknown & np.roll(known, 1, axis=axis)
+        boundary |= unknown & np.roll(known, -1, axis=axis)
+    boundary[0, :, :] = False
+    boundary[-1, :, :] = False
+    boundary[:, 0, :] = False
+    boundary[:, -1, :] = False
+    boundary[:, :, 0] = False
+    boundary[:, :, -1] = False
+
+    idx = np.argwhere(boundary)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    glb = _voxel_boxes_glb_bytes(idx, occ.origin.astype(np.float32), float(occ.voxel_size), (54, 124, 255, 130))
+    out_path.write_bytes(glb)
+    return {"format": "glb", "path": str(out_path).replace('\\', '/'), "count": int(idx.shape[0])}
+
+
+def export_clearance_violations_glb(world_model, out_path: Path, *, min_clearance_m: float) -> dict[str, Any]:
+    occ = world_model.occupancy
+    g = occ.grid
+    shp = g.shape
+    coords = np.indices(shp).reshape(3, -1).T.astype(np.int32)
+    pts = occ.origin[None, :] + (coords.astype(np.float32) + 0.5) * float(occ.voxel_size)
+    dists = np.asarray(world_model.query_distance(pts.tolist()), dtype=np.float32)
+    bad = dists < float(min_clearance_m)
+    idx = coords[bad]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    glb = _voxel_boxes_glb_bytes(idx, occ.origin.astype(np.float32), float(occ.voxel_size), (255, 80, 80, 170))
+    out_path.write_bytes(glb)
+    return {
+        "format": "glb",
+        "path": str(out_path).replace('\\', '/'),
+        "count": int(idx.shape[0]),
+        "min_clearance_m": float(min_clearance_m),
+    }

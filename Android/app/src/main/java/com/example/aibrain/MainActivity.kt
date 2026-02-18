@@ -21,6 +21,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Switch
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -39,6 +40,7 @@ import com.example.aibrain.managers.ARSessionManager
 import com.example.aibrain.scene.PhysicsAnimator
 import com.example.aibrain.scene.SceneBuilder
 import com.example.aibrain.scene.LightingSetup
+import com.example.aibrain.scene.LayerGlbManager
 import io.github.sceneview.ar.ArSceneView
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.floatingactionbutton.FloatingActionButton
@@ -184,6 +186,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var voxelVisualizer: VoxelVisualizer
     private var currentVoxelData: List<VoxelData>? = null
     private var eyeOfAIActive = false
+    private var layerGlbManager: LayerGlbManager? = null
+    private var exportedLayers: List<UiLayer> = emptyList()
 
     // ══════════════════════════════════════════════════════════════════════
     // СОСТОЯНИЕ - AR RULER
@@ -566,20 +570,78 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onExportClicked() {
-        if (current3DModel == null) {
-            showHint("⚠️ Нет модели для экспорта")
+        val sid = currentSessionId
+        if (sid.isNullOrBlank()) {
+            showHint("⚠️ Нет активной сессии")
             return
         }
 
-        showHint("📦 Экспорт модели...")
+        showHint("📦 Загрузка export/latest...")
         scope.launch {
             try {
-                delay(1000)
-                showHint("✓ Модель экспортирована в Downloads/scaffold_model.obj")
+                val response = api.exportLatest(sid)
+                if (!response.isSuccessful || response.body() == null) {
+                    throw IllegalStateException("HTTP ${response.code()}")
+                }
+                val bundle = response.body()!!
+                val layers = bundle.ui?.layers.orEmpty()
+                exportedLayers = layers
+                if (layerGlbManager == null) {
+                    layerGlbManager = LayerGlbManager(this@MainActivity, sceneView.scene, getCurrentServerUrl())
+                }
+
+                for (layer in layers) {
+                    val path = layer.file?.glb?.path ?: layer.file?.path
+                    if (path.isNullOrBlank()) continue
+                    runCatching { layerGlbManager?.loadLayer(layer.id, path) }
+                }
+
+                showLayersDialog()
+                showHint("✓ Слои загружены")
             } catch (e: Exception) {
-                showHint("❌ Ошибка экспорта: ${e.message}")
+                showHint("❌ Ошибка загрузки слоёв: ${e.message}")
             }
         }
+    }
+
+    private fun showLayersDialog() {
+        if (exportedLayers.isEmpty()) {
+            showHint("⚠️ Нет доступных слоёв")
+            return
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 8)
+        }
+
+        exportedLayers.forEach { layer ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                val p = (resources.displayMetrics.density * 8).toInt()
+                setPadding(0, p, 0, p)
+            }
+            val label = TextView(this).apply {
+                text = layer.label ?: layer.id
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            val sw = Switch(this).apply {
+                isChecked = layer.default_on ?: true
+                setOnCheckedChangeListener { _, checked ->
+                    layerGlbManager?.setVisible(layer.id, checked)
+                }
+            }
+            row.addView(label)
+            row.addView(sw)
+            container.addView(row)
+            layerGlbManager?.setVisible(layer.id, sw.isChecked)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Layers")
+            .setView(container)
+            .setPositiveButton("OK", null)
+            .show()
     }
 
     private fun onSettingsClicked() {
@@ -1406,6 +1468,10 @@ class MainActivity : AppCompatActivity() {
         return when (item.itemId) {
             R.id.action_toggle_mode -> {
                 viewModel.toggleEditMode()
+                true
+            }
+            R.id.action_layers -> {
+                showLayersDialog()
                 true
             }
             else -> super.onOptionsItemSelected(item)

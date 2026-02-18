@@ -9,6 +9,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request
 
 from api.ingest import ingest_frame
+from export.overlays_export import export_clearance_violations_glb, export_unknown_heatmap_glb
 from export.scene_bundle import build_scene_bundle
 from contracts.frame_packet import FramePacketMeta
 from contracts.legacy_stream import LegacyStreamPayload
@@ -19,6 +20,7 @@ from scaffold.validators import collision_check
 from scanning.next_best_view import generate_scan_plan
 from scanning.readiness import compute_readiness
 from trace.decision_trace import add_trace_event
+from world.mesh_export import env_mesh_glb_bytes, env_mesh_obj_bytes
 from world.occupancy import OCCUPIED
 
 router = APIRouter(tags=["legacy"])
@@ -286,9 +288,35 @@ def legacy_model(request: Request, session_id: str):
 
         overlays = world.compute_overlays(state.policy.__dict__)
         overlays["violations"] = violations
-        rev_id = state.store.lock_revision(session_id, world.serialize_state(), overlays, state.traces.setdefault(session_id, []))
+
+        env_obj = env_mesh_obj_bytes(world)
+        rev_id = state.store.lock_revision(
+            session_id,
+            world.serialize_state(),
+            overlays,
+            state.traces.setdefault(session_id, []),
+            env_mesh_bytes=env_obj,
+        )
         state.last_rev[session_id] = rev_id
+
+        world_dir = state.store.session_root(session_id) / "world" / rev_id
+        env_glb_rel = f"sessions/{session_id}/world/{rev_id}/env_mesh.glb"
+        (world_dir / "env_mesh.glb").write_bytes(env_mesh_glb_bytes(world))
+
+        overlay_files = overlays.setdefault("overlay_files", {})
+        unknown = export_unknown_heatmap_glb(world, world_dir / "unknown_heatmap.glb")
+        clearance = export_clearance_violations_glb(
+            world,
+            world_dir / "clearance_violations.glb",
+            min_clearance_m=float(getattr(state.policy, "min_clearance_m", 0.2)),
+        )
+        overlay_files["unknown_heatmap"] = {"glb": {"path": unknown["path"]}}
+        overlay_files["clearance_violations"] = {"glb": {"path": clearance["path"]}}
+
         bundle = build_scene_bundle(session_id, rev_id, world, anchors, elements, scan_plan, overlays)
+        bundle.setdefault("env_mesh", {})
+        bundle["env_mesh"]["obj"] = {"path": f"sessions/{session_id}/world/{rev_id}/env_mesh.obj"}
+        bundle["env_mesh"]["glb"] = {"path": env_glb_rel}
         bundle["bom"] = bom_from_elements(elements)
         state.store.save_export(session_id, rev_id, bundle)
 

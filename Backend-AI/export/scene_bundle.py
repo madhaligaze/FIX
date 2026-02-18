@@ -20,6 +20,8 @@ def _layers(overlays: dict[str, Any]) -> dict[str, Any]:
         {"id": "trace", "label": "Decision trace", "kind": "debug", "default_on": False, "file": files.get("trace_ndjson")},
     ]
     for l in layers:
+        if "file" in l and isinstance(l["file"], str):
+            l["file"] = {"glb": {"path": l["file"]}}
         if "file" in l and not l["file"]:
             l.pop("file", None)
     return {"bundle_version": BUNDLE_VERSION, "layers": layers}
@@ -41,7 +43,7 @@ def build_scene_bundle(session_id: str, rev_id: str, world_model, anchors, scaff
         "session_id": session_id,
         "revision_id": rev_id,
         "timestamp": time.time(),
-        "env_mesh": {"format": "obj", "path": f"sessions/{session_id}/world/{rev_id}/env_mesh.obj"},
+        "env_mesh": {"obj": {"path": f"sessions/{session_id}/world/{rev_id}/env_mesh.obj"}, "glb": {"path": f"sessions/{session_id}/world/{rev_id}/env_mesh.glb"}},
         "trace": {"format": "ndjson", "path": f"sessions/{session_id}/world/{rev_id}/trace.ndjson", "json_path": f"sessions/{session_id}/world/{rev_id}/trace.json"},
         "objects": objects,
         "scene_meta": meta,
