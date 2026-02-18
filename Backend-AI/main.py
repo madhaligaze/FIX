@@ -12,7 +12,7 @@ Main FastAPI Server - AI Brain Backend
 """
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, Response
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
 import base64
@@ -73,7 +73,7 @@ except Exception:
 
 from modules.readiness_calibration import extract_reprojection_metrics_from_frames, suggest_thresholds
 
-# Stage 9: reproducible world snapshots
+# Stage 9/10: reproducible world snapshots
 try:
     from modules.world_snapshot import DEFAULT_SNAPSHOT_DIR, load_snapshot as load_world_snapshot
 except Exception:  # pragma: no cover
@@ -162,6 +162,31 @@ debug_dumper = DebugDumper()
 
 # Session persistence: восстанавливаем сессии после рестарта процесса
 session_manager.restore_sessions()
+
+
+def _require_snapshot_revision(session, requested_revision: Optional[str] = None) -> str:
+    if not getattr(session, "world_locked", False):
+        raise HTTPException(
+            status_code=409,
+            detail="World is not locked. Call /session/lock/{session_id} before generating/exporting.",
+        )
+    revision = (
+        requested_revision
+        or getattr(session, "current_structure_revision", None)
+        or getattr(session, "locked_snapshot_revision", None)
+    )
+    if not revision:
+        try:
+            revision = session_manager.commit_world_snapshot(session.session_id, reason="auto_commit")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to commit snapshot: {e}")
+    return str(revision)
+
+
+def _restore_revision_world(session_id: str, revision: str) -> None:
+    ok = session_manager.restore_world_snapshot(session_id, revision)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Snapshot revision not found: {revision}")
 
 
 def _normalize_camera_pose(camera_pose: Optional[List[float]]) -> List[float]:
@@ -1179,6 +1204,35 @@ async def restore_world_snapshot(request: SnapshotRestoreRequest):
     return {"status": "ok", "session_id": request.session_id, "revision": request.revision}
 
 
+@app.post('/session/lock/{session_id}')
+async def lock_session(session_id: str, reason: str = 'manual'):
+    try:
+        return session_manager.lock_session(session_id, reason=reason)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post('/session/unlock/{session_id}')
+async def unlock_session(session_id: str):
+    try:
+        return session_manager.unlock_session(session_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get('/session/snapshots/{session_id}')
+async def list_session_snapshots(session_id: str):
+    return {'session_id': session_id, 'snapshots': session_manager.list_world_snapshots(session_id)}
+
+
+@app.post('/session/snapshot/restore/{session_id}/{revision}')
+async def restore_session_snapshot(session_id: str, revision: str):
+    ok = session_manager.restore_world_snapshot(session_id, revision)
+    if not ok:
+        raise HTTPException(status_code=404, detail='Snapshot not found')
+    return {'session_id': session_id, 'restored_revision': revision}
+
+
 @app.post("/session/stream")
 async def stream_frame(request: StreamFrameRequest):
     """
@@ -1281,24 +1335,17 @@ async def generate_variants(request: GenerateRequest):
     - Генерируется BOM для каждого варианта
     """
     try:
-        # Получаем сессию
-        session = session_manager.get_session(request.session_id)
+        session_id = request.session_id
+        session = session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Сессия не найдена")
 
         _require_locked(session, force_unlocked=bool(getattr(request, "force_unlocked", False)))
 
-        # Stage 9: if snapshot_revision is provided, use its voxel_world for reproducibility
-        snapshot_revision_used = None
+        revision = _require_snapshot_revision(session, request.snapshot_revision)
+        _restore_revision_world(session_id, revision)
+
         snapshot_voxel_world = None
-        if request.snapshot_revision and load_world_snapshot is not None:
-            try:
-                snap_session_dict, snap_vw = load_world_snapshot(request.session_id, request.snapshot_revision, base_dir=DEFAULT_SNAPSHOT_DIR)
-                if snap_vw is not None:
-                    snapshot_voxel_world = snap_vw
-                    snapshot_revision_used = request.snapshot_revision
-            except Exception:
-                pass
 
         if bool(getattr(request, "require_ready", True)) and compute_readiness is not None:
             voxel_world_gate = snapshot_voxel_world or session.scene_context.ensure_voxel_world()
@@ -1353,8 +1400,11 @@ async def generate_variants(request: GenerateRequest):
             # Заполняем воксели из YOLO-детекций накопленных в сессии
             # (вспомогательно, если point_cloud не передавался)
             all_dets = session.scene_context.all_detected_objects
-            if all_dets and voxel_world.total_voxels == 0:
-                voxel_world.ingest_yolo_detections(all_dets)
+            if all_dets and getattr(voxel_world, 'total_voxels', 0) == 0:
+                try:
+                    voxel_world.ingest_yolo_detections(all_dets)
+                except Exception:
+                    pass
 
             from modules.auto_scaffolder import AutoScaffolder
             scaffolder = AutoScaffolder(
@@ -1363,47 +1413,53 @@ async def generate_variants(request: GenerateRequest):
                 standard_h=request.target_dimensions.get('standard_h', 2.07),
                 world_objects=getattr(session.scene_context, 'world_objects', None),
             )
-            target_dict = {
-                "x": request.target_point.x,
-                "y": request.target_point.y,
-                "z": request.target_point.z,
-            }
+            target_dict = {'x': request.target_point.x, 'y': request.target_point.y, 'z': request.target_point.z}
             floor_z = request.target_dimensions.get('floor_z', 0.0)
-            variant = scaffolder.build_to_target(
-                target=target_dict,
-                floor_z=floor_z,
-            )
+            variant = scaffolder.build_to_target(target=target_dict, floor_z=floor_z)
 
             # Физический анализ
-            analysis = physics_engine.calculate_load_map(
-                variant['nodes'], variant['beams']
-            )
+            analysis = physics_engine.calculate_load_map(variant['nodes'], variant['beams'])
             variant['physics_analysis'] = {
-                "status": analysis.status,
-                "max_load_ratio": analysis.max_load_ratio,
-                "critical_beams": analysis.critical_beams,
+                'status': analysis.status,
+                'max_load_ratio': analysis.max_load_ratio,
+                'critical_beams': analysis.critical_beams,
             }
 
             # Загружаем в структурный граф сессии
             if hasattr(session, 'ensure_structural_graph'):
-                graph = session.ensure_structural_graph()
-                graph.load_from_variant(variant)
+                try:
+                    graph = session.ensure_structural_graph()
+                    if graph is not None and hasattr(graph, 'load_from_variant'):
+                        graph.load_from_variant(variant)
+                except Exception:
+                    pass
 
-            session.add_variant(variant)
+            try:
+                from modules.revision_artifacts import save_json_artifact
 
-            blocked = sum(1 for b in variant['beams'] if b.get('blocked'))
-            return {
-                "status": "success",
-                "mode": "auto_scaffolder",
-                "variants": [variant],
-                "count": 1,
-                "blocked_beams": blocked,
-                "voxels_used": voxel_world.total_voxels,
-                "message": (
-                    f"AutoScaffolder: башня {variant.get('floors','?')} ярусов. "
-                    f"Препятствий в VoxelWorld: {voxel_world.total_voxels}. "
-                    f"Обойдено балок: {blocked}."
+                save_json_artifact(
+                    session_id=session_id,
+                    revision=revision,
+                    name=f'variant_auto_scaffolder_{revision}',
+                    payload=variant,
                 )
+            except Exception:
+                pass
+
+            blocked = sum(1 for b in variant.get('beams', []) if b.get('blocked'))
+            return {
+                'status': 'success',
+                'mode': 'auto_scaffolder',
+                'variants': [variant],
+                'count': 1,
+                'blocked_beams': blocked,
+                'voxels_used': getattr(voxel_world, 'total_voxels', 0),
+                'snapshot_revision': revision,
+                'message': (
+                    f"AutoScaffolder: башня {variant.get('floors','?')} ярусов. "
+                    f"Препятствий в VoxelWorld: {getattr(voxel_world, 'total_voxels', 0)}. "
+                    f"Обойдено балок: {blocked}."
+                ),
             }
         # ────────────────────────────────────────────────────────────────────
         # СТАРЫЙ ПУТЬ: target_point не задан → классический генератор
@@ -2206,7 +2262,7 @@ async def finalize_model(session_id: str):
                 }
             )
 
-        session.save_structure(final_options[0]["elements"])
+        session.save_structure(final_options[0]["elements"], revision=revision)
         session_manager.auto_save_session(session_id)
 
         mesh = mesh_builder.build_from_elements(final_options[0]["elements"])
@@ -2222,8 +2278,35 @@ async def finalize_model(session_id: str):
         }
         final_options[0]["inspection"] = scaffold_inspector.inspect(final_options[0]["elements"], physics_data)
 
+        try:
+            from modules.revision_artifacts import artifact_path, save_json_artifact
+
+            mesh_path = artifact_path(session_id=session_id, revision=revision, filename=f"scaffold_mesh_{revision}.gltf")
+            mesh_builder.export_gltf(mesh, mesh_path)
+            save_json_artifact(
+                session_id=session_id,
+                revision=revision,
+                name=f"generation_manifest_{revision}",
+                payload={
+                    "session_id": session_id,
+                    "revision": revision,
+                    "physics_status": physics_status,
+                    "safety_score": safety_score,
+                    "target_dimensions": target_dims,
+                    "stats": {
+                        "skeleton_elements": len(skeleton),
+                        "total_elements": len(full_structure),
+                        "reinforcement_iterations": reinforcement_iterations,
+                        "voxels_used": voxel_world.total_voxels,
+                    },
+                },
+            )
+        except Exception:
+            pass
+
         return {
             "status": "SUCCESS",
+            "snapshot_revision": revision,
             "options": final_options,
             "statistics": {
                 "skeleton_elements": len(skeleton),
@@ -2424,34 +2507,85 @@ async def beautify_environment(session_id: str, depth: int = 9):
 
 
 @app.get("/session/export/{session_id}")
-async def export_session_bom(session_id: str, format: str = "csv", project_name: str = "Unnamed Project"):
+async def export_session_bom(
+    session_id: str,
+    format: str = "csv",
+    project_name: str = "Unnamed Project",
+    snapshot_revision: Optional[str] = None,
+):
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    _require_locked(session, force_unlocked=False)
     if not session.current_structure and not session.generated_variants:
         raise HTTPException(status_code=400, detail="No structure to export")
+
+    revision = _require_snapshot_revision(session, snapshot_revision)
+    _restore_revision_world(session_id, revision)
 
     elements = session.current_structure or session.generated_variants[0].get("full_structure", [])
     bom = _build_layher_bom_from_elements(elements)
 
+    from modules.revision_artifacts import artifact_path, save_json_artifact
+
+    safe_project = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (project_name or "project"))
+    base_name = f"BOM_{safe_project}_{revision}"
+
     if format == "csv":
         csv_data = bom_exporter.export_to_csv(bom, project_name)
-        return Response(
-            content=csv_data,
-            media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename=BOM_{session_id}.csv"},
+        out_path = artifact_path(session_id=session_id, revision=revision, filename=f"{base_name}.csv")
+        Path(out_path).write_bytes(csv_data.encode("utf-8") if isinstance(csv_data, str) else csv_data)
+        save_json_artifact(
+            session_id=session_id,
+            revision=revision,
+            name=f"export_manifest_{revision}",
+            payload={
+                "session_id": session_id,
+                "revision": revision,
+                "format": format,
+                "project_name": project_name,
+                "elements_count": len(elements),
+                "timestamp": time.time(),
+            },
         )
+        return FileResponse(str(out_path), media_type="text/csv", filename=f"{base_name}.csv")
+
     if format == "xlsx":
-        filepath = f"/tmp/BOM_{session_id}.xlsx"
-        if not bom_exporter.export_to_excel(bom, filepath, project_name):
+        out_path = artifact_path(session_id=session_id, revision=revision, filename=f"{base_name}.xlsx")
+        if not bom_exporter.export_to_excel(bom, str(out_path), project_name):
             raise HTTPException(status_code=500, detail="Excel export failed")
-        return FileResponse(filepath, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=f"BOM_{session_id}.xlsx")
+        save_json_artifact(
+            session_id=session_id,
+            revision=revision,
+            name=f"export_manifest_{revision}",
+            payload={
+                "session_id": session_id,
+                "revision": revision,
+                "format": format,
+                "project_name": project_name,
+                "elements_count": len(elements),
+                "timestamp": time.time(),
+            },
+        )
+        return FileResponse(str(out_path), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=f"{base_name}.xlsx")
+
     if format == "pdf":
-        filepath = f"/tmp/BOM_{session_id}.pdf"
-        if not bom_exporter.export_to_pdf(bom, filepath, project_name):
+        out_path = artifact_path(session_id=session_id, revision=revision, filename=f"{base_name}.pdf")
+        if not bom_exporter.export_to_pdf(bom, str(out_path), project_name):
             raise HTTPException(status_code=500, detail="PDF export failed")
-        return FileResponse(filepath, media_type="application/pdf", filename=f"BOM_{session_id}.pdf")
+        save_json_artifact(
+            session_id=session_id,
+            revision=revision,
+            name=f"export_manifest_{revision}",
+            payload={
+                "session_id": session_id,
+                "revision": revision,
+                "format": format,
+                "project_name": project_name,
+                "elements_count": len(elements),
+                "timestamp": time.time(),
+            },
+        )
+        return FileResponse(str(out_path), media_type="application/pdf", filename=f"{base_name}.pdf")
 
     raise HTTPException(status_code=400, detail=f"Unsupported format: {format}")
 
@@ -2475,18 +2609,40 @@ async def inspect_quality(session_id: str):
 
 
 @app.get("/session/debug_dump/{session_id}")
-async def get_debug_dump(session_id: str, include_voxels: bool = False):
+async def get_debug_dump(session_id: str, include_voxels: bool = False, snapshot_revision: Optional[str] = None):
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    session_json = session_manager.export_session_data(session_id)
-    if not session_json:
+    session_data = session_manager.export_session_data(session_id)
+    if not session_data:
         raise HTTPException(status_code=500, detail="Failed to export session")
+
+    if getattr(session, "world_locked", False):
+        revision = _require_snapshot_revision(session, snapshot_revision)
+        try:
+            snap = load_world_snapshot(session_id, revision, root_dir=DEFAULT_SNAPSHOT_DIR)
+            if include_voxels:
+                session_data["snapshot_voxel"] = (snap or {}).get("voxel_payload", {})
+        except Exception:
+            pass
+
+        try:
+            from modules.revision_artifacts import save_json_artifact
+
+            path_out = save_json_artifact(
+                session_id=session_id,
+                revision=revision,
+                name=f"debug_dump_{revision}",
+                payload=session_data,
+            )
+            return FileResponse(str(path_out), media_type="application/json", filename=f"debug_{session_id}_{revision}.json")
+        except Exception:
+            pass
 
     filepath = debug_dumper.dump_session(
         session_id=session_id,
-        session_data=json.loads(session_json),
+        session_data=session_data,
         reason="manual",
         include_voxels=include_voxels,
     )
