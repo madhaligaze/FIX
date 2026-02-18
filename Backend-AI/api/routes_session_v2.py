@@ -7,6 +7,7 @@ from api.ingest import ingest_frame
 from contracts.frame_packet import AnchorPoint, FramePacketMeta
 from policy.unknown_space import apply_unknown_policy
 from scanning.readiness import compute_readiness
+from validation.frame_validation import validate_and_normalize_frame_meta
 from world.mesh_export import env_mesh_obj_bytes
 
 router = APIRouter(tags=["session"])
@@ -29,6 +30,7 @@ def create_session(request: Request) -> dict:
     state.get_scene_graph(session_id)
     state.anchors[session_id] = []
     state.traces[session_id] = []
+    state.last_timestamp[session_id] = float("-inf")
     return {"session_id": session_id}
 
 
@@ -63,7 +65,29 @@ async def post_frame(
     session_id = meta_payload.session_id
     rgb_bytes = await rgb.read()
     meta_dict = meta_payload.model_dump()
-    return ingest_frame(state, session_id, meta_payload.frame_id, meta_dict, rgb_bytes, depth_bytes, pointcloud_bytes)
+
+    last_ts = state.last_timestamp.get(session_id)
+    validated_meta, errors = validate_and_normalize_frame_meta(
+        meta_dict,
+        rgb_bytes=rgb_bytes,
+        last_timestamp=last_ts,
+    )
+    if errors:
+        raise HTTPException(status_code=400, detail={"status": "INVALID_FRAMEPACKET", "errors": errors})
+
+    # Update monotonic timestamp state (STAGE A)
+    state.last_timestamp[session_id] = float(validated_meta["timestamp"])
+
+    return ingest_frame(
+        state,
+        session_id,
+        meta_payload.frame_id,
+        meta_dict,
+        rgb_bytes,
+        depth_bytes,
+        pointcloud_bytes,
+        validated_meta=validated_meta,
+    )
 
 
 @router.post("/session/anchors")

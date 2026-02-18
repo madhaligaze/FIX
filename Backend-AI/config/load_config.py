@@ -21,6 +21,15 @@ class WorldCfg(BaseModel):
     min_clearance_m: float = 0.20
 
 
+class TrackingCfg(BaseModel):
+    icp_enabled: bool = True
+    icp_apply_correction: bool = True
+    icp_max_correspondence_m: float = 0.20
+    icp_voxel_down_m: float = 0.06
+    icp_min_fitness_apply: float = 0.35
+    icp_max_rmse_apply: float = 0.06
+
+
 class ExportOverlaysCfg(BaseModel):
     occupancy_npz: bool = True
     occupancy_slice_png: bool = True
@@ -72,6 +81,7 @@ class AppConfig(BaseModel):
     server: ServerCfg = Field(default_factory=ServerCfg)
     storage: StorageCfg = Field(default_factory=StorageCfg)
     world: WorldCfg = Field(default_factory=WorldCfg)
+    tracking: TrackingCfg = Field(default_factory=TrackingCfg)
     export: ExportCfg = Field(default_factory=ExportCfg)
     policy: PolicyCfg = Field(default_factory=PolicyCfg)
     security: SecurityCfg = Field(default_factory=SecurityCfg)

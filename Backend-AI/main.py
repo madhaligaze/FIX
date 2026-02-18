@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -28,9 +29,45 @@ def init_runtime() -> RuntimeState:
     raise RuntimeError("RuntimeState.build is unavailable")
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI lifespan: start/stop background tasks (retention, etc.)."""
+    task: asyncio.Task | None = None
+    try:
+        cfg = app.state.runtime.config
+        retention = getattr(cfg, "retention", None)
+        enabled = True if retention is None else bool(getattr(retention, "enabled", True))
+        if enabled:
+            max_age_days = int(getattr(retention, "max_age_days", 14))
+            interval_min = int(getattr(retention, "cleanup_interval_minutes", 60))
+
+            def _run_once():
+                try:
+                    return app.state.runtime.store.prune_sessions(max_age_days=max_age_days)
+                except Exception:
+                    return {"deleted": 0, "kept": 0}
+
+            _run_once()
+
+            async def _loop():
+                while True:
+                    await asyncio.sleep(max(60.0, float(interval_min) * 60.0))
+                    _run_once()
+
+            task = asyncio.create_task(_loop())
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+
+
 def create_app() -> FastAPI:
     setup_json_logging(level="INFO")
-    app = FastAPI(title="Backend-AI", version="5.1.0")
+    app = FastAPI(title="Backend-AI", version="5.1.0", lifespan=lifespan)
     app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
     app.state.runtime = init_runtime()
     obs_cfg = getattr(app.state.runtime.config, "observability", None)
@@ -101,31 +138,6 @@ def create_app() -> FastAPI:
             "version": app.version,
             "modules": {"legacy": True, "pipeline": True},
         }
-
-    @app.on_event("startup")
-    async def _retention_task():
-        cfg = app.state.runtime.config
-        retention = getattr(cfg, "retention", None)
-        if retention is None or not bool(getattr(retention, "enabled", True)):
-            return
-
-        max_age_days = int(getattr(retention, "max_age_days", 14))
-        interval_min = int(getattr(retention, "cleanup_interval_minutes", 60))
-
-        def _run_once():
-            try:
-                return app.state.runtime.store.prune_sessions(max_age_days=max_age_days)
-            except Exception:
-                return {"deleted": 0, "kept": 0}
-
-        _run_once()
-
-        async def _loop():
-            while True:
-                await asyncio.sleep(max(60.0, float(interval_min) * 60.0))
-                _run_once()
-
-        asyncio.create_task(_loop())
 
     return app
 

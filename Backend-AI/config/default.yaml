@@ -10,6 +10,14 @@ world:
   tsdf_trunc_m: 0.40
   min_clearance_m: 0.20
 
+tracking:
+  icp_enabled: true
+  icp_apply_correction: true
+  icp_max_correspondence_m: 0.20
+  icp_voxel_down_m: 0.06
+  icp_min_fitness_apply: 0.35
+  icp_max_rmse_apply: 0.06
+
 export:
   env_mesh_format: "obj"
   overlays:
