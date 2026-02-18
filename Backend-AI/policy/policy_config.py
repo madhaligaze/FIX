@@ -22,6 +22,14 @@ class PolicyConfig:
     stability_require_diagonals: bool = True
     enforce_validators_strict: bool = True
 
+    # --- STAGE 16: candidate search + repair loop ---
+    planner_max_candidates: int = 24
+    planner_repair_rounds: int = 8
+    planner_max_shift_m: float = 0.60
+    planner_score_w_violations: float = 10.0
+    planner_score_w_unknown: float = 2.0
+    planner_score_w_shift: float = 0.5
+
     @classmethod
     def from_config(cls, config: dict) -> "PolicyConfig":
         policy = config.get("policy", {})
@@ -40,4 +48,10 @@ class PolicyConfig:
             access_min_corridor_m=float(policy.get("access_min_corridor_m", 0.7)),
             stability_require_diagonals=bool(policy.get("stability_require_diagonals", True)),
             enforce_validators_strict=bool(policy.get("enforce_validators_strict", True)),
+            planner_max_candidates=int(policy.get("planner_max_candidates", 24)),
+            planner_repair_rounds=int(policy.get("planner_repair_rounds", 8)),
+            planner_max_shift_m=float(policy.get("planner_max_shift_m", 0.60)),
+            planner_score_w_violations=float(policy.get("planner_score_w_violations", 10.0)),
+            planner_score_w_unknown=float(policy.get("planner_score_w_unknown", 2.0)),
+            planner_score_w_shift=float(policy.get("planner_score_w_shift", 0.5)),
         )
