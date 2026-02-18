@@ -64,3 +64,41 @@ def generate_scan_plan(world_model, anchors: list[dict], N: int = 7) -> list[dic
         if len(dedup) >= int(N):
             break
     return dedup
+
+
+_generate_scan_plan_core = generate_scan_plan
+
+
+def _esdf_distance_ok(world_model, pos: list[float], min_clearance_m: float) -> bool:
+    if not pos or len(pos) != 3:
+        return False
+    esdf = getattr(world_model, "esdf", None)
+    if esdf is None:
+        return True
+    fn = getattr(esdf, "query_distance", None) or getattr(esdf, "distance", None)
+    if not callable(fn):
+        return True
+    try:
+        d = float(fn([pos])[0])
+        return bool(d >= float(min_clearance_m))
+    except Exception:
+        return True
+
+
+def generate_scan_plan(world_model, anchors: list[dict], policy=None):
+    # keep backward compatibility with the old 3rd positional argument (N: int)
+    if isinstance(policy, (int, float)):
+        plan = list(_generate_scan_plan_core(world_model, anchors, int(policy)))
+        min_clearance = 0.2
+    else:
+        plan = list(_generate_scan_plan_core(world_model, anchors))
+        min_clearance = float(getattr(policy, "min_clearance_m", 0.2)) if policy is not None else 0.2
+    filtered = []
+    for h in plan:
+        pos = h.get("pos") or h.get("position")
+        if isinstance(pos, list) and len(pos) == 3:
+            if _esdf_distance_ok(world_model, pos, min_clearance):
+                filtered.append(h)
+        else:
+            filtered.append(h)
+    return filtered

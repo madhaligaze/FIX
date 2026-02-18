@@ -1,20 +1,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
-class LayherLikeSpec:
-    """MVP dimensional rules for a Layher-like frame system."""
-
-    ledger_lengths_m: tuple[float, ...] = (0.73, 1.09, 1.57, 2.07, 2.57, 3.07)
-    transom_lengths_m: tuple[float, ...] = (0.73, 1.09, 1.57, 2.07)
-    min_bay_m: float = 1.57
-    max_bay_m: float = 3.07
-    post_radius_m: float = 0.03
-    ledger_radius_m: float = 0.02
-    brace_radius_m: float = 0.02
-    default_height_m: float = 4.0
+class Part:
+    part_id: str
+    name: str
+    unit_weight_kg: float
+    meta: dict[str, Any] | None = None
 
 
-DEFAULT_SPEC = LayherLikeSpec()
+class Catalog:
+    def __init__(self) -> None:
+        self.parts: dict[str, Part] = {}
+        self._init_defaults()
+
+    def _init_defaults(self) -> None:
+        self.add(Part("post", "Vertical post", 8.5, {"unit": "pcs"}))
+        self.add(Part("ledger", "Ledger (horizontal)", 5.0, {"unit": "pcs"}))
+        self.add(Part("brace", "Diagonal brace", 3.2, {"unit": "pcs"}))
+        self.add(Part("deck", "Deck/Plank", 12.0, {"unit": "pcs"}))
+        self.add(Part("base_jack", "Base jack", 2.0, {"unit": "pcs"}))
+        self.add(Part("guardrail", "Guardrail", 4.0, {"unit": "pcs"}))
+        self.add(Part("toe_board", "Toe board", 2.5, {"unit": "pcs"}))
+        self.add(Part("ladder", "Access ladder", 7.0, {"unit": "pcs"}))
+
+    def add(self, part: Part) -> None:
+        self.parts[part.part_id] = part
+
+    def get(self, part_id: str) -> Part | None:
+        return self.parts.get(part_id)
+
+
+DEFAULT_CATALOG = Catalog()

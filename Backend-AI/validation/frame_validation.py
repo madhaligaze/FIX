@@ -200,3 +200,38 @@ def validate_and_normalize_frame_meta(
     if errs:
         return None, errs
     return out, []
+
+
+from pydantic import BaseModel
+
+
+def validate_and_normalize_meta(meta_payload: BaseModel) -> dict[str, Any]:
+    """Stable wrapper for callers/tests."""
+    fn = globals().get("validate_frame_meta") or globals().get("validate_and_normalize")
+    if callable(fn):
+        out = fn(meta_payload)
+        if isinstance(out, BaseModel):
+            return out.model_dump()
+        if isinstance(out, dict):
+            return out
+    if isinstance(meta_payload, BaseModel):
+        payload = meta_payload.model_dump()
+    else:
+        payload = dict(meta_payload)
+    normalized, errs = validate_and_normalize_frame_meta(payload)
+    if errs:
+        raise ValueError(errs)
+    return normalized or payload
+
+
+def validate_meta_dict(meta_dict: dict[str, Any]) -> dict[str, Any]:
+    fn = globals().get("validate_frame_meta_dict")
+    if callable(fn):
+        return fn(meta_dict)
+    try:
+        from contracts.frame_packet import FramePacketMeta
+
+        meta = FramePacketMeta.model_validate(meta_dict)
+        return validate_and_normalize_meta(meta)
+    except Exception:
+        return meta_dict

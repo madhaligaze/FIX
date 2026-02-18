@@ -22,6 +22,18 @@ class SceneGraph:
     objects: Dict[str, SceneObject] = field(default_factory=dict)
     meta: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def planes(self) -> list[dict[str, Any]]:
+        return [o.params for o in self.objects.values() if o.type == "plane"]
+
+    def set_planes(self, planes: list[dict[str, Any]]) -> None:
+        self.objects = {k:v for k,v in self.objects.items() if v.type != "plane"}
+        for i, fit in enumerate(planes or []):
+            self.upsert_plane(f"plane_{i}", fit)
+
+    def set_objects(self, objects: list[dict[str, Any]]) -> None:
+        self.meta["objects"] = list(objects or [])
+
     def upsert_plane(self, plane_id: str, fit: dict) -> None:
         # Confidence is a simple function of inlier_ratio and rmse.
         inlier_ratio = float(fit.get("inlier_ratio", 0.0))

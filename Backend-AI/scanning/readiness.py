@@ -75,3 +75,33 @@ def compute_readiness(world_model, anchors: list[dict], policy) -> tuple[bool, f
     score = 0.75 * max(0.0, min(1.0, observed)) + 0.25 * max(0.0, min(1.0, float(vp) / float(max(1, min_vp))))
     ready = (observed >= min_obs) and (vp >= min_vp) and (len(reasons) == 0)
     return bool(ready), float(score), reasons
+
+
+_compute_readiness_core = compute_readiness
+
+
+def _supports(anchors: list[dict]) -> list[dict]:
+    out = []
+    for a in anchors or []:
+        if a.get("kind") in ("support", "anchor", "opora"):
+            out.append(a)
+    return out
+
+
+def compute_readiness(world_model, anchors: list[dict], policy) -> tuple[bool, float, list[str]]:
+    reasons: list[str] = []
+    ready, score, core_reasons = _compute_readiness_core(world_model, anchors, policy)
+    reasons.extend(list(core_reasons or []))
+    min_views = int(getattr(policy, "min_views_per_anchor", 0) or 0)
+    if min_views > 0 and hasattr(world_model, "anchor_view_count"):
+        bad = []
+        for s in _supports(anchors):
+            pos = s.get("position")
+            if isinstance(pos, list) and len(pos) == 3:
+                n = int(world_model.anchor_view_count(pos))
+                if n < min_views:
+                    bad.append({"id": s.get("id"), "views": n})
+        if bad:
+            ready = False
+            reasons.append(f"min_views_per_anchor_not_met:{bad}")
+    return bool(ready), float(max(0.0, min(1.0, score))), reasons

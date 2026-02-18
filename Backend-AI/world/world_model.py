@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from tracking.pose_quality import evaluate_pose_step
 from world.esdf import ESDF
 from world.occupancy import OccupancyGrid
 from world.tsdf_volume import TSDFVolume
+from world.quality_metrics import compute_quality_metrics
 
 
 class WorldModel:
@@ -36,6 +39,7 @@ class WorldModel:
                 "conflicts": 0,
             }
         self.esdf = ESDF()
+        self._pose_history: list[dict[str, float | list[float]]] = []
 
     def _update_viewpoints(self, pose: dict) -> None:
         pos = pose.get("position")
@@ -62,6 +66,11 @@ class WorldModel:
         self.metrics["frames"] = int(self.metrics.get("frames", 0)) + 1
 
         pose = meta.get("pose", {}) or {}
+        pos = pose.get("position")
+        if isinstance(pos, (list, tuple)) and len(pos) == 3:
+            self._pose_history.append({"ts": float(time.time()), "pos": [float(pos[0]), float(pos[1]), float(pos[2])]})
+            if len(self._pose_history) > 300:
+                self._pose_history = self._pose_history[-300:]
 
         # STAGE C: pose jump detection
         prev_pose = self.metrics.get("last_pose")
@@ -108,13 +117,33 @@ class WorldModel:
         return self.export_env_mesh_obj_bytes()
 
     def compute_overlays(self, policy_dict: dict) -> dict:
-        # minimal overlays: occupancy summary + policy snapshot + uncertainty stats
+        qm = compute_quality_metrics(self, anchors=policy_dict.get("_anchors_for_metrics") if isinstance(policy_dict, dict) else None)
         return {
             "occupancy": self.occupancy.stats(),
             "weights_hist": self.occupancy.weight_histogram(),
             "conflicts": int(getattr(self.occupancy, "conflict_count", 0)),
+            "quality_metrics": qm.to_dict(),
             "policy": policy_dict,
         }
+
+    def anchor_view_count(self, anchor_pos: list[float], *, bins_deg: float = 45.0) -> int:
+        if not anchor_pos or len(anchor_pos) != 3 or not self._pose_history:
+            return 0
+        ax, ay, _ = float(anchor_pos[0]), float(anchor_pos[1]), float(anchor_pos[2])
+        step = max(5.0, float(bins_deg))
+        seen: set[int] = set()
+        for ph in self._pose_history:
+            p = ph.get("pos") if isinstance(ph, dict) else None
+            if not isinstance(p, list) or len(p) != 3:
+                continue
+            dx = float(p[0]) - ax
+            dy = float(p[1]) - ay
+            if (dx * dx + dy * dy) < 0.04:
+                continue
+            az = np.degrees(np.arctan2(dy, dx))
+            b = int(np.floor((az + 180.0) / step))
+            seen.add(b)
+        return int(len(seen))
 
     def serialize_state(self) -> dict:
         # hide internal viewpoint quant list
