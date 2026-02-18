@@ -58,7 +58,7 @@ def request_scaffold(request: Request, payload: ScaffoldRequest):
     elements, solver_meta = generate_scaffold(world, anchors, state.policy, trace=trace)
     trace_candidate_grid(trace, solver_meta)
 
-    valid, violations = validate_all(elements, world, state.policy)
+    valid, violations = validate_all(elements, world, state.policy, trace=trace)
     trace_validator_result(trace, valid, violations)
     if not valid:
         raise HTTPException(status_code=409, detail={"status": "VALIDATION_FAILED", "violations": violations})

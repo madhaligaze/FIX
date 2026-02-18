@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from typing import Any, Iterable
+import uuid
 
 import numpy as np
+
+from policy.unknown_space import apply_unknown_policy
+from trace.decision_trace import add_constraint_eval
+from world.occupancy import UNKNOWN
 
 
 def _pos(e: dict[str, Any]) -> np.ndarray | None:
@@ -42,7 +47,13 @@ def _iter_segments(elements: list[dict[str, Any]]) -> Iterable[tuple[str, np.nda
             yield t, p, p, e
 
 
-def collision_check(elements: list[dict[str, Any]], world_model, policy) -> tuple[bool, list[dict[str, Any]]]:
+def collision_check(
+    elements: list[dict[str, Any]],
+    world_model,
+    policy,
+    *,
+    trace: list[dict[str, Any]] | None = None,
+) -> tuple[bool, list[dict[str, Any]]]:
     violations: list[dict[str, Any]] = []
     if not elements:
         return False, [{"type": "NO_SCAFFOLD", "msg": "No scaffold elements generated"}]
@@ -69,8 +80,20 @@ def collision_check(elements: list[dict[str, Any]], world_model, policy) -> tupl
         return False, [{"type": "NO_POINTS", "msg": "No positions to validate"}]
 
     d = world_model.query_distance(sample_pts)
+    decision_id = f"collision:{uuid.uuid4()}"
     for i, dist in enumerate(d):
-        if float(dist) < min_clear:
+        ok = float(dist) >= min_clear
+        if trace is not None:
+            add_constraint_eval(
+                trace,
+                decision_id=decision_id,
+                constraint_id="collision_clearance",
+                ok=ok,
+                reason="clearance_ok" if ok else "clearance_too_low",
+                metrics={"dist_m": float(dist), "min_clearance_m": float(min_clear)},
+                element_id=str(meta[i].get("ref") or ""),
+            )
+        if not ok:
             violations.append(
                 {
                     "type": "COLLISION",
@@ -115,10 +138,68 @@ def access_rules(elements: list[dict[str, Any]], policy) -> tuple[bool, list[dic
     return len(violations) == 0, violations
 
 
-def validate_all(elements: list[dict[str, Any]], world_model, policy) -> tuple[bool, list[dict[str, Any]]]:
+
+
+def unknown_space_check(
+    elements: list[dict[str, Any]],
+    world_model,
+    policy,
+    *,
+    trace: list[dict[str, Any]] | None = None,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """
+    Enforces unknown_mode=forbid strictly; unknown_mode=buffer is advisory (traced).
+    """
+    decision_id = f"unknown:{uuid.uuid4()}"
+    report = apply_unknown_policy(world_model, [], policy)
+    mode = str(report.get("mode", "forbid"))
+    violations: list[dict[str, Any]] = []
+
+    for e in elements:
+        p = _pos(e)
+        if p is None:
+            continue
+        occ = int(world_model.occupancy.query([p.tolist()])[0])
+        in_unknown = occ == int(UNKNOWN)
+
+        if mode == "forbid":
+            ok = not in_unknown
+            if trace is not None:
+                add_constraint_eval(
+                    trace,
+                    decision_id=decision_id,
+                    constraint_id="no_unknown_at_pose",
+                    ok=ok,
+                    reason="observed" if ok else "unknown_voxel",
+                    metrics={"occ": occ, "mode": mode},
+                    element_id=str(e.get("id") or ""),
+                )
+            if not ok:
+                violations.append({"type": "UNKNOWN_AT_POSE", "element": e.get("type"), "pose": p.tolist()})
+
+    if mode != "forbid" and trace is not None:
+        add_constraint_eval(
+            trace,
+            decision_id=decision_id,
+            constraint_id="unknown_buffer_mode",
+            ok=True,
+            reason="buffer_or_allow_mode_no_hard_fail",
+            metrics={"mode": mode, "unknown_buffer_m": float(getattr(policy, "unknown_buffer_m", 0.5))},
+            element_id=None,
+        )
+
+    return len(violations) == 0, violations
+
+def validate_all(
+    elements: list[dict[str, Any]],
+    world_model,
+    policy,
+    *,
+    trace: list[dict[str, Any]] | None = None,
+) -> tuple[bool, list[dict[str, Any]]]:
     all_violations: list[dict[str, Any]] = []
 
-    ok1, v1 = collision_check(elements, world_model, policy)
+    ok1, v1 = collision_check(elements, world_model, policy, trace=trace)
     all_violations.extend(v1)
 
     ok2, v2 = stability_rules(elements, policy)
@@ -127,4 +208,7 @@ def validate_all(elements: list[dict[str, Any]], world_model, policy) -> tuple[b
     ok3, v3 = access_rules(elements, policy)
     all_violations.extend(v3)
 
-    return (ok1 and ok2 and ok3 and len(all_violations) == 0), all_violations
+    ok4, v4 = unknown_space_check(elements, world_model, policy, trace=trace)
+    all_violations.extend(v4)
+
+    return (ok1 and ok2 and ok3 and ok4 and len(all_violations) == 0), all_violations

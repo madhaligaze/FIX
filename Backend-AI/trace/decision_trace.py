@@ -30,6 +30,30 @@ def add_trace_event(
     )
 
 
+def add_constraint_eval(
+    trace: list[dict[str, Any]],
+    *,
+    decision_id: str,
+    constraint_id: str,
+    ok: bool,
+    reason: str,
+    metrics: dict[str, Any] | None = None,
+    element_id: str | None = None,
+) -> None:
+    add_trace_event(
+        trace,
+        "constraint_eval",
+        {
+            "decision_id": str(decision_id),
+            "constraint_id": str(constraint_id),
+            "ok": bool(ok),
+            "reason": str(reason),
+            "metrics": metrics or {},
+            "element_id": element_id,
+        },
+    )
+
+
 def trace_to_ndjson_bytes(trace: list[dict[str, Any]]) -> bytes:
     """
     NDJSON is better for streaming/large traces than a single huge JSON array.

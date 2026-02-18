@@ -13,6 +13,14 @@ from api.routes_session import router as session_router
 from api.state import RuntimeState
 
 
+def init_runtime() -> RuntimeState:
+    # Backward-compatible runtime init for both old and new state shapes.
+    build = getattr(RuntimeState, "build", None)
+    if callable(build):
+        return RuntimeState.build()
+    raise RuntimeError("RuntimeState.build is unavailable")
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Backend-AI", version="5.0.0")
 
@@ -22,7 +30,7 @@ def create_app() -> FastAPI:
         compresslevel=5,
     )
 
-    app.state.runtime = RuntimeState.build()
+    app.state.runtime = init_runtime()
 
     app.include_router(session_router)
     app.include_router(planning_router)
@@ -34,6 +42,10 @@ def create_app() -> FastAPI:
     sessions_dir = Path(app.state.runtime.config.storage.sessions_root)
     sessions_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/sessions", StaticFiles(directory=str(sessions_dir)), name="sessions")
+
+    @app.get("/health")
+    def health() -> dict[str, object]:
+        return {"status": "ok", "version": app.version, "modules": {"legacy": True, "pipeline": True}}
 
     return app
 
