@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import io
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -77,12 +77,7 @@ class Detector2D:
             return []
 
         # Load image as RGB numpy
-        try:
-            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")  # type: ignore[name-defined]
-        except Exception:
-            # Lazy import io only if needed
-            import io
-            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")  # type: ignore
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
         img_np = np.array(img)  # H,W,3 RGB
 

@@ -125,8 +125,8 @@ def termination_evidence_cylinder(
         if nearby_labels:
             end_p = axis_origin + a * float(end_t)
             for lbl, pos in nearby_labels:
-                l = (lbl or "").lower()
-                if not any(k in l for k in ["flange", "valve", "endcap", "end-cap", "cap"]):
+                label_lower = (lbl or "").lower()
+                if not any(k in label_lower for k in ["flange", "valve", "endcap", "end-cap", "cap"]):
                     continue
                 p = np.array(pos[:3], dtype=np.float64)
                 if float(np.linalg.norm(p - end_p)) < max(0.15, 2.0 * radius):

@@ -12,7 +12,7 @@ All structures are dict-friendly to keep session save/load simple.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 @dataclass

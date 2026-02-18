@@ -13,7 +13,7 @@ Main FastAPI Server - AI Brain Backend
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, model_validator
 from typing import List, Dict, Optional, Any
 import base64
 import time
@@ -829,7 +829,7 @@ async def ingest_frame_packet(request: FramePacketRequest):
                 from modules.lifter_2d3d import decode_depth_bytes, decode_confidence_bytes
 
                 depth_arr = decode_depth_bytes(depth_bytes, request.width, request.height)
-                conf_arr = decode_confidence_bytes(conf_bytes, request.width, request.height) if conf_bytes else None
+                _ = decode_confidence_bytes(conf_bytes, request.width, request.height) if conf_bytes else None
                 # TSDFIntegrator expects depth in meters and (optionally) confidence weights
                 # Convert to meters for TSDF
                 depth_meters = depth_arr.astype(np.float32) / float(request.depth_scale)
@@ -982,7 +982,11 @@ async def ingest_frame_packet(request: FramePacketRequest):
         try:
             if voxel_world is not None:
                 unknown_local = voxel_world.unknown_fraction_in_box(
-                    center_world=(float(pose[0]), float(pose[1]), float(pose[2])),
+                    center_world=(
+                        float(request.pose_world_from_camera[0]),
+                        float(request.pose_world_from_camera[1]),
+                        float(request.pose_world_from_camera[2]),
+                    ),
                     half_extents_m=(2.0, 2.0, 2.0),
                     sample_step_vox=3,
                 )
@@ -1387,7 +1391,7 @@ async def stream_frame(request: StreamFrameRequest):
                 point_cloud=request.point_cloud or [],
                 enable_vision=bool(request.enable_vision),
             )
-            out = await session_frame(frame_req)
+            out = await ingest_frame_packet(frame_req)
             # Mark as legacy wrapper response
             if isinstance(out, dict):
                 out["legacy_stream"] = True
@@ -2233,6 +2237,8 @@ async def finalize_model(session_id: str):
     start_anchor = user_anchors[0]
     end_anchor = user_anchors[-1]
 
+    revision = _require_snapshot_revision(session)
+
     start_node = {
         "x": start_anchor.get("x", 0),
         "y": start_anchor.get("y", 0),
@@ -2431,7 +2437,7 @@ async def finalize_model(session_id: str):
                     revision=revision,
                     session=session,
                     planned_elements_count=len(full_structure),
-                    unknown_policy=str(getattr(request, "unknown_policy", "")) if "request" in locals() else None,
+                    unknown_policy=None,
                 )
             except Exception:
                 pass
