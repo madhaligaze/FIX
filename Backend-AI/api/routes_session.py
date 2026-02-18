@@ -111,7 +111,7 @@ def lock_session(request: Request, payload: LockPayload):
     state = request.app.state.runtime
     world = state.get_world(payload.session_id)
     overlays = world.compute_overlays(state.policy.__dict__)
-    env_mesh_bytes = world.export_env_mesh_obj()
+    env_mesh_bytes = world.export_env_mesh_obj_bytes() if hasattr(world, "export_env_mesh_obj_bytes") else world.export_env_mesh_obj()
     rev_id = state.store.lock_revision(
         payload.session_id,
         world.serialize_state(),
