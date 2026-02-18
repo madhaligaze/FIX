@@ -1238,19 +1238,33 @@ async def ingest_measurements_packet(request: MeasurementPacketRequest):
     if not ok:
         raise HTTPException(status_code=409, detail={"error": "unsupported_protocol", "message": err})
 
-    payload = request.dict()
+    payload = request.model_dump()
 
     tape_warnings = []
     for i, t in enumerate(payload.get("tapes", []) or []):
+        has_a_ref = bool(t.get("a_anchor_id") or t.get("a_world_point"))
+        has_b_ref = bool(t.get("b_anchor_id") or t.get("b_world_point"))
+        if not has_a_ref or not has_b_ref:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"tapes[{i}] must provide each endpoint as anchor_id or world_point "
+                    "(a_anchor_id|a_world_point and b_anchor_id|b_world_point)"
+                ),
+            )
+
         a = t.get("a_world_point")
         b = t.get("b_world_point")
-        if a and b:
+        if a:
             ok_a, err_a = validate_world_point(a, name=f"tapes[{i}].a_world_point")
-            ok_b, err_b = validate_world_point(b, name=f"tapes[{i}].b_world_point")
             if not ok_a:
                 raise HTTPException(status_code=422, detail=err_a)
+        if b:
+            ok_b, err_b = validate_world_point(b, name=f"tapes[{i}].b_world_point")
             if not ok_b:
                 raise HTTPException(status_code=422, detail=err_b)
+
+        if a and b:
             computed = float(distance_between(a, b))
             if t.get("distance_m") is None:
                 t["distance_m"] = computed
