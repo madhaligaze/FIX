@@ -2,6 +2,7 @@ import base64
 import importlib.util
 import pathlib
 import sys
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -146,3 +147,45 @@ def test_session_frame_accepts_multipart_upload():
     data = response.json()
     assert data["status"] == "processed"
     assert data.get("transport") == "multipart"
+
+
+def test_generate_request_accepts_target_box_forward_ref():
+    payload = {
+        "session_id": "s-forward-ref",
+        "target_dimensions": {"width": 1.0, "height": 2.0, "depth": 3.0},
+        "target_box": {
+            "center": {"x": 1.0, "y": 2.0, "z": 3.0},
+            "half_extents": {"x": 0.5, "y": 0.5, "z": 0.5},
+        },
+    }
+    req = main_mod.GenerateRequest(**payload)
+
+    assert req.target_box is not None
+    assert req.target_box.center.x == 1.0
+    assert req.target_box.half_extents.z == 0.5
+
+
+def test_lock_world_extracts_mesh_version_and_lock_info_from_dict(monkeypatch):
+    fake_session = SimpleNamespace(
+        mesh_version=13,
+        status="ACTIVE",
+        scene_context=SimpleNamespace(last_readiness={"ready_to_lock": True}),
+    )
+
+    def _lock_world():
+        return {"locked_mesh_version": 42, "lock_info": {"reason": "unit-test"}}
+
+    fake_session.lock_world = _lock_world
+
+    auto_saved = {"session_id": None}
+
+    monkeypatch.setattr(main_mod.session_manager, "get_session", lambda _: fake_session)
+    monkeypatch.setattr(main_mod.session_manager, "auto_save_session", lambda sid: auto_saved.update(session_id=sid))
+
+    response = client.post("/session/lock_world", json={"session_id": "s-lock"})
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["mesh_version"] == 42
+    assert body["lock_info"] == {"reason": "unit-test"}
+    assert auto_saved["session_id"] == "s-lock"
