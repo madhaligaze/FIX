@@ -6,8 +6,8 @@ import types
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from modules.revision_artifacts import artifact_path, save_bytes_artifact, save_json_artifact
-from modules.world_snapshot import commit_snapshot, list_snapshots, load_snapshot, restore_voxel_world
+from modules.revision_artifacts import artifact_path, save_bytes_artifact, save_json_artifact  # noqa: E402
+from modules.world_snapshot import commit_snapshot, list_snapshots, load_snapshot, restore_voxel_world  # noqa: E402
 
 
 class DummyVoxelWorld:

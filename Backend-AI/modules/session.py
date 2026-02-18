@@ -288,4 +288,3 @@ class SessionStorage:
 
 
 # Совместимость с обновленным импортом в main.py
-from modules.session_manager import SessionManager  # noqa: E402
