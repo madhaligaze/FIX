@@ -35,7 +35,9 @@ def _dist(a: np.ndarray, b: np.ndarray) -> float:
 def cluster_suggestions(
     suggestions: List[Dict[str, Any]],
     radius_m: float = 0.6,
-    min_cluster_size: int = 3,
+    # Keep small clusters: in industrial scenes a single inconsistency point can be valuable.
+    # Larger clustering/selection happens later via scoring + max_views.
+    min_cluster_size: int = 1,
     max_clusters: int = 12,
 ) -> List[Cluster]:
     pts: List[np.ndarray] = []
@@ -202,6 +204,12 @@ def build_scan_plan(
     return {"clusters": [c.to_dict() for c in clusters], "next_best_views": chosen}
 
 
-def propose_views(scan_suggestions: List[Dict[str, Any]], current_pose: Optional[List[float]], voxel_world: Any = None, **kwargs) -> Dict[str, Any]:
-    del current_pose, kwargs
-    return build_scan_plan(voxel_world=voxel_world, scan_suggestions=scan_suggestions)
+def propose_views(
+    scan_suggestions: List[Dict[str, Any]],
+    current_pose: Optional[List[float]],
+    voxel_world: Any = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    # current_pose reserved for future (e.g., prefer closer candidate views)
+    del current_pose
+    return build_scan_plan(voxel_world=voxel_world, scan_suggestions=scan_suggestions, **kwargs)
