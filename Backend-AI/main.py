@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -9,26 +11,6 @@ from api.routes_legacy import router as legacy_router
 from api.routes_planning import router as planning_router
 from api.routes_session import router as session_router
 from api.state import RuntimeState
-from config.loader import load_config
-from modules.detector_2d import Detector2D
-from policy.load_policy import find_policy_file, load_policy_from_yaml
-from policy.policy_config import PolicyConfig
-from session.session_store import SessionStore
-
-
-def init_runtime() -> RuntimeState:
-    config = load_config()
-    store = SessionStore(config.get("paths", {}).get("artifacts_root", "sessions"))
-    policy = PolicyConfig.from_config(config)
-    policy_file = find_policy_file()
-    if policy_file is not None:
-        policy = load_policy_from_yaml(policy_file)
-        config["policy_source"] = str(policy_file).replace("\\", "/")
-    else:
-        config["policy_source"] = None
-    runtime = RuntimeState(config=config, store=store, policy=policy)
-    runtime.perception_unavailable = not Detector2D().available
-    return runtime
 
 
 def create_app() -> FastAPI:
@@ -40,7 +22,7 @@ def create_app() -> FastAPI:
         compresslevel=5,
     )
 
-    app.state.runtime = init_runtime()
+    app.state.runtime = RuntimeState.build()
 
     app.include_router(session_router)
     app.include_router(planning_router)
@@ -49,11 +31,9 @@ def create_app() -> FastAPI:
 
     # Serve artifacts (sessions/...) for Android to fetch env mesh, overlays, and traces
     # Note: path is relative to process cwd; RuntimeState/session_store uses same convention.
-    app.mount("/sessions", StaticFiles(directory="sessions"), name="sessions")
-
-    @app.get("/health")
-    def health():
-        return {"status": "ok", "version": app.version, "modules": {"legacy": True, "pipeline": True}}
+    sessions_dir = Path(app.state.runtime.config.storage.sessions_root)
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/sessions", StaticFiles(directory=str(sessions_dir)), name="sessions")
 
     return app
 

@@ -20,6 +20,17 @@ class LockPayload(BaseModel):
     session_id: str
 
 
+@router.get("/health")
+def health(_: Request):
+    return {"status": "ok"}
+
+
+@router.get("/policy/status")
+def policy_status(request: Request):
+    state = request.app.state.runtime
+    return state.policy_status()
+
+
 @router.post("/session/create")
 def create_session(request: Request):
     state = request.app.state.runtime
@@ -31,12 +42,6 @@ def create_session(request: Request):
     return {"session_id": session_id}
 
 
-@router.get("/policy/status")
-def policy_status(request: Request):
-    state = request.app.state.runtime
-    return state.policy_status()
-
-
 @router.post("/session/frame")
 async def post_frame(
     request: Request,
@@ -46,6 +51,7 @@ async def post_frame(
     pointcloud: UploadFile | None = File(default=None),
 ):
     state = request.app.state.runtime
+
     try:
         meta_payload = FramePacketMeta.model_validate_json(await meta.read())
     except ValidationError as exc:
@@ -62,6 +68,7 @@ async def post_frame(
     session_id = meta_payload.session_id
     rgb_bytes = await rgb.read()
     meta_dict = meta_payload.model_dump()
+
     return ingest_frame(state, session_id, meta_payload.frame_id, meta_dict, rgb_bytes, depth_bytes, pointcloud_bytes)
 
 
@@ -115,7 +122,8 @@ def session_status(request: Request, session_id: str):
         "unknown_policy": unknown,
         "perception_unavailable": state.perception_unavailable,
         "scene_graph": sg.serialize(),
-        "geometry_unavailable": not bool(world.metrics.get("tsdf_available", True)),
+        "geometry_unavailable": (not bool(world.metrics.get("tsdf_available", True))),
         "geometry_reason": world.metrics.get("tsdf_reason"),
-        "policy_source": state.config.get("policy_source"),
+        "policy_source": getattr(state, "policy_source", None),
+        "config_source": getattr(state, "config_source", None),
     }

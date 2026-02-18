@@ -10,12 +10,16 @@ from trace.decision_trace import trace_to_ndjson_bytes
 
 
 class SessionStore:
-    def __init__(self, artifacts_root: str = "sessions") -> None:
-        self.root = ensure_dirs(Path(artifacts_root))
+    def __init__(self, sessions_root: str = "sessions") -> None:
+        self.root = Path(sessions_root)
+        self.root.mkdir(parents=True, exist_ok=True)
 
     def create_session(self) -> str:
         session_id = str(uuid4())
         ensure_dirs(self.root / session_id)
+        ensure_dirs(self.root / session_id / "frames")
+        ensure_dirs(self.root / session_id / "world")
+        ensure_dirs(self.root / session_id / "exports")
         return session_id
 
     def session_root(self, session_id: str) -> Path:
