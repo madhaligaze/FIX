@@ -13,7 +13,7 @@ Main FastAPI Server - AI Brain Backend
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Dict, Optional, Any
 import base64
 import time
@@ -565,18 +565,18 @@ class FramePacketRequest(BaseModel):
     # Preferred transport: multipart/form-data with binary file part "rgb_file".
     rgb_base64: Optional[str] = None
 
-    # Image size
-    width: int
-    height: int
+    # Image size (validated in model validator)
+    width: Optional[int] = None
+    height: Optional[int] = None
 
-    # Intrinsics
-    fx: float
-    fy: float
-    cx_px: float
-    cy_px: float
+    # Intrinsics (validated in model validator)
+    fx: Optional[float] = None
+    fy: Optional[float] = None
+    cx_px: Optional[float] = None
+    cy_px: Optional[float] = None
 
-    # Pose: [tx,ty,tz,qx,qy,qz,qw] world_from_camera
-    pose_world_from_camera: List[float]
+    # Pose: [tx,ty,tz,qx,qy,qz,qw] world_from_camera (validated in model validator)
+    pose_world_from_camera: Optional[List[float]] = None
 
     # Depth (optional)
     depth_base64: Optional[str] = None
@@ -593,6 +593,26 @@ class FramePacketRequest(BaseModel):
     enable_self_check: bool = True
     target_center: Optional[Point3D] = None
     target_half_extents: Optional[Point3D] = None
+
+    @model_validator(mode="after")
+    def _require_core_fields(self) -> "FramePacketRequest":
+        missing: List[str] = []
+        if not self.rgb_base64:
+            missing.append("rgb_base64")
+        for k in ("width", "height", "fx", "fy", "cx_px", "cy_px"):
+            if getattr(self, k) is None:
+                missing.append(k)
+        if not self.pose_world_from_camera or len(self.pose_world_from_camera) < 7:
+            missing.append("pose_world_from_camera")
+
+        has_depth = bool(self.depth_base64)
+        has_pc = bool(self.point_cloud)
+        if not (has_depth or has_pc):
+            missing.append("depth_base64_or_point_cloud")
+
+        if missing:
+            raise ValueError(f"Missing required fields: {', '.join(missing)}")
+        return self
 
 
 class LockWorldRequest(BaseModel):
@@ -635,7 +655,8 @@ class AutoScaffoldRequest(BaseModel):
     force_unlocked: bool = False
 
 
-GenerateRequest.update_forward_refs(TargetBoxModel=TargetBoxModel)
+# Pydantic v2: resolve forward refs via model_rebuild (update_forward_refs is deprecated)
+GenerateRequest.model_rebuild(_types_namespace={"TargetBoxModel": TargetBoxModel})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1149,7 +1170,14 @@ async def lock_world(request: LockWorldRequest):
                 },
             )
 
-    mesh_version = session.lock_world()
+    lock_res = session.lock_world()
+    # Session.lock_world() may return dict; keep API return mesh_version as int.
+    if isinstance(lock_res, dict):
+        mesh_version = int(lock_res.get("locked_mesh_version") or lock_res.get("mesh_version") or session.mesh_version)
+        lock_info = lock_res.get("lock_info")
+    else:
+        mesh_version = int(lock_res)
+        lock_info = None
     session.status = "LOCKED_WORLD"
     session_manager.auto_save_session(request.session_id)
 
@@ -1157,6 +1185,7 @@ async def lock_world(request: LockWorldRequest):
         "status": "LOCKED_WORLD",
         "session_id": request.session_id,
         "mesh_version": mesh_version,
+        "lock_info": lock_info,
         "planner_can_run": True,
     }
 

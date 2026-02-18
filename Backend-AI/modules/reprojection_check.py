@@ -34,6 +34,48 @@ class ReprojectionResult:
     suggestions: List[Dict[str, Any]]
 
 
+class ReprojectionAPIResult:
+    """Return type that works for both API and tests.
+
+    `main.py` expects a dict-like object with `.get('reprojection')` and
+    `.get('scan_suggestions')`.
+
+    Some unit tests (and legacy callers) expect attribute access like
+    `.samples`, `.hit_rate`, `.median_abs_error_m`.
+    """
+
+    def __init__(self, reprojection: Dict[str, Any], scan_suggestions: List[Dict[str, Any]]):
+        self.reprojection = reprojection
+        self.scan_suggestions = scan_suggestions
+
+    def get(self, key: str, default=None):
+        if key == "reprojection":
+            return self.reprojection
+        if key == "scan_suggestions":
+            return self.scan_suggestions
+        return default
+
+    @property
+    def samples(self) -> int:
+        return int(self.reprojection.get("samples", 0))
+
+    @property
+    def hit_rate(self) -> float:
+        return float(self.reprojection.get("hit_rate", 0.0))
+
+    @property
+    def miss_rate(self) -> float:
+        return float(self.reprojection.get("miss_rate", 0.0))
+
+    @property
+    def mismatch_rate(self) -> float:
+        return float(self.reprojection.get("mismatch_rate", 0.0))
+
+    @property
+    def median_abs_error_m(self) -> float:
+        return float(self.reprojection.get("median_abs_error_m", 0.0))
+
+
 def _quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
     n = (qx * qx + qy * qy + qz * qz + qw * qw) ** 0.5
     if n <= 1e-8:
@@ -61,29 +103,54 @@ def _quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
 def check_reprojection(
     *,
     voxel_world,
-    depth_bytes: bytes,
+    # Support both raw uint16 depth buffer and pre-decoded meters array.
+    # Tests (and some integrations) pass `depth_m` directly.
+    depth_bytes: bytes | None = None,
+    depth_m: np.ndarray | None = None,
     width: int,
     height: int,
     fx: float,
     fy: float,
-    cx_px: float,
-    cy_px: float,
+    cx_px: float | None = None,
+    cy_px: float | None = None,
+    # Back-compat aliases
+    cx: float | None = None,
+    cy: float | None = None,
     pose7: List[float],
     depth_scale: float = 1000.0,
     pixel_step: int = 12,
     max_range: float = 8.0,
     mismatch_abs_thresh_m: float = 0.12,
+    # Legacy aliases
+    max_depth: float | None = None,
+    error_threshold_m: float | None = None,
+    miss_rate_threshold: float | None = None,
     max_suggestions: int = 120,
-) -> Dict[str, Any]:
-    if voxel_world is None or depth_bytes is None:
-        return {"reprojection": {"enabled": False}, "scan_suggestions": []}
-    if width <= 0 or height <= 0 or fx <= 0 or fy <= 0 or len(pose7) < 7:
-        return {"reprojection": {"enabled": False, "error": "bad_inputs"}, "scan_suggestions": []}
-    if len(depth_bytes) < width * height * 2:
-        return {"reprojection": {"enabled": False, "error": "bad_depth"}, "scan_suggestions": []}
+) -> ReprojectionAPIResult:
+    if max_depth is not None:
+        max_range = float(max_depth)
+    if error_threshold_m is not None:
+        mismatch_abs_thresh_m = float(error_threshold_m)
+    # miss_rate_threshold is used by legacy callers/tests for ok/not ok; we keep it for compatibility.
+    if cx_px is None:
+        cx_px = cx
+    if cy_px is None:
+        cy_px = cy
 
-    depth_u16 = np.frombuffer(depth_bytes, dtype=np.uint16).reshape(height, width)
-    depth_m = depth_u16.astype(np.float32) / float(depth_scale)
+    if voxel_world is None or (depth_bytes is None and depth_m is None):
+        return ReprojectionAPIResult({"enabled": False}, [])
+    if width <= 0 or height <= 0 or fx <= 0 or fy <= 0 or len(pose7) < 7:
+        return ReprojectionAPIResult({"enabled": False, "error": "bad_inputs"}, [])
+
+    if depth_m is None:
+        if depth_bytes is None or len(depth_bytes) < width * height * 2:
+            return ReprojectionAPIResult({"enabled": False, "error": "bad_depth"}, [])
+        depth_u16 = np.frombuffer(depth_bytes, dtype=np.uint16).reshape(height, width)
+        depth_m = depth_u16.astype(np.float32) / float(depth_scale)
+    else:
+        depth_m = np.asarray(depth_m, dtype=np.float32)
+        if depth_m.shape != (height, width):
+            return ReprojectionAPIResult({"enabled": False, "error": "bad_depth_shape"}, [])
 
     rot = _quat_to_rot(float(pose7[3]), float(pose7[4]), float(pose7[5]), float(pose7[6]))
     cam_t = np.array([float(pose7[0]), float(pose7[1]), float(pose7[2])], dtype=np.float32)
@@ -98,6 +165,8 @@ def check_reprojection(
             d_obs = float(depth_m[v, u])
             if d_obs <= 0.0 or d_obs > float(max_range):
                 continue
+            if cx_px is None or cy_px is None:
+                return ReprojectionAPIResult({"enabled": False, "error": "missing_intrinsics"}, [])
             xc = (float(u) - float(cx_px)) * d_obs / float(fx)
             yc = (float(v) - float(cy_px)) * d_obs / float(fy)
             dir_c = np.array([xc, yc, d_obs], dtype=np.float32)
@@ -168,7 +237,10 @@ def check_reprojection(
             uniq[key] = s
 
     out_suggestions = [s.to_dict() for s in sorted(uniq.values(), key=lambda x: -x.weight)[: int(max_suggestions)]]
-    return {"reprojection": reproj, "scan_suggestions": out_suggestions}
+    api = ReprojectionAPIResult(reprojection=reproj, scan_suggestions=out_suggestions)
+    if miss_rate_threshold is not None:
+        api.reprojection["ok"] = bool(api.miss_rate <= float(miss_rate_threshold))
+    return api
 
 
 def run_reprojection_check(**kwargs) -> ReprojectionResult:
