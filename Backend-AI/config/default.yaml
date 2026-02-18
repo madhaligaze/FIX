@@ -1,11 +1,23 @@
-paths:
-  artifacts_root: "sessions"
-policy:
-  readiness_observed_ratio_min: 0.1
-  unknown_ratio_near_support_max: 0.6
-  unknown_mode: "forbid"
-  unknown_buffer_m: 0.5
+# Backend-AI runtime config (STAGE 0 baseline)
+
+server:
+  host: "127.0.0.1"
+  port: 8000
+
+storage:
+  sessions_root: "sessions"
+
 world:
-  voxel_size: 0.2
-  tsdf_trunc: 0.4
-  min_clearance_m: 0.2
+  voxel_size_m: 0.20
+  tsdf_trunc_m: 0.40
+
+export:
+  env_mesh_format: "obj"
+  overlays:
+    occupancy_npz: true
+    occupancy_slice_png: true
+
+# Policy YAML location can be overridden per deployment.
+# If null, policy/load_policy.py will search its default locations.
+policy:
+  policy_yaml_path: null
