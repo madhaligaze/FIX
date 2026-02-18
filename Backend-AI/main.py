@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 
 from api.routes_export import router as export_router
 from api.routes_legacy import router as legacy_router
@@ -12,7 +13,14 @@ from modules.detector_2d import Detector2D
 from policy.policy_config import PolicyConfig
 from session.session_store import SessionStore
 
+
 app = FastAPI(title="Backend-AI", version="5.0.0")
+
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=1000,
+    compresslevel=5,
+)
 
 
 def init_runtime() -> RuntimeState:
