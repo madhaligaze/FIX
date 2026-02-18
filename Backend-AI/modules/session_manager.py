@@ -5,21 +5,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-# Stage 9: reproducible world snapshots
+# Stage 9/10: reproducible world snapshots
 try:
     from modules.world_snapshot import (
         DEFAULT_SNAPSHOT_DIR,
-        compute_revision as compute_snapshot_revision,
-        save_snapshot as save_world_snapshot,
-        list_snapshots as list_world_snapshots,
-        load_snapshot as load_world_snapshot,
+        commit_snapshot,
+        list_snapshots,
+        load_snapshot,
+        restore_voxel_world,
     )
 except Exception:  # pragma: no cover
     DEFAULT_SNAPSHOT_DIR = "/tmp/ai_brain_snapshots"
-    compute_snapshot_revision = None
-    save_world_snapshot = None
-    list_world_snapshots = None
-    load_world_snapshot = None
+    commit_snapshot = None
+    list_snapshots = None
+    load_snapshot = None
+    restore_voxel_world = None
 
 from modules.session_state import LockInfo, SessionState, compute_world_revision
 
@@ -186,6 +186,8 @@ class Session:
         self.world_locked = False
         self.locked_mesh_version: Optional[int] = None
         self.mesh_version = 0
+        self.locked_snapshot_revision: Optional[str] = None
+        self.current_structure_revision: Optional[str] = None
 
     def _touch(self) -> None:
         now = time.time()
@@ -262,13 +264,16 @@ class Session:
         self.generated_variants.append(variant)
         self._touch()
 
-    def save_structure(self, elements: List[Dict[str, Any]]) -> None:
+    def save_structure(self, elements: List[Dict[str, Any]], revision: Optional[str] = None) -> None:
         self.current_structure = elements
+        if revision:
+            self.current_structure_revision = str(revision)
         self.structure_history.append(
             {
                 "timestamp": time.time(),
                 "action": "SAVE_STRUCTURE",
                 "elements_count": len(elements),
+                "revision": self.current_structure_revision,
             }
         )
         self._touch()
@@ -328,6 +333,11 @@ class Session:
             "last_activity": self.last_activity,
             "total_frames_processed": self.total_frames_processed,
             "total_objects_detected": self.total_objects_detected,
+            "world_locked": self.world_locked,
+            "locked_mesh_version": self.locked_mesh_version,
+            "mesh_version": self.mesh_version,
+            "locked_snapshot_revision": self.locked_snapshot_revision,
+            "current_structure_revision": self.current_structure_revision,
         }
 
     # ── Stage 9: world snapshot (reproducibility) ─────────────────────────
@@ -343,29 +353,30 @@ class Session:
         Stores: session context + sparse voxel world.
         Returns snapshot metadata (revision, counts, created_at) or None.
         """
-        if save_world_snapshot is None:
+        if commit_snapshot is None:
             return None
         try:
             session_dict = self.to_dict()
             voxel_world = self.scene_context.ensure_voxel_world()
-            if revision is None and compute_snapshot_revision is not None:
-                revision = compute_snapshot_revision(session_dict)
-            meta = save_world_snapshot(
+            if voxel_world is None:
+                return None
+            ref = commit_snapshot(
+                session_id=self.session_id,
                 session_dict=session_dict,
                 voxel_world=voxel_world,
-                base_dir=base_dir,
-                revision=revision,
+                root_dir=base_dir,
                 reason=reason,
             )
-            return meta
+            self.locked_snapshot_revision = self.locked_snapshot_revision or ref.revision
+            return {"session_id": self.session_id, "revision": ref.revision}
         except Exception:
             return None
 
     def list_world_snapshots(self, base_dir: str = DEFAULT_SNAPSHOT_DIR) -> List[Dict[str, Any]]:
-        if list_world_snapshots is None:
+        if list_snapshots is None:
             return []
         try:
-            return list_world_snapshots(self.session_id, base_dir=base_dir)
+            return list_snapshots(self.session_id, root_dir=base_dir)
         except Exception:
             return []
 
@@ -378,29 +389,17 @@ class Session:
 
         WARNING: overwrites scene_context, frames (truncated), and voxel world.
         """
-        if load_world_snapshot is None:
+        if load_snapshot is None:
             return False
         try:
-            session_dict, voxel_world = load_world_snapshot(self.session_id, revision, base_dir=base_dir)
-            if not session_dict:
+            snap = load_snapshot(self.session_id, revision, root_dir=base_dir)
+            if not snap:
                 return False
-            restored = Session.from_dict(session_dict)
-            # Overwrite fields (keep same object reference)
-            self.created_at = restored.created_at
-            self.updated_at = restored.updated_at
-            self.last_activity = restored.last_activity
-            self.status = restored.status
-            self.frames = restored.frames
-            self.scene_context = restored.scene_context
-            if voxel_world is not None:
-                self.scene_context.voxel_world = voxel_world
-            self.generated_variants = restored.generated_variants
-            self.current_structure = restored.current_structure
-            self.structure_history = restored.structure_history
-            self.user_anchors = restored.user_anchors
-            self.total_frames_processed = restored.total_frames_processed
-            self.total_objects_detected = restored.total_objects_detected
-            self._structural_graph = None
+            voxel_world = self.scene_context.ensure_voxel_world()
+            if voxel_world is None or restore_voxel_world is None:
+                return False
+            restore_voxel_world(voxel_world, snap.get("voxel_payload") or {})
+            self.locked_snapshot_revision = str(revision)
             self._touch()
             return True
         except Exception:
@@ -424,6 +423,11 @@ class Session:
             "user_anchors": self.user_anchors,
             "total_frames_processed": self.total_frames_processed,
             "total_objects_detected": self.total_objects_detected,
+            "world_locked": self.world_locked,
+            "locked_mesh_version": self.locked_mesh_version,
+            "mesh_version": self.mesh_version,
+            "locked_snapshot_revision": self.locked_snapshot_revision,
+            "current_structure_revision": self.current_structure_revision,
         }
 
     @classmethod
@@ -447,6 +451,11 @@ class Session:
         s.user_anchors = data.get("user_anchors", [])
         s.total_frames_processed = data.get("total_frames_processed", len(s.frames))
         s.total_objects_detected = data.get("total_objects_detected", len(s.scene_context.all_detected_objects))
+        s.world_locked = bool(data.get("world_locked", False))
+        s.locked_mesh_version = data.get("locked_mesh_version")
+        s.mesh_version = int(data.get("mesh_version", s.mesh_version))
+        s.locked_snapshot_revision = data.get("locked_snapshot_revision")
+        s.current_structure_revision = data.get("current_structure_revision")
         return s
 
     def save_to_disk(self, base_dir: str = "/tmp/ai_brain_sessions") -> bool:
@@ -466,6 +475,8 @@ class Session:
                 "world_locked": self.world_locked,
                 "locked_mesh_version": self.locked_mesh_version,
                 "mesh_version": self.mesh_version,
+                "locked_snapshot_revision": self.locked_snapshot_revision,
+                "current_structure_revision": self.current_structure_revision,
                 "lifecycle_state": getattr(self.lifecycle_state, "value", str(self.lifecycle_state)),
                 "world_revision": self.world_revision,
                 "lock_info": self.lock_info.to_dict() if self.lock_info else None,
@@ -518,6 +529,8 @@ class Session:
             session.world_locked = metadata.get("world_locked", False)
             session.locked_mesh_version = metadata.get("locked_mesh_version")
             session.mesh_version = metadata.get("mesh_version", session.mesh_version)
+            session.locked_snapshot_revision = metadata.get("locked_snapshot_revision")
+            session.current_structure_revision = metadata.get("current_structure_revision")
             try:
                 session.lifecycle_state = SessionState(
                     metadata.get("lifecycle_state")
@@ -556,11 +569,18 @@ class Session:
 
 
 class SessionManager:
-    def __init__(self, base_dir: str = "/tmp/ai_brain_sessions", session_timeout: int = 60 * 60 * 12):
+    def __init__(
+        self,
+        base_dir: str = "/tmp/ai_brain_sessions",
+        session_timeout: int = 60 * 60 * 12,
+        snapshot_dir: str = DEFAULT_SNAPSHOT_DIR,
+    ):
         self.sessions: Dict[str, Session] = {}
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.session_timeout = session_timeout
+        self.snapshot_dir = Path(snapshot_dir)
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     def create_session(self) -> str:
         session_id = f"session_{uuid4().hex[:10]}"
@@ -615,10 +635,10 @@ class SessionManager:
         session = self.get_session(session_id)
         if not session:
             # allow listing even if session not loaded in RAM
-            if list_world_snapshots is None:
+            if list_snapshots is None:
                 return []
             try:
-                return list_world_snapshots(session_id, base_dir=base_dir)
+                return list_snapshots(session_id, root_dir=base_dir)
             except Exception:
                 return []
         return session.list_world_snapshots(base_dir=base_dir)
@@ -631,6 +651,47 @@ class SessionManager:
         if ok:
             self.auto_save_session(session_id)
         return ok
+
+    # Stage 10 convenience API
+    def commit_world_snapshot(self, session_id: str, reason: str = "manual") -> str:
+        meta = self.commit_snapshot(session_id, base_dir=str(self.snapshot_dir), reason=reason)
+        revision = meta.get("revision")
+        if not revision:
+            raise ValueError("Snapshot commit failed")
+        self.auto_save_session(session_id)
+        return str(revision)
+
+    def list_world_snapshots(self, session_id: str) -> List[Dict[str, Any]]:
+        return self.list_snapshots(session_id, base_dir=str(self.snapshot_dir))
+
+    def restore_world_snapshot(self, session_id: str, revision: str) -> bool:
+        ok = self.restore_snapshot(session_id, revision=revision, base_dir=str(self.snapshot_dir))
+        if ok:
+            self.auto_save_session(session_id)
+        return ok
+
+    def lock_session(self, session_id: str, reason: str = "lock") -> Dict[str, Any]:
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError("Session not found")
+        lock_state = session.lock_world(reason=reason)
+        revision = self.commit_world_snapshot(session_id, reason=f"lock:{reason}")
+        session.locked_snapshot_revision = revision
+        self.auto_save_session(session_id)
+        return {
+            "locked": True,
+            "mesh_version": lock_state.get("locked_mesh_version"),
+            "snapshot_revision": revision,
+        }
+
+    def unlock_session(self, session_id: str) -> Dict[str, Any]:
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError("Session not found")
+        session.unlock_world(reason="unlock")
+        session.locked_snapshot_revision = None
+        self.auto_save_session(session_id)
+        return {"locked": False}
 
     def save_to_disk(self, session: Session) -> bool:
         return session.save_to_disk(str(self.base_dir))
