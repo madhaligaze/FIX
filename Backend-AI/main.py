@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from api.routes_export import router as export_router
+from api.routes_legacy import router as legacy_router
 from api.routes_planning import router as planning_router
 from api.routes_session import router as session_router
 from api.state import RuntimeState
@@ -28,8 +29,9 @@ app.state.runtime = init_runtime()
 app.include_router(session_router)
 app.include_router(planning_router)
 app.include_router(export_router)
+app.include_router(legacy_router)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": app.version, "modules": {"legacy": True, "pipeline": True}}

@@ -6,7 +6,7 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from contracts.frame_packet import AnchorPoint, FramePacketMeta
 from policy.unknown_space import apply_unknown_policy
 from scanning.readiness import compute_readiness
-from trace.decision_trace import add_trace_event
+from api.ingest import ingest_frame
 
 router = APIRouter(tags=["session"])
 
@@ -52,15 +52,9 @@ async def post_frame(
         raise HTTPException(status_code=400, detail="pointcloud file is required when pointcloud_meta is provided")
 
     session_id = meta_payload.session_id
-    state.get_world(session_id)
-    state.anchors.setdefault(session_id, [])
-    state.traces.setdefault(session_id, [])
     rgb_bytes = await rgb.read()
     meta_dict = meta_payload.model_dump()
-    state.store.save_frame(session_id, meta_payload.frame_id, meta_dict, rgb_bytes, depth_bytes, pointcloud_bytes)
-    state.get_world(session_id).update_from_frame(meta_dict, rgb_bytes, depth_bytes, pointcloud_bytes)
-    add_trace_event(state.traces[session_id], "frame_ingested", {"frame_id": meta_payload.frame_id})
-    return {"status": "ok"}
+    return ingest_frame(state, session_id, meta_payload.frame_id, meta_dict, rgb_bytes, depth_bytes, pointcloud_bytes)
 
 
 @router.post("/session/anchors")

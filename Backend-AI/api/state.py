@@ -16,6 +16,7 @@ class RuntimeState:
     anchors: dict[str, list[dict]] = field(default_factory=dict)
     traces: dict[str, list[dict]] = field(default_factory=dict)
     last_rev: dict[str, str] = field(default_factory=dict)
+    restored_revision_state: dict[str, dict] = field(default_factory=dict)
     perception_unavailable: bool = False
 
     def get_world(self, session_id: str) -> WorldModel:
