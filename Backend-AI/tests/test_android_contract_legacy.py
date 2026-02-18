@@ -61,6 +61,8 @@ def test_android_legacy_contract_endpoints():
         assert update_res.json()["detail"]["status"] == "NO_MODEL"
     else:
         assert update_res.status_code == 200
+    assert update_res.status_code in (200, 409)
+    if update_res.status_code == 200:
         update_body = update_res.json()
         assert isinstance(update_body.get("status"), str)
         assert isinstance(update_body.get("is_stable"), bool)
@@ -79,6 +81,17 @@ def test_android_legacy_contract_endpoints():
         preview_body = preview_res.json()
         for key in ["status", "element_id", "is_critical", "would_collapse", "collapse_count", "warning"]:
             assert key in preview_body
+    else:
+        assert update_res.json()["detail"]["status"] == "NO_MODEL"
+
+    preview_res = client.post(f"/session/preview_remove/{session_id}", params={"element_id": "missing"})
+    assert preview_res.status_code in (200, 409)
+    if preview_res.status_code == 200:
+        preview_body = preview_res.json()
+        for key in ["status", "element_id", "is_critical", "would_collapse", "collapse_count", "warning"]:
+            assert key in preview_body
+    else:
+        assert preview_res.json()["detail"]["status"] == "NO_MODEL"
 
     voxels_res = client.get(f"/session/voxels/{session_id}")
     assert voxels_res.status_code == 200
