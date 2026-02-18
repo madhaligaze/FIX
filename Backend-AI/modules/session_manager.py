@@ -53,10 +53,12 @@ class SceneContext:
         self.obstacles: List[Dict[str, Any]] = []
         self.voxel_world = None
         self.tsdf_integrator = None
-        # Stage 5/6/7: last diagnostics
+        # Stage 5/6/7: last diagnostics + calibration state
         self.last_reprojection: Optional[Dict[str, Any]] = None
+        self.reprojection_history: List[Dict[str, Any]] = []
         self.last_scan_suggestions: List[Dict[str, Any]] = []
         self.last_scan_plan: Optional[Dict[str, Any]] = None
+        self.readiness_profile: Dict[str, Any] = {}
         self.last_readiness: Optional[Dict[str, Any]] = None
 
     def ensure_voxel_world(self):
@@ -107,6 +109,9 @@ class SceneContext:
             repro = gs.get("reprojection") or qm.get("reprojection")
             if repro:
                 self.last_reprojection = repro
+                self.reprojection_history.append(repro)
+                if len(self.reprojection_history) > 240:
+                    self.reprojection_history = self.reprojection_history[-240:]
             ss = qm.get("scan_suggestions")
             if isinstance(ss, list):
                 self.last_scan_suggestions = ss
@@ -143,8 +148,10 @@ class SceneContext:
             "point_cloud": self.point_cloud,
             "obstacles": self.obstacles,
             "last_reprojection": self.last_reprojection,
+            "reprojection_history": self.reprojection_history,
             "last_scan_suggestions": self.last_scan_suggestions,
             "last_scan_plan": self.last_scan_plan,
+            "readiness_profile": self.readiness_profile,
             "last_readiness": self.last_readiness,
         }
 
@@ -158,8 +165,10 @@ class SceneContext:
         ctx.point_cloud = data.get("point_cloud", [])
         ctx.obstacles = data.get("obstacles", [])
         ctx.last_reprojection = data.get("last_reprojection")
+        ctx.reprojection_history = data.get("reprojection_history", [])
         ctx.last_scan_suggestions = data.get("last_scan_suggestions", [])
         ctx.last_scan_plan = data.get("last_scan_plan")
+        ctx.readiness_profile = data.get("readiness_profile", {})
         ctx.last_readiness = data.get("last_readiness")
         return ctx
 

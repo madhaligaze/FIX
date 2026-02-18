@@ -1,334 +1,207 @@
-"""Stage 6.2 - Active scanning plan.
+"""Stage 6: Active scanning.
 
-Stage 6 baseline:
-- Cluster scan_suggestions (3D points) and return one view per top cluster.
-
-Stage 6.2 improvements:
-- Generate multiple candidate views per cluster (azimuth offsets + distance ring).
-- Score candidates with a conservative visibility model:
-  * Hard penalty if line-of-sight is blocked by OCCUPIED voxels.
-  * Penalty proportional to UNKNOWN density along the ray.
-  * Penalty if candidate position is inside/near OCCUPIED.
-- Pick the top-N diverse views across clusters.
-
-Notes
------
-- This module avoids heavy dependencies. It uses numpy only.
-- We assume ARCore-like world axis where Y is roughly "up". If your project uses
-  a different convention, adjust rotation/projection helpers.
+Transforms raw scan suggestions into a small number of actionable view prompts.
 """
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-import math
 import numpy as np
 
-from modules.information_gain import TargetBox, estimate_information_gain
+
+@dataclass
+class Cluster:
+    id: int
+    centroid: np.ndarray
+    count: int
+    reasons: Dict[str, int]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": int(self.id),
+            "centroid": {"x": float(self.centroid[0]), "y": float(self.centroid[1]), "z": float(self.centroid[2])},
+            "count": int(self.count),
+            "reasons": dict(self.reasons),
+        }
 
 
-def _vec3(p: Dict[str, Any]) -> np.ndarray:
-    return np.array([float(p.get("x", 0.0)), float(p.get("y", 0.0)), float(p.get("z", 0.0))], dtype=float)
+def _dist(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b))
 
 
-def _normalize(v: np.ndarray) -> np.ndarray:
-    n = float(np.linalg.norm(v))
-    if n <= 1e-9:
-        return v
-    return v / n
-
-
-def _project_xz(v: np.ndarray) -> np.ndarray:
-    return np.array([float(v[0]), 0.0, float(v[2])], dtype=float)
-
-
-def _rotate_y(v: np.ndarray, angle_rad: float) -> np.ndarray:
-    c = math.cos(angle_rad)
-    s = math.sin(angle_rad)
-    x, y, z = float(v[0]), float(v[1]), float(v[2])
-    return np.array([c * x + s * z, y, -s * x + c * z], dtype=float)
-
-
-def _cluster_points_grid(points: List[Dict[str, Any]], cell_m: float = 0.8) -> List[Dict[str, Any]]:
-    """Cluster points by coarse 3D grid with NumPy grouping."""
-    if not points:
-        return []
-
-    raw_pts: List[List[float]] = []
-    severities: List[float] = []
+def cluster_suggestions(
+    suggestions: List[Dict[str, Any]],
+    radius_m: float = 0.6,
+    min_cluster_size: int = 3,
+    max_clusters: int = 12,
+) -> List[Cluster]:
+    pts: List[np.ndarray] = []
     reasons: List[str] = []
-
-    for s in points:
-        p = s.get("point") or s
-        if not isinstance(p, dict):
+    for s in suggestions:
+        try:
+            p = s.get("point") if isinstance(s, dict) else None
+            if isinstance(p, dict):
+                pts.append(np.array([float(p.get("x")), float(p.get("y")), float(p.get("z"))], dtype=np.float32))
+            else:
+                pts.append(np.array([float(s.get("x")), float(s.get("y")), float(s.get("z"))], dtype=np.float32))
+            reasons.append(str(s.get("reason") or "unknown"))
+        except Exception:
             continue
-        raw_pts.append([float(p.get("x", 0.0)), float(p.get("y", 0.0)), float(p.get("z", 0.0))])
-        severities.append(float(s.get("severity", 0.5)))
-        reasons.append(str(s.get("reason", "unknown")))
 
-    if not raw_pts:
+    if not pts:
         return []
 
-    pts = np.asarray(raw_pts, dtype=np.float64)
-    sev = np.asarray(severities, dtype=np.float64)
-    keys = np.floor(pts / float(cell_m)).astype(np.int64)
+    assigned = [False] * len(pts)
+    clusters: List[Cluster] = []
+    cid = 0
 
-    unique_keys, inverse = np.unique(keys, axis=0, return_inverse=True)
-    counts = np.bincount(inverse)
-    sev_sums = np.bincount(inverse, weights=sev)
+    for i, p in enumerate(pts):
+        if assigned[i]:
+            continue
+        members = [i]
+        assigned[i] = True
+        changed = True
+        while changed:
+            changed = False
+            c = np.mean([pts[j] for j in members], axis=0)
+            for k, pk in enumerate(pts):
+                if assigned[k]:
+                    continue
+                if _dist(pk, c) <= float(radius_m):
+                    assigned[k] = True
+                    members.append(k)
+                    changed = True
 
-    centers = np.zeros((unique_keys.shape[0], 3), dtype=np.float64)
-    np.add.at(centers, inverse, pts)
-    centers /= counts[:, None]
+        if len(members) < int(min_cluster_size):
+            for j in members:
+                assigned[j] = False
+            continue
 
-    clusters: List[Dict[str, Any]] = []
-    for i in range(unique_keys.shape[0]):
-        idxs = np.where(inverse == i)[0]
-        reason_counts: Dict[str, int] = {}
-        for idx in idxs:
-            r = reasons[int(idx)]
-            reason_counts[r] = reason_counts.get(r, 0) + 1
+        centroid = np.mean([pts[j] for j in members], axis=0)
+        rmap: Dict[str, int] = {}
+        for j in members:
+            rmap[reasons[j]] = rmap.get(reasons[j], 0) + 1
 
-        count = int(counts[i])
-        severity = float(sev_sums[i] / max(count, 1))
-        center = centers[i]
-        clusters.append(
-            {
-                "center": {"x": float(center[0]), "y": float(center[1]), "z": float(center[2])},
-                "count": count,
-                "severity": severity,
-                "reasons": reason_counts,
-                "priority": float(count) * (0.5 + severity),
-            }
-        )
+        clusters.append(Cluster(id=cid, centroid=centroid, count=len(members), reasons=rmap))
+        cid += 1
+        if len(clusters) >= int(max_clusters):
+            break
 
-    clusters.sort(key=lambda c: float(c.get("priority", 0.0)), reverse=True)
+    if not clusters:
+        centroid = np.mean(pts, axis=0)
+        rmap: Dict[str, int] = {}
+        for r in reasons:
+            rmap[r] = rmap.get(r, 0) + 1
+        clusters = [Cluster(id=0, centroid=centroid, count=len(pts), reasons=rmap)]
+
     return clusters
 
 
-def _candidate_positions(
-    target: np.ndarray,
-    cam_pos: Optional[np.ndarray],
-    distance_m: float,
-    angles_deg: Tuple[float, ...],
-    distance_multipliers: Tuple[float, ...],
-) -> List[np.ndarray]:
-    """Generate candidate camera positions on a ring around the target."""
-    if cam_pos is None:
-        base_dir = np.array([0.0, 0.0, -1.0], dtype=float)
-        base_height = float(target[1]) + 0.2
-    else:
-        base_dir = cam_pos - target
-        base_height = float(cam_pos[1])
-
-    # Prefer lateral moves: project onto XZ and renormalize.
-    base_dir = _project_xz(base_dir)
-    if float(np.linalg.norm(base_dir)) <= 1e-6:
-        base_dir = np.array([0.0, 0.0, -1.0], dtype=float)
-
-    base_dir = _normalize(base_dir)
-
-    candidates: List[np.ndarray] = []
-    for mul in distance_multipliers:
-        d = float(distance_m) * float(mul)
-        for a in angles_deg:
-            v = _rotate_y(base_dir, math.radians(float(a)))
-            v = _normalize(_project_xz(v))
-            pos = target + v * d
-            pos[1] = base_height
-            candidates.append(pos)
-
-    return candidates
+def _yaw_pitch_from_vec(v: np.ndarray) -> Tuple[float, float]:
+    vx, vy, vz = float(v[0]), float(v[1]), float(v[2])
+    yaw = math.degrees(math.atan2(vy, vx))
+    horiz = math.sqrt(vx * vx + vy * vy)
+    pitch = math.degrees(math.atan2(vz, max(1e-6, horiz)))
+    return yaw, pitch
 
 
-def _score_candidate(
-    voxel_world: Any,
-    pos: np.ndarray,
-    target: np.ndarray,
-    cluster_priority: float,
-    default_distance_m: float,
-    target_box: Optional[Dict[str, Any]] = None,
-    gain_weight: float = 8.0,
-    gain_samples: int = 220,
-) -> Tuple[float, Dict[str, Any]]:
-    """Compute a conservative score for a candidate view.
-
-    Adds a Stage 7 information-gain proxy when target_box is available.
-    """
-    dist = float(np.linalg.norm(pos - target))
-    score = float(cluster_priority)
-    diag: Dict[str, Any] = {"distance_m": dist}
-
-    # Distance penalty (keep around default).
-    score -= 0.5 * abs(dist - float(default_distance_m))
-
-    if voxel_world is None:
-        diag["has_world"] = False
-        return score, diag
-
-    diag["has_world"] = True
-
-    # Penalize if camera position is inside occupied.
+def _score_view(voxel_world, cam_pos: np.ndarray, target: np.ndarray) -> float:
     try:
-        st = int(voxel_world.get_state(float(pos[0]), float(pos[1]), float(pos[2])))
-        diag["pos_state"] = st
-        if st == getattr(voxel_world, "OCCUPIED", 1):
-            score -= 20.0
-            diag["pos_penalty"] = 20.0
+        if voxel_world.is_blocked(float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]), unknown_is_blocked=False):
+            return -1e9
     except Exception:
         pass
 
-    # Hard penalty if line-of-sight is blocked by occupied.
-    blocked = False
+    ray = target - cam_pos
+    dist = float(np.linalg.norm(ray))
+    if dist <= 1e-3:
+        return -1e9
+    dirn = ray / dist
+
+    unknown_ratio = 0.0
     try:
-        blocked = bool(
-            voxel_world.is_blocked(
-                (float(pos[0]), float(pos[1]), float(pos[2])),
-                (float(target[0]), float(target[1]), float(target[2])),
-                clearance=0.03,
-                unknown_is_blocked=False,
-            )
-        )
+        unknown_ratio = float(voxel_world.unknown_ratio_along_ray(tuple(cam_pos), tuple(dirn), max_dist=dist))
     except Exception:
-        blocked = False
+        unknown_ratio = 0.5
 
-    diag["los_blocked"] = blocked
-    if blocked:
-        score -= 10.0
-
-    # Penalize UNKNOWN density along the segment.
+    hit_d = None
     try:
-        unk = float(
-            voxel_world.segment_unknown_ratio(
-                (float(pos[0]), float(pos[1]), float(pos[2])),
-                (float(target[0]), float(target[1]), float(target[2])),
-                sample_step_m=max(0.5 * float(getattr(voxel_world, "resolution", 0.1)), 0.05),
-            )
-        )
-        diag["unknown_ratio"] = unk
-        score -= 5.0 * unk
+        hit_d = voxel_world.raycast_distance(tuple(cam_pos), tuple(dirn), max_dist=dist, unknown_is_blocked=False)
     except Exception:
-        pass
+        hit_d = None
 
-    # Stage 7: Information gain proxy in the planning target region.
-    if target_box:
-        try:
-            c = target_box.get("center") or {}
-            h = target_box.get("half_extents") or target_box.get("half_extents_m") or {}
-            box = TargetBox(
-                center=(float(c.get("x", 0.0)), float(c.get("y", 0.0)), float(c.get("z", 0.0))),
-                half_extents=(float(h.get("x", 0.0)), float(h.get("y", 0.0)), float(h.get("z", 0.0))),
-            )
-            gain, gdiag = estimate_information_gain(
-                voxel_world=voxel_world,
-                camera_pos=(float(pos[0]), float(pos[1]), float(pos[2])),
-                box=box,
-                max_samples=int(gain_samples),
-            )
-            diag["info_gain"] = float(gain)
-            diag["info_gain_diag"] = gdiag
-            score += float(gain_weight) * float(gain)
-        except Exception:
-            pass
+    occluded = 1.0 if (hit_d is not None and float(hit_d) < dist - voxel_world.resolution * 2) else 0.0
 
-    return score, diag
+    score = 0.0
+    score += max(0.0, 4.0 - abs(dist - 1.6))
+    score -= 6.0 * unknown_ratio
+    score -= 8.0 * occluded
+
+    return float(score)
 
 
-def propose_views(
-    scan_suggestions: List[Dict[str, Any]],
-    current_pose: Optional[List[float]],
-    voxel_world: Any = None,
-    target_box: Optional[Dict[str, Any]] = None,
-    gain_weight: float = 8.0,
-    gain_samples: int = 220,
-    default_distance_m: float = 1.6,
+def build_scan_plan(
+    *,
+    voxel_world,
+    suggestions: Optional[List[Dict[str, Any]]] = None,
+    scan_suggestions: Optional[List[Dict[str, Any]]] = None,
     max_views: int = 3,
-    angles_deg: Tuple[float, ...] = (0.0, 25.0, -25.0, 55.0, -55.0, 180.0),
-    distance_multipliers: Tuple[float, ...] = (1.0, 1.25),
-    max_clusters: int = 5,
-    min_view_separation_m: float = 0.8,
+    cluster_radius_m: float = 0.6,
+    distance_m: float = 1.6,
+    angles_deg: Optional[List[float]] = None,
+    height_offset_m: float = 0.2,
 ) -> Dict[str, Any]:
-    """Return clusters and next-best-view proposals.
-
-    Each view includes:
-    - position: {x,y,z}
-    - look_at: {x,y,z}
-    - reason: string
-    - score: float
-    - priority: float (cluster priority)
-    - diagnostics: {..}
-
-    We pick `max_views` views globally (not per-cluster) but we keep the
-    cluster info in each entry.
-    """
-    clusters = _cluster_points_grid(scan_suggestions, cell_m=0.8)
-
     if angles_deg is None:
-        angles_deg = (0.0, 25.0, -25.0, 55.0, -55.0, 180.0)
-    if distance_multipliers is None:
-        distance_multipliers = (1.0, 1.25)
-    if not clusters:
-        return {"clusters": [], "next_best_views": []}
+        angles_deg = [0.0, 30.0, -30.0, 60.0, -60.0]
 
-    cam_pos = None
-    if current_pose and len(current_pose) >= 3:
-        cam_pos = np.array([float(current_pose[0]), float(current_pose[1]), float(current_pose[2])], dtype=float)
+    src = suggestions if suggestions is not None else (scan_suggestions or [])
+    clusters = cluster_suggestions(src, radius_m=cluster_radius_m)
 
     candidates: List[Dict[str, Any]] = []
+    for c in clusters:
+        target = c.centroid
+        for ang in angles_deg:
+            theta = math.radians(float(ang))
+            offset = np.array([math.cos(theta) * distance_m, math.sin(theta) * distance_m, 0.0], dtype=np.float32)
+            cam_pos = target + offset
+            cam_pos[2] = target[2] + float(height_offset_m)
 
-    for c in clusters[: max(1, int(max_clusters))]:
-        target = _vec3(c["center"])
-        cand_positions = _candidate_positions(
-            target=target,
-            cam_pos=cam_pos,
-            distance_m=float(default_distance_m),
-            angles_deg=tuple(float(a) for a in angles_deg),
-            distance_multipliers=tuple(float(m) for m in distance_multipliers),
-        )
+            score = _score_view(voxel_world, cam_pos, target)
+            if score < -1e8:
+                continue
 
-        for pos in cand_positions:
-            sc, diag = _score_candidate(
-                voxel_world=voxel_world,
-                pos=pos,
-                target=target,
-                cluster_priority=float(c.get("priority", 0.0)),
-                default_distance_m=float(default_distance_m),
-                target_box=target_box,
-                gain_weight=float(gain_weight),
-                gain_samples=int(gain_samples),
-            )
+            yaw, pitch = _yaw_pitch_from_vec(target - cam_pos)
+
             candidates.append(
                 {
-                    "position": {"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])},
+                    "position": {"x": float(cam_pos[0]), "y": float(cam_pos[1]), "z": float(cam_pos[2])},
                     "look_at": {"x": float(target[0]), "y": float(target[1]), "z": float(target[2])},
-                    "reason": "scan_cluster",
-                    "score": float(sc),
-                    "priority": float(c.get("priority", 0.0)),
-                    "cluster": c,
-                    "diagnostics": diag,
+                    "yaw_deg": float(yaw),
+                    "pitch_deg": float(pitch),
+                    "score": float(score),
+                    "target_cluster_id": int(c.id),
                 }
             )
 
-    # Sort by score.
-    candidates.sort(key=lambda v: float(v.get("score", 0.0)), reverse=True)
+    candidates.sort(key=lambda x: x.get("score", -1e9), reverse=True)
 
-    # Greedy pick diverse views.
-    picked: List[Dict[str, Any]] = []
+    chosen: List[Dict[str, Any]] = []
+    used_clusters: set[int] = set()
     for cand in candidates:
-        if len(picked) >= int(max_views):
+        if len(chosen) >= int(max_views):
             break
-        p = cand.get("position") or {}
-        pvec = np.array([float(p.get("x", 0.0)), float(p.get("y", 0.0)), float(p.get("z", 0.0))], dtype=float)
+        cid = int(cand.get("target_cluster_id", -1))
+        if cid in used_clusters and len(used_clusters) < len(clusters):
+            continue
+        chosen.append(cand)
+        used_clusters.add(cid)
 
-        ok = True
-        for prev in picked:
-            q = prev.get("position") or {}
-            qvec = np.array([float(q.get("x", 0.0)), float(q.get("y", 0.0)), float(q.get("z", 0.0))], dtype=float)
-            if float(np.linalg.norm(pvec - qvec)) < float(min_view_separation_m):
-                ok = False
-                break
-        if ok:
-            picked.append(cand)
+    return {"clusters": [c.to_dict() for c in clusters], "next_best_views": chosen}
 
-    return {"clusters": clusters, "next_best_views": picked}
+
+def propose_views(scan_suggestions: List[Dict[str, Any]], current_pose: Optional[List[float]], voxel_world: Any = None, **kwargs) -> Dict[str, Any]:
+    del current_pose, kwargs
+    return build_scan_plan(voxel_world=voxel_world, scan_suggestions=scan_suggestions)
