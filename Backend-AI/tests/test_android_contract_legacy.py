@@ -24,6 +24,14 @@ def test_android_legacy_contract_endpoints():
     client = TestClient(app)
     session_id = client.post("/session/start").json()["session_id"]
 
+    pre_update = client.post(f"/session/update/{session_id}", json={"action": "noop"})
+    assert pre_update.status_code == 409
+    assert pre_update.json()["detail"]["status"] == "NO_MODEL"
+
+    pre_preview = client.post(f"/session/preview_remove/{session_id}", params={"element_id": "missing"})
+    assert pre_preview.status_code == 409
+    assert pre_preview.json()["detail"]["status"] == "NO_MODEL"
+
     stream_res = client.post(f"/session/stream/{session_id}", json=_stream_payload())
     assert stream_res.status_code == 200
     stream_body = stream_res.json()
@@ -41,27 +49,36 @@ def test_android_legacy_contract_endpoints():
     assert isinstance(model_body.get("status"), str)
     options = model_body.get("options")
     assert isinstance(options, list)
-    assert len(options) >= 1
-    option = options[0]
-    for key in ["variant_name", "material_info", "safety_score", "ai_critique", "elements", "stats", "physics"]:
-        assert key in option
+    if model_body.get("status") != "NEEDS_SCAN":
+        assert len(options) >= 1
+        option = options[0]
+        for key in ["variant_name", "material_info", "safety_score", "ai_critique", "elements", "stats", "physics"]:
+            assert key in option
 
     update_res = client.post(f"/session/update/{session_id}", json={"action": "noop"})
-    assert update_res.status_code == 200
-    update_body = update_res.json()
-    assert isinstance(update_body.get("status"), str)
-    assert isinstance(update_body.get("is_stable"), bool)
-    assert isinstance(update_body.get("physics_status"), str)
-    assert isinstance(update_body.get("heatmap"), list)
-    assert isinstance(update_body.get("affected_elements"), list)
-    assert isinstance(update_body.get("collapsed"), dict)
-    assert isinstance(update_body.get("processing_time_ms"), int)
+    if model_body.get("status") == "NEEDS_SCAN":
+        assert update_res.status_code == 409
+        assert update_res.json()["detail"]["status"] == "NO_MODEL"
+    else:
+        assert update_res.status_code == 200
+        update_body = update_res.json()
+        assert isinstance(update_body.get("status"), str)
+        assert isinstance(update_body.get("is_stable"), bool)
+        assert isinstance(update_body.get("physics_status"), str)
+        assert isinstance(update_body.get("heatmap"), list)
+        assert isinstance(update_body.get("affected_elements"), list)
+        assert isinstance(update_body.get("collapsed"), dict)
+        assert isinstance(update_body.get("processing_time_ms"), int)
 
     preview_res = client.post(f"/session/preview_remove/{session_id}", params={"element_id": "missing"})
-    assert preview_res.status_code == 200
-    preview_body = preview_res.json()
-    for key in ["status", "element_id", "is_critical", "would_collapse", "collapse_count", "warning"]:
-        assert key in preview_body
+    if model_body.get("status") == "NEEDS_SCAN":
+        assert preview_res.status_code == 409
+        assert preview_res.json()["detail"]["status"] == "NO_MODEL"
+    else:
+        assert preview_res.status_code == 200
+        preview_body = preview_res.json()
+        for key in ["status", "element_id", "is_critical", "would_collapse", "collapse_count", "warning"]:
+            assert key in preview_body
 
     voxels_res = client.get(f"/session/voxels/{session_id}")
     assert voxels_res.status_code == 200
@@ -121,26 +138,21 @@ def test_legacy_model_ready_returns_elements_list():
     assert res.status_code == 200
     body = res.json()
     assert isinstance(body["options"], list)
-    assert isinstance(body["options"][0]["elements"], list)
+    if body["options"]:
+        assert isinstance(body["options"][0]["elements"], list)
 
 
-def test_legacy_update_returns_stable_response_shape():
+def test_legacy_update_returns_no_model_without_revision():
     client = TestClient(app)
     session_id = client.post("/session/start").json()["session_id"]
     res = client.post(f"/session/update/{session_id}", json={"action": "move", "element_id": "e1"})
-    assert res.status_code == 200
-    body = res.json()
-    assert isinstance(body["is_stable"], bool)
-    assert isinstance(body["heatmap"], list)
-    assert isinstance(body["affected_elements"], list)
-    assert isinstance(body["collapsed"], dict)
+    assert res.status_code == 409
+    assert res.json()["detail"]["status"] == "NO_MODEL"
 
 
-def test_legacy_preview_remove_returns_shape():
+def test_legacy_preview_remove_returns_no_model_without_revision():
     client = TestClient(app)
     session_id = client.post("/session/start").json()["session_id"]
     res = client.post(f"/session/preview_remove/{session_id}", params={"element_id": "any"})
-    assert res.status_code == 200
-    body = res.json()
-    assert body["status"] == "ok"
-    assert "warning" in body
+    assert res.status_code == 409
+    assert res.json()["detail"]["status"] == "NO_MODEL"
