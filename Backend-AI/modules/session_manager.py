@@ -79,10 +79,6 @@ class SceneContext:
                 self.tsdf_integrator = TSDFIntegrator()
             except Exception:
                 self.tsdf_integrator = None
-        # Stage 5/6/7: last diagnostics
-        self.last_reprojection: Optional[Dict[str, Any]] = None
-        self.last_scan_suggestions: List[Dict[str, Any]] = []
-        self.last_scan_plan: Optional[Dict[str, Any]] = None
         return self.tsdf_integrator
 
     def ensure_perception_backend(self):
