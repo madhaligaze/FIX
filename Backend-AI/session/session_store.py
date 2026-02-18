@@ -20,6 +20,7 @@ class SessionStore:
         ensure_dirs(self.root / session_id / "frames")
         ensure_dirs(self.root / session_id / "world")
         ensure_dirs(self.root / session_id / "exports")
+        ensure_dirs(self.root / session_id / "anchors")
         return session_id
 
     def session_root(self, session_id: str) -> Path:
@@ -33,14 +34,18 @@ class SessionStore:
         rgb_bytes: bytes,
         depth_bytes: bytes | None = None,
         pointcloud_bytes: bytes | None = None,
+        *,
+        validated_meta: dict[str, Any] | None = None,
     ) -> None:
         base = ensure_dirs(self.session_root(session_id) / "frames" / frame_id)
         save_json(base / "meta.json", meta)
+        if validated_meta is not None:
+            save_json(base / "validated_meta.json", validated_meta)
         save_bytes(base / "rgb.jpg", rgb_bytes)
         if depth_bytes is not None:
             save_bytes(base / "depth.u16", depth_bytes)
         if pointcloud_bytes is not None:
-            save_bytes(base / "pointcloud.npy", pointcloud_bytes)
+            save_bytes(base / "pointcloud.bin", pointcloud_bytes)
 
     def save_anchors(self, session_id: str, anchors: list[dict[str, Any]]) -> None:
         save_json(self.session_root(session_id) / "anchors" / "anchors.json", anchors)
@@ -67,9 +72,6 @@ class SessionStore:
         return rev_id
 
     def save_export(self, session_id: str, rev_id: str, bundle: dict[str, Any]) -> None:
-        """
-        Persist export bundle as the stable handoff artifact for Android.
-        """
         base = ensure_dirs(self.session_root(session_id) / "exports" / rev_id)
         save_json(base / "scene_bundle.json", bundle)
         # Backward compatibility for legacy code paths.
