@@ -8,8 +8,8 @@ from fastapi.staticfiles import StaticFiles
 
 from api.routes_export import router as export_router
 from api.routes_legacy import router as legacy_router
-from api.routes_planning import router as planning_router
-from api.routes_session import router as session_router
+from api.routes_planning_v2 import router as planning_router
+from api.routes_session_v2 import router as session_router
 from api.state import RuntimeState
 
 
