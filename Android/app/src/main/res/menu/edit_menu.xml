@@ -4,4 +4,8 @@
         android:id="@+id/action_toggle_mode"
         android:title="🎬 Режим: EDIT"
         android:showAsAction="always"/>
+    <item
+        android:id="@+id/action_layers"
+        android:title="Layers"
+        android:showAsAction="never"/>
 </menu>

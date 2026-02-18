@@ -25,9 +25,12 @@ networkx==3.2.1
 # WebSocket support
 websockets==12.0
 
+# Optimization (Stage H)
+ortools==9.9.3963
+
 # Computer Vision (опционально, если используется YOLO)
-# opencv-python==4.9.0.80
-# ultralytics==8.1.0  # YOLOv8
+opencv-python-headless==4.9.0.80
+ultralytics==8.1.0  # YOLOv8-seg
 
 # Utilities
 httpx==0.27.2

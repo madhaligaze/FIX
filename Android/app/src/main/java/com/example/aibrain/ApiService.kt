@@ -51,6 +51,11 @@ interface ApiService {
     suspend fun getVoxels(
         @Path("session_id") sessionId: String
     ): Response<VoxelResponse>
+
+    @GET("/session/{session_id}/export/latest")
+    suspend fun exportLatest(
+        @Path("session_id") sessionId: String
+    ): Response<SceneBundleResponse>
 }
 
 // ── Ответ /session/start ──────────────────────────────────────────────────────
@@ -181,4 +186,40 @@ data class VoxelItem(
 data class Bounds(
     val min: List<Float>,
     val max: List<Float>
+)
+
+
+data class SceneBundleResponse(
+    val session_id: String,
+    val revision_id: String? = null,
+    val rev_id: String? = null,
+    val env_mesh: EnvMeshFile? = null,
+    val ui: UiConfig? = null
+)
+
+data class EnvMeshFile(
+    val glb: LayerFile? = null,
+    val obj: LayerFile? = null,
+    val path: String? = null
+)
+
+data class UiConfig(
+    val layers: List<UiLayer>? = null
+)
+
+data class UiLayer(
+    val id: String,
+    val label: String? = null,
+    val kind: String? = null,
+    val default_on: Boolean? = null,
+    val file: UiLayerFile? = null
+)
+
+data class UiLayerFile(
+    val glb: LayerFile? = null,
+    val path: String? = null
+)
+
+data class LayerFile(
+    val path: String? = null
 )

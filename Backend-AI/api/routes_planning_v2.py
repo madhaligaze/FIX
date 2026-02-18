@@ -15,7 +15,8 @@ from scaffold.solver import generate_scaffold
 from scaffold.trace import trace_candidate_grid, trace_solver_start, trace_validator_result
 from scaffold.validators import validate_all
 from trace.decision_trace import add_trace_event
-from world.mesh_export import env_mesh_obj_bytes
+from export.overlays_export import export_clearance_violations_glb, export_unknown_heatmap_glb
+from world.mesh_export import env_mesh_glb_bytes, env_mesh_obj_bytes
 
 router = APIRouter(tags=["planning"])
 
@@ -115,6 +116,18 @@ def plan_scaffold(request: Request, payload: PlanPayload) -> dict[str, Any]:
         trace,
         env_mesh_bytes=env_mesh_bytes,
     )
+
+    world_dir = state.store.session_root(session_id) / "world" / rev_id
+    (world_dir / "env_mesh.glb").write_bytes(env_mesh_glb_bytes(world))
+    overlay_files = overlays.setdefault("overlay_files", {})
+    unknown = export_unknown_heatmap_glb(world, world_dir / "unknown_heatmap.glb")
+    clearance = export_clearance_violations_glb(
+        world,
+        world_dir / "clearance_violations.glb",
+        min_clearance_m=float(getattr(state.policy, "min_clearance_m", 0.2)),
+    )
+    overlay_files["unknown_heatmap"] = {"glb": {"path": unknown["path"]}}
+    overlay_files["clearance_violations"] = {"glb": {"path": clearance["path"]}}
     state.last_rev[session_id] = rev_id
 
     base = f"/sessions/{session_id}/world/{rev_id}"
@@ -123,6 +136,7 @@ def plan_scaffold(request: Request, payload: PlanPayload) -> dict[str, Any]:
         "rev_id": rev_id,
         "env": {
             "mesh_obj_url": f"{base}/env_mesh.obj",
+            "mesh_glb_url": f"{base}/env_mesh.glb",
             "overlays_url": f"{base}/overlays.json",
             "world_state_url": f"{base}/world_state.json",
             "trace_url": f"{base}/trace.json",
