@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import trimesh
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from export.overlays_export import export_clearance_violations_glb, export_unknown_heatmap_glb
 from policy.unknown_space import apply_unknown_policy
 from scanning.next_best_view import generate_scan_plan
 from scanning.readiness import compute_readiness
@@ -15,14 +17,24 @@ from scaffold.solver import generate_scaffold
 from scaffold.trace import trace_candidate_grid, trace_solver_start, trace_validator_result
 from scaffold.validators import validate_all
 from trace.decision_trace import add_trace_event
-from export.overlays_export import export_clearance_violations_glb, export_unknown_heatmap_glb
-from world.mesh_export import env_mesh_glb_bytes, env_mesh_obj_bytes
+from world.mesh_export import env_mesh_obj_bytes
 
 router = APIRouter(tags=["planning"])
 
 
 class ScaffoldRequest(BaseModel):
     session_id: str
+
+
+def _obj_bytes_to_glb(obj_bytes: bytes) -> bytes:
+    try:
+        obj_txt = obj_bytes.decode("utf-8", errors="ignore")
+        mesh = trimesh.load_mesh(trimesh.util.wrap_as_stream(obj_txt.encode("utf-8")), file_type="obj")
+        scene = trimesh.Scene()
+        scene.add_geometry(mesh, node_name="environment_mesh")
+        return scene.export(file_type="glb")
+    except Exception:
+        return trimesh.Scene().export(file_type="glb")
 
 
 @router.post("/planning/request_scaffold")
@@ -108,6 +120,7 @@ def plan_scaffold(request: Request, payload: PlanPayload) -> dict[str, Any]:
 
     overlays = world.compute_overlays(state.policy.__dict__)
     env_mesh_bytes = env_mesh_obj_bytes(world)
+    env_mesh_glb = _obj_bytes_to_glb(env_mesh_bytes)
 
     rev_id = state.store.lock_revision(
         session_id,
@@ -116,30 +129,72 @@ def plan_scaffold(request: Request, payload: PlanPayload) -> dict[str, Any]:
         trace,
         env_mesh_bytes=env_mesh_bytes,
     )
-
-    world_dir = state.store.session_root(session_id) / "world" / rev_id
-    (world_dir / "env_mesh.glb").write_bytes(env_mesh_glb_bytes(world))
-    overlay_files = overlays.setdefault("overlay_files", {})
-    unknown = export_unknown_heatmap_glb(world, world_dir / "unknown_heatmap.glb")
-    clearance = export_clearance_violations_glb(
-        world,
-        world_dir / "clearance_violations.glb",
-        min_clearance_m=float(getattr(state.policy, "min_clearance_m", 0.2)),
-    )
-    overlay_files["unknown_heatmap"] = {"glb": {"path": unknown["path"]}}
-    overlay_files["clearance_violations"] = {"glb": {"path": clearance["path"]}}
     state.last_rev[session_id] = rev_id
 
-    base = f"/sessions/{session_id}/world/{rev_id}"
+    world_dir = state.store.session_root(session_id) / "world" / rev_id
+    try:
+        world_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    (world_dir / "env_mesh.glb").write_bytes(env_mesh_glb)
+
+    min_clearance = float(getattr(state.policy, "min_clearance_m", 0.2))
+    unknown_glb = export_unknown_heatmap_glb(world, world_dir / "unknown_heatmap.glb", stride=2, max_voxels=25000)
+    clearance_glb = export_clearance_violations_glb(
+        world,
+        world_dir / "clearance_violations.glb",
+        min_clearance_m=min_clearance,
+        stride=2,
+        max_voxels=25000,
+    )
+
+    base_world = f"/sessions/{session_id}/world/{rev_id}"
+    base_exports = f"/sessions/{session_id}/exports/{rev_id}"
     scene_bundle = {
         "session_id": session_id,
         "rev_id": rev_id,
         "env": {
-            "mesh_obj_url": f"{base}/env_mesh.obj",
-            "mesh_glb_url": f"{base}/env_mesh.glb",
-            "overlays_url": f"{base}/overlays.json",
-            "world_state_url": f"{base}/world_state.json",
-            "trace_url": f"{base}/trace.json",
+            "mesh_obj_url": f"{base_world}/env_mesh.obj",
+            "mesh_glb_url": f"{base_world}/env_mesh.glb",
+            "overlays_url": f"{base_world}/overlays.json",
+            "world_state_url": f"{base_world}/world_state.json",
+            "trace_url": f"{base_world}/trace.json",
+            "trace_ndjson_url": f"{base_world}/trace.ndjson",
+        },
+        "ui": {
+            "bundle_version": "1.2",
+            "layers": [
+                {
+                    "id": "environment_mesh",
+                    "label": "Environment mesh",
+                    "kind": "mesh",
+                    "default_on": True,
+                    "file": {"glb": {"path": f"{base_world}/env_mesh.glb"}},
+                },
+                {"id": "scaffold", "label": "Scaffold", "kind": "model", "default_on": True},
+                {
+                    "id": "unknown_heatmap",
+                    "label": "Unknown space",
+                    "kind": "overlay",
+                    "default_on": False,
+                    "file": {"glb": {"path": f"{base_world}/unknown_heatmap.glb"}},
+                },
+                {
+                    "id": "clearance_violations",
+                    "label": "Clearance violations",
+                    "kind": "overlay",
+                    "default_on": True,
+                    "file": {"glb": {"path": f"{base_world}/clearance_violations.glb"}},
+                },
+                {
+                    "id": "trace",
+                    "label": "Decision trace",
+                    "kind": "debug",
+                    "default_on": False,
+                    "file": {"ndjson": {"path": f"{base_world}/trace.ndjson"}},
+                },
+            ],
         },
         "scaffold": {
             "elements": elements,
@@ -157,10 +212,28 @@ def plan_scaffold(request: Request, payload: PlanPayload) -> dict[str, Any]:
                 for c in ranked[:5]
             ],
         },
+        "overlay_files": {
+            "unknown_heatmap": {
+                "glb": {
+                    "path": f"{base_world}/unknown_heatmap.glb",
+                    "meta": {"count": unknown_glb.get("count"), "stride": unknown_glb.get("stride")},
+                }
+            },
+            "clearance_violations": {
+                "glb": {
+                    "path": f"{base_world}/clearance_violations.glb",
+                    "meta": {
+                        "count": clearance_glb.get("count"),
+                        "stride": clearance_glb.get("stride"),
+                        "min_clearance_m": clearance_glb.get("min_clearance_m"),
+                    },
+                }
+            },
+        },
         "meta": {"policy": state.policy.__dict__},
     }
 
     state.store.save_export(session_id, rev_id, scene_bundle)
-    add_trace_event(trace, "plan_export_saved", {"rev_id": rev_id})
+    add_trace_event(trace, "plan_export_saved", {"rev_id": rev_id, "bundle_path": f"{base_exports}/scene_bundle.json"})
 
     return {"status": "ok", "session_id": session_id, "rev_id": rev_id, "scene_bundle": scene_bundle}
