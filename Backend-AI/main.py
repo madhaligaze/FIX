@@ -21,6 +21,7 @@ import traceback
 import json
 import logging
 import os
+from pathlib import Path
 
 # Импорты исправленных модулей
 from modules.layher_standards import (
