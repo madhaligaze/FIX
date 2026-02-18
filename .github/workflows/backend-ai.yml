@@ -1,0 +1,46 @@
+name: backend-ai
+
+on:
+  push:
+    paths:
+      - "Backend-AI/**"
+      - ".github/workflows/backend-ai.yml"
+  pull_request:
+    paths:
+      - "Backend-AI/**"
+      - ".github/workflows/backend-ai.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r Backend-AI/requirements.txt
+
+      - name: Ruff
+        run: |
+          python -m ruff check Backend-AI
+
+      - name: Pytest
+        run: |
+          python -m pytest Backend-AI
+
+      - name: Black (advisory)
+        continue-on-error: true
+        run: |
+          python -m black --check Backend-AI || true
+          python -m black --check Backend-AI --diff || true
