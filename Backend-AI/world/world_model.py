@@ -1,104 +1,127 @@
 from __future__ import annotations
 
-import time
-from typing import Any
 import numpy as np
 
+from tracking.pose_quality import evaluate_pose_step
 from world.esdf import ESDF
 from world.occupancy import OccupancyGrid
 from world.tsdf_volume import TSDFVolume
 
 
 class WorldModel:
-    """
-    Core geometric state:
-      - Occupancy (UNKNOWN/FREE/OCCUPIED)
-      - TSDF (mesh)
-      - ESDF (clearance queries)
-      - Viewpoints history (for readiness gating + NBV)
-    """
-
-    def __init__(self, voxel_size: float, tsdf_trunc: float) -> None:
+    def __init__(self, *, voxel_size: float = 0.2, tsdf_trunc: float = 0.4) -> None:
         self.occupancy = OccupancyGrid(voxel_size=voxel_size)
-        self.tsdf = TSDFVolume(self.occupancy, truncation=tsdf_trunc)
+        self.tsdf = None
+        try:
+            self.tsdf = TSDFVolume(self.occupancy, truncation=tsdf_trunc)
+            self.metrics = {
+                "frames": 0,
+                "tsdf_available": True,
+                "tracking_quality": "UNKNOWN",
+                "tracking_reasons": [],
+                "viewpoints": 0,
+                "_viewpoints_q": [],  # internal list of quantized camera positions
+                "conflicts": 0,
+            }
+        except Exception as exc:
+            self.tsdf = None
+            self.metrics = {
+                "frames": 0,
+                "tsdf_available": False,
+                "tsdf_reason": str(exc),
+                "tracking_quality": "UNKNOWN",
+                "tracking_reasons": [],
+                "viewpoints": 0,
+                "_viewpoints_q": [],
+                "conflicts": 0,
+            }
         self.esdf = ESDF()
-        self.viewpoints: list[dict[str, Any]] = []  # [{"position":[3], "timestamp":float, "frame_id":str}]
-        self.metrics: dict[str, Any] = {
-            "frames": 0,
-            "last_update": None,
-            "viewpoints": 0,
-            "tsdf_available": bool(self.tsdf.available),
-            "tsdf_reason": self.tsdf.unavailable_reason,
-        }
 
-    def _push_viewpoint(self, frame_meta: dict[str, Any]) -> None:
-        pose = frame_meta.get("pose") or {}
+    def _update_viewpoints(self, pose: dict) -> None:
         pos = pose.get("position")
-        if not pos or len(pos) != 3:
+        if not (isinstance(pos, (list, tuple)) and len(pos) == 3):
             return
-        ts = float(frame_meta.get("timestamp") or time.time())
-        fid = str(frame_meta.get("frame_id") or "")
-        p = np.asarray(pos, dtype=np.float32).reshape(3)
-
-        # Dedup: keep only distinct camera positions (>= 0.35m apart)
-        if self.viewpoints:
-            last = np.asarray(self.viewpoints[-1]["position"], dtype=np.float32).reshape(3)
-            if float(np.linalg.norm(p - last)) < 0.35:
-                return
-
-        self.viewpoints.append({"position": [float(p[0]), float(p[1]), float(p[2])], "timestamp": ts, "frame_id": fid})
-        # Keep bounded history
-        if len(self.viewpoints) > 80:
-            self.viewpoints = self.viewpoints[-80:]
-        self.metrics["viewpoints"] = len(self.viewpoints)
+        # quantize to ~35cm grid for uniqueness
+        q = [int(round(float(pos[0]) / 0.35)), int(round(float(pos[1]) / 0.35)), int(round(float(pos[2]) / 0.35))]
+        lst = self.metrics.get("_viewpoints_q")
+        if not isinstance(lst, list):
+            lst = []
+            self.metrics["_viewpoints_q"] = lst
+        if q not in lst:
+            lst.append(q)
+            self.metrics["viewpoints"] = int(len(lst))
 
     def update_from_frame(
         self,
-        frame_meta: dict[str, Any],
-        rgb: bytes,
+        meta: dict,
+        rgb_bytes: bytes,
         depth_bytes: bytes | None,
         pointcloud_bytes: bytes | None,
     ) -> None:
-        self._push_viewpoint(frame_meta)
+        del pointcloud_bytes
+        self.metrics["frames"] = int(self.metrics.get("frames", 0)) + 1
 
-        if depth_bytes is not None and frame_meta.get("depth_meta"):
-            shape = (int(frame_meta["depth_meta"]["height"]), int(frame_meta["depth_meta"]["width"]))
-            depth = np.frombuffer(depth_bytes, dtype=np.uint16).reshape(shape)
+        pose = meta.get("pose", {}) or {}
+
+        # STAGE C: pose jump detection
+        prev_pose = self.metrics.get("last_pose")
+        quality, reasons = evaluate_pose_step(prev_pose, pose)
+        if quality != "UNKNOWN":
+            self.metrics["tracking_quality"] = quality
+            self.metrics["tracking_reasons"] = reasons
+        self.metrics["last_pose"] = {"position": pose.get("position"), "quaternion": pose.get("quaternion")}
+
+        # viewpoint count (STAGE D support)
+        self._update_viewpoints(pose)
+
+        if self.tsdf is None:
+            return
+
+        intr = meta.get("intrinsics", {}) or {}
+        depth_meta = meta.get("depth_meta")
+        if depth_meta and depth_bytes:
+            w = int(depth_meta["width"])
+            h = int(depth_meta["height"])
+            depth_u16 = np.frombuffer(depth_bytes, dtype=np.uint16).reshape(h, w)
             self.tsdf.integrate_depth(
-                depth,
-                frame_meta["intrinsics"],
-                frame_meta["pose"],
-                float(frame_meta["depth_meta"]["scale_m_per_unit"]),
-                rgb_bytes=rgb,
+                depth_u16,
+                intr,
+                pose,
+                float(depth_meta["scale_m_per_unit"]),
+                rgb_bytes=rgb_bytes,
             )
             self.esdf.mark_dirty()
 
-        self.metrics["frames"] += 1
-        self.metrics["last_update"] = time.time()
-        # Keep TSDF status current in case env changes (container, missing deps, etc.)
-        self.metrics["tsdf_available"] = bool(self.tsdf.available)
-        self.metrics["tsdf_reason"] = self.tsdf.unavailable_reason
+        # propagate conflict counter
+        self.metrics["conflicts"] = int(getattr(self.occupancy, "conflict_count", 0))
 
     def query_distance(self, points: list[list[float]]) -> list[float]:
         return self.esdf.query_distance(points, self.occupancy.grid, self.occupancy.origin, self.occupancy.voxel_size)
 
-    def compute_overlays(self, policy: dict[str, Any]) -> dict[str, Any]:
-        stats = self.occupancy.stats()
-        return {
-            "unknown_summary": stats,
-            "policy": policy,
-            "viewpoints": {"count": int(self.metrics.get("viewpoints", 0))},
-        }
-
     def export_env_mesh_obj(self) -> bytes:
+        if self.tsdf is None:
+            return b""
         return self.tsdf.extract_mesh_obj_bytes()
 
-    def serialize_state(self) -> dict[str, Any]:
+    def compute_overlays(self, policy_dict: dict) -> dict:
+        # minimal overlays: occupancy summary + policy snapshot + uncertainty stats
         return {
-            "metrics": self.metrics,
-            "stats": self.occupancy.stats(),
+            "occupancy": self.occupancy.stats(),
+            "weights_hist": self.occupancy.weight_histogram(),
+            "conflicts": int(getattr(self.occupancy, "conflict_count", 0)),
+            "policy": policy_dict,
+        }
+
+    def serialize_state(self) -> dict:
+        # hide internal viewpoint quant list
+        m = dict(self.metrics)
+        if "_viewpoints_q" in m:
+            m.pop("_viewpoints_q", None)
+        return {
+            "metrics": m,
+            "occupancy": self.occupancy.stats(),
+            "weights_hist": self.occupancy.weight_histogram(),
+            "conflicts": int(getattr(self.occupancy, "conflict_count", 0)),
             "origin": self.occupancy.origin.tolist(),
             "voxel_size": float(self.occupancy.voxel_size),
-            "shape": list(self.occupancy.grid.shape),
-            "viewpoints": self.viewpoints[-10:],  # last few for debugging/UI
         }

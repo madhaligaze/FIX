@@ -1,48 +1,77 @@
 from __future__ import annotations
 
-from policy.policy_config import PolicyConfig
+import math
+from typing import Any
+
+import numpy as np
+
 from scanning.coverage import compute_work_aabb
 
 
-def compute_readiness(world_model, anchors: list[dict], policy: PolicyConfig) -> tuple[bool, float, list[str]]:
+def _views_near_point(world_model, p: list[float], *, radius_m: float = 2.5) -> int:
+    # Approximate using quantized viewpoints list (stored only as count), so we use camera_history if available.
+    hist = world_model.metrics.get("camera_positions")  # optional future field
+    if not isinstance(hist, list):
+        return 0
+    px, py, pz = float(p[0]), float(p[1]), float(p[2])
+    r2 = float(radius_m * radius_m)
+    cnt = 0
+    for it in hist:
+        if not (isinstance(it, (list, tuple)) and len(it) == 3):
+            continue
+        dx = float(it[0]) - px
+        dy = float(it[1]) - py
+        dz = float(it[2]) - pz
+        if dx * dx + dy * dy + dz * dz <= r2:
+            cnt += 1
+    return int(cnt)
+
+
+def compute_readiness(world_model, anchors: list[dict], policy) -> tuple[bool, float, list[str]]:
     """
-    STAGE 5: Readiness gating must prevent scaffold requests on weak coverage.
-    Rules (MVP):
-      - observed_ratio inside work AABB >= threshold
-      - unknown near supports <= threshold
-      - at least N distinct viewpoints captured (deduped camera positions)
+    STAGE D: readiness is a gate, not a vibe.
+    - coverage in the work AABB
+    - min viewpoints overall
+    - min views around each support anchor (if we have camera history)
     """
+    aabb = compute_work_aabb(anchors, padding_m=1.0)
     reasons: list[str] = []
+    if aabb is None:
+        return False, 0.0, ["NO_ANCHORS"]
 
-    # Work region stats (preferred) else global stats.
-    work = compute_work_aabb(anchors, padding_m=1.25)
-    if work:
-        box_min, box_max = work
-        stats = world_model.occupancy.stats_aabb(box_min, box_max)
-        observed_ratio = float(stats["observed_ratio"])
-        unknown_ratio = float(stats["unknown_ratio"])
-    else:
-        stats = world_model.occupancy.stats()
-        observed_ratio = float(stats["observed_ratio"])
-        unknown_ratio = float(stats["unknown_ratio"])
+    bmin, bmax = aabb
+    stats = world_model.occupancy.stats_aabb(bmin, bmax)
+    if int(stats.get("total", 0)) <= 0:
+        return False, 0.0, ["EMPTY_AABB"]
 
-    if observed_ratio < float(policy.readiness_observed_ratio_min):
-        reasons.append(f"LOW_OBSERVED_RATIO:{observed_ratio:.3f}<{float(policy.readiness_observed_ratio_min):.3f}")
+    unknown = float(stats.get("unknown", 0))
+    total = float(stats.get("total", 1))
+    observed = 1.0 - (unknown / max(1.0, total))
 
-    support_points = [a["position"] for a in anchors if a.get("kind") == "support" and a.get("position") is not None]
-    near_stats = world_model.occupancy.stats(support_points if support_points else None)
-    if support_points and float(near_stats["unknown_ratio"]) > float(policy.unknown_ratio_near_support_max):
-        reasons.append(
-            f"UNKNOWN_NEAR_SUPPORT:{float(near_stats['unknown_ratio']):.3f}>{float(policy.unknown_ratio_near_support_max):.3f}"
-        )
+    min_obs = float(getattr(policy, "readiness_observed_ratio_min", 0.1))
+    if observed < min_obs:
+        reasons.append(f"LOW_COVERAGE:{observed:.3f}<{min_obs:.3f}")
 
-    # View diversity (no silent pass): require at least 3 distinct viewpoints if any anchors exist.
-    vp = int(world_model.metrics.get("viewpoints", 0) or 0)
-    if anchors and vp < 3:
-        reasons.append(f"LOW_VIEW_DIVERSITY:{vp}<3")
+    # Viewpoints
+    vp = int(world_model.metrics.get("viewpoints", 0))
+    min_vp = int(getattr(policy, "min_viewpoints", 3) or 3)
+    if vp < min_vp:
+        reasons.append(f"LOW_VIEWPOINTS:{vp}<{min_vp}")
 
-    # Score: conservative blend of observed coverage and view diversity.
-    cov_score = min(1.0, observed_ratio / max(float(policy.readiness_observed_ratio_min), 1e-6))
-    view_score = min(1.0, float(vp) / 3.0) if anchors else 1.0
-    score = float(max(0.0, min(1.0, 0.75 * cov_score + 0.25 * view_score)))
-    return len(reasons) == 0, score, reasons
+    # Per-support view requirement (best-effort)
+    supports = [a for a in anchors if a.get("kind") == "support" and isinstance(a.get("position"), (list, tuple))]
+    min_views_per_support = int(getattr(policy, "min_views_per_support", 2) or 2)
+    if supports:
+        bad = 0
+        for s in supports:
+            p = list(s.get("position"))
+            n = _views_near_point(world_model, p, radius_m=2.5)
+            if n < min_views_per_support:
+                bad += 1
+        if bad > 0:
+            reasons.append(f"SUPPORTS_NEED_MORE_VIEWS:{bad}/{len(supports)}")
+
+    # Score: weighted blend
+    score = 0.75 * max(0.0, min(1.0, observed)) + 0.25 * max(0.0, min(1.0, float(vp) / float(max(1, min_vp))))
+    ready = (observed >= min_obs) and (vp >= min_vp) and (len(reasons) == 0)
+    return bool(ready), float(score), reasons
