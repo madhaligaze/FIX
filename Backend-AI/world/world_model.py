@@ -98,10 +98,14 @@ class WorldModel:
     def query_distance(self, points: list[list[float]]) -> list[float]:
         return self.esdf.query_distance(points, self.occupancy.grid, self.occupancy.origin, self.occupancy.voxel_size)
 
-    def export_env_mesh_obj(self) -> bytes:
+    def export_env_mesh_obj_bytes(self) -> bytes:
         if self.tsdf is None:
             return b""
         return self.tsdf.extract_mesh_obj_bytes()
+
+    def export_env_mesh_obj(self) -> bytes:
+        # Backward-compatible API for existing call sites.
+        return self.export_env_mesh_obj_bytes()
 
     def compute_overlays(self, policy_dict: dict) -> dict:
         # minimal overlays: occupancy summary + policy snapshot + uncertainty stats

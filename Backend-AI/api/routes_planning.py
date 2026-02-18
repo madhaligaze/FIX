@@ -105,7 +105,7 @@ def plan_scaffold(request: Request, payload: PlanPayload) -> dict[str, object]:
         )
 
     overlays = world.compute_overlays(state.policy.__dict__)
-    env_mesh_bytes = world.export_env_mesh_obj()
+    env_mesh_bytes = world.export_env_mesh_obj_bytes() if hasattr(world, "export_env_mesh_obj_bytes") else world.export_env_mesh_obj()
 
     rev_id = state.store.lock_revision(
         session_id,
