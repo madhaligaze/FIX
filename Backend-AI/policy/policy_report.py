@@ -1,35 +1,28 @@
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+import json
+from dataclasses import asdict, dataclass
 from typing import Any
 
 
-def _policy_as_dict(policy: Any) -> dict[str, Any]:
-    if is_dataclass(policy):
-        return asdict(policy)
-    if isinstance(policy, dict):
-        return dict(policy)
-    return dict(getattr(policy, "__dict__", {}))
+@dataclass(frozen=True)
+class PolicyReport:
+    """
+    Small, stable JSON payload for client-side overlays and for audit/export bundles.
+    Store large arrays/maps separately; keep only summary + references here.
+    """
+
+    policy_id: str
+    mode: str
+    ok: bool
+    reason: str | None = None
+    metrics: dict[str, Any] | None = None
+    artifacts: dict[str, str] | None = None  # name -> path/url
+
+    def to_json_bytes(self) -> bytes:
+        return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def build_policy_report(
-    *,
-    policy: Any,
-    readiness: dict[str, Any] | None = None,
-    unknown: dict[str, Any] | None = None,
-    validators: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    STAGE 8: single compact report object that Android can display.
-    """
-    policy_dict = _policy_as_dict(policy)
-    return {
-        "policy": {
-            "unknown_mode": str(policy_dict.get("unknown_mode", "forbid")),
-            "unknown_buffer_m": float(policy_dict.get("unknown_buffer_m", 0.0)),
-            "min_clearance_m": float(policy_dict.get("min_clearance_m", 0.0)),
-        },
-        "readiness": readiness or {},
-        "unknown_space": unknown or {},
-        "validators": validators or {},
-    }
+def write_policy_report(path: str, report: PolicyReport) -> None:
+    with open(path, "wb") as f:
+        f.write(report.to_json_bytes())

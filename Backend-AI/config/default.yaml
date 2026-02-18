@@ -1,3 +1,21 @@
+# ---- Project-level policy knobs (Stage 15: first-class safety/physics policy) ----
+# Unknown-space handling around anchors / supports / critical zones.
+# mode:
+#   - allow  : do not gate on unknown (NOT recommended for production)
+#   - forbid : hard-block decisions if unknown is too high near critical points
+#   - buffer : allow, but require extra clearance away from unknown (conservative)
+unknown_policy:
+  mode: "buffer"
+  # If mode == forbid: radius around critical points to inspect for unknown
+  forbid_radius_m: 0.35
+  # If mode == buffer: radius inspected for unknown + extra clearance imposed
+  buffer_radius_m: 0.50
+  buffer_clearance_m: 0.15
+  # Threshold: max fraction of unknown samples allowed inside the inspected region
+  max_unknown_fraction: 0.05
+  # Sampling for region inspection (controls speed/accuracy)
+  samples_per_region: 256
+
 # Backend-AI runtime config (STAGE 0 baseline)
 
 server:
