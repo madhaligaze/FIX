@@ -23,6 +23,12 @@ except Exception:  # pragma: no cover
 
 from modules.session_state import LockInfo, SessionState, compute_world_revision
 
+# Stage 13: raw inputs -> revision artifacts
+try:
+    from modules.raw_input_artifacts import finalize_incoming_raw_to_revision
+except Exception:  # pragma: no cover
+    finalize_incoming_raw_to_revision = None
+
 
 @dataclass
 class CameraFrame:
@@ -60,6 +66,10 @@ class SceneContext:
         self.last_scan_plan: Optional[Dict[str, Any]] = None
         self.readiness_profile: Dict[str, Any] = {}
         self.last_readiness: Optional[Dict[str, Any]] = None
+
+        # Stage 13: explicit measurement protocol packets
+        self.measurements: List[Dict[str, Any]] = []
+        self.marker_observations: List[Dict[str, Any]] = []
 
     def ensure_voxel_world(self):
         if self.voxel_world is None:
@@ -123,6 +133,19 @@ class SceneContext:
         if point_cloud:
             self.point_cloud.extend(point_cloud)
 
+    def ingest_measurement_packet(self, packet: Dict[str, Any]) -> None:
+        """Persist measurement packet into context (Stage 13)."""
+        if not isinstance(packet, dict):
+            return
+        self.measurements.append(packet)
+        if len(self.measurements) > 500:
+            self.measurements = self.measurements[-500:]
+        obs = packet.get("markers")
+        if isinstance(obs, list) and obs:
+            self.marker_observations.extend(obs)
+            if len(self.marker_observations) > 1000:
+                self.marker_observations = self.marker_observations[-1000:]
+
     def get_summary(self) -> Dict[str, Any]:
         return {
             "anchors": len(self.anchor_points),
@@ -133,6 +156,8 @@ class SceneContext:
             "scan_suggestions": len(self.last_scan_suggestions),
             "has_reprojection": bool(self.last_reprojection),
             "has_scan_plan": bool(self.last_scan_plan),
+            "measurement_packets": len(self.measurements),
+            "marker_observations": len(self.marker_observations),
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -149,6 +174,8 @@ class SceneContext:
             "last_scan_plan": self.last_scan_plan,
             "readiness_profile": self.readiness_profile,
             "last_readiness": self.last_readiness,
+            "measurements": self.measurements,
+            "marker_observations": self.marker_observations,
         }
 
     @classmethod
@@ -166,6 +193,8 @@ class SceneContext:
         ctx.last_scan_plan = data.get("last_scan_plan")
         ctx.readiness_profile = data.get("readiness_profile", {})
         ctx.last_readiness = data.get("last_readiness")
+        ctx.measurements = data.get("measurements", [])
+        ctx.marker_observations = data.get("marker_observations", [])
         return ctx
 
 
@@ -208,6 +237,58 @@ class Session:
         self.mesh_version += 1
         self.total_objects_detected += len(frame.detected_objects)
         self._touch()
+
+    # ── Stage 13: measurement packets (anchors / ruler / markers) ─────────
+
+    @staticmethod
+    def _upsert_by_id(items: List[Dict[str, Any]], item: Dict[str, Any], key: str = "id") -> None:
+        try:
+            v = item.get(key)
+            if not v:
+                items.append(item)
+                return
+            for i, existing in enumerate(items):
+                if existing.get(key) == v:
+                    items[i] = item
+                    return
+            items.append(item)
+        except Exception:
+            items.append(item)
+
+    def ingest_measurement_packet(self, packet: Dict[str, Any]) -> None:
+        """Ingest a validated measurement protocol packet."""
+        try:
+            self.scene_context.measurements.append(packet)
+            if len(self.scene_context.measurements) > 500:
+                self.scene_context.measurements = self.scene_context.measurements[-500:]
+
+            for a in packet.get("anchors", []) or []:
+                anchor = {
+                    "id": a.get("anchor_id") or a.get("id"),
+                    "x": float((a.get("world_point") or {}).get("x", 0.0)),
+                    "y": float((a.get("world_point") or {}).get("y", 0.0)),
+                    "z": float((a.get("world_point") or {}).get("z", 0.0)),
+                    "label": a.get("label"),
+                    "confidence": float(a.get("confidence", 1.0)) if a.get("confidence") is not None else 1.0,
+                    "source": a.get("source", "measurement"),
+                }
+                self._upsert_by_id(self.scene_context.anchor_points, anchor, key="id")
+                self._upsert_by_id(self.user_anchors, anchor, key="id")
+
+            for m in packet.get("markers", []) or []:
+                marker = {
+                    "id": m.get("marker_id") or m.get("id"),
+                    "world_point": m.get("world_point"),
+                    "normal": m.get("normal"),
+                    "size_m": m.get("size_m"),
+                    "confidence": m.get("confidence"),
+                    "source": m.get("source", "marker"),
+                }
+                self.scene_context.marker_observations.append(marker)
+                if len(self.scene_context.marker_observations) > 800:
+                    self.scene_context.marker_observations = self.scene_context.marker_observations[-800:]
+        finally:
+            self._touch()
 
     def lock_world(
         self,
@@ -373,6 +454,17 @@ class Session:
                 reason=reason,
             )
             self.locked_snapshot_revision = self.locked_snapshot_revision or ref.revision
+
+            # Stage 13: attach raw inputs captured during scanning to the revision.
+            if finalize_incoming_raw_to_revision is not None:
+                try:
+                    finalize_incoming_raw_to_revision(
+                        session_id=self.session_id,
+                        revision=str(ref.revision),
+                        root_dir=str(base_dir),
+                    )
+                except Exception:
+                    pass
             return {"session_id": self.session_id, "revision": ref.revision}
         except Exception:
             return None
