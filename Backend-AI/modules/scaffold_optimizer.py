@@ -12,16 +12,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import math
 
-try:
-    from modules.builder import ScaffoldGenerator
-    from modules.constraints import ConstraintConfig, evaluate_variant, score_variant
-    from modules.layher_standards import LayherStandards
-    from modules.voxel_world import VoxelWorld
-except Exception:  # pragma: no cover
-    from builder import ScaffoldGenerator
-    from constraints import ConstraintConfig, evaluate_variant, score_variant
-    from layher_standards import LayherStandards
-    from voxel_world import VoxelWorld
+from .builder import ScaffoldGenerator
+from .constraints import ConstraintConfig, evaluate_variant, score_variant
+from .layher_standards import LayherStandards
+from .voxel_world import VoxelWorld
 
 
 @dataclass

@@ -35,6 +35,7 @@ import com.google.ar.sceneform.Node
 import com.google.ar.sceneform.math.Vector3
 import com.google.ar.sceneform.rendering.Color as SceneColor
 import com.example.aibrain.assets.ModelAssets
+import com.example.aibrain.managers.ARSessionManager
 import com.example.aibrain.scene.PhysicsAnimator
 import com.example.aibrain.scene.SceneBuilder
 import com.example.aibrain.scene.LightingSetup
@@ -99,6 +100,7 @@ class MainActivity : AppCompatActivity() {
     // UI ЭЛЕМЕНТЫ - ОСНОВНЫЕ
     // ══════════════════════════════════════════════════════════════════════
     private lateinit var sceneView: ArSceneView
+    private lateinit var arManager: ARSessionManager
     private lateinit var tvAiHint: TextView
     private lateinit var tvFrameCounter: TextView
     private lateinit var tvCoordX: TextView
@@ -321,6 +323,12 @@ class MainActivity : AppCompatActivity() {
             config.focusMode = Config.FocusMode.AUTO
             config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
             config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+        }
+
+
+        if (!::arManager.isInitialized) {
+            arManager = ARSessionManager(this, sceneView)
+            arManager.setupSession()
         }
 
         sceneView.renderer?.apply {
