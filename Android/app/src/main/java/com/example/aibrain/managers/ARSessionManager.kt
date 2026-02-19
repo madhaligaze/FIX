@@ -20,7 +20,7 @@ class ARSessionManager(
             val session = sceneView.session ?: return@addOnUpdateListener
             if (sessionConfigured) return@addOnUpdateListener
 
-            val rawDepthMode = runCatching { Config.DepthMode.valueOf("RAW_DEPTH_ONLY") }.getOrNull()
+            val rawDepthMode = enumValues<Config.DepthMode>().firstOrNull { it.name == "RAW_DEPTH_ONLY" }
             val selectedDepthMode = when {
                 rawDepthMode != null && session.isDepthModeSupported(rawDepthMode) -> rawDepthMode
                 session.isDepthModeSupported(Config.DepthMode.AUTOMATIC) -> Config.DepthMode.AUTOMATIC
@@ -32,12 +32,6 @@ class ARSessionManager(
                 lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
                 planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
                 depthMode = selectedDepthMode
-
-                depthMode = when {
-                    session.isDepthModeSupported(Config.DepthMode.RAW_DEPTH_ONLY) -> Config.DepthMode.RAW_DEPTH_ONLY
-                    session.isDepthModeSupported(Config.DepthMode.AUTOMATIC) -> Config.DepthMode.AUTOMATIC
-                    else -> Config.DepthMode.DISABLED
-                }
             }
 
             session.configure(config)

@@ -35,7 +35,6 @@ class LayerGlbManager(
     fun setLayersRoot(anchor: AnchorNode?) {
         layersRoot = anchor
         val parent: NodeParent = anchor ?: sceneView.scene
-        val parent = anchor ?: sceneView.scene
         nodesByLayerId.values.forEach { it.setParent(parent) }
     }
 
@@ -56,7 +55,6 @@ class LayerGlbManager(
                 this.renderable = renderable
                 this.isEnabled = true
                 setParent(nodeParent)
-                setParent(layersRoot ?: sceneView.scene)
             }
             nodesByLayerId[layerId] = node
             node
@@ -87,7 +85,18 @@ class LayerGlbManager(
             val crc = CRC32().apply { update(bytes) }.value.toString(16)
             val out = File(context.cacheDir, "layer_${layerId}_$crc.glb")
             out.writeBytes(bytes)
+            cleanupLayerCache(layerId, keepLatest = 10)
             return CachedLayerFile(file = out, contentTag = crc)
+        }
+    }
+
+    private fun cleanupLayerCache(layerId: String, keepLatest: Int) {
+        val files = context.cacheDir.listFiles { file ->
+            file.isFile && file.name.startsWith("layer_${layerId}_") && file.name.endsWith(".glb")
+        }?.sortedByDescending { it.lastModified() } ?: return
+
+        files.drop(keepLatest).forEach {
+            runCatching { it.delete() }
         }
     }
 }

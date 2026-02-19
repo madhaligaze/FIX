@@ -1500,10 +1500,12 @@ class MainActivity : AppCompatActivity() {
         streamSendJob?.cancel()
         streamJob = scope.launch {
             while (isActive && isStreaming && currentSessionId == sid) {
-                if (streamSendJob?.isActive != true) {
+                if (streamSendJob?.isActive == true) {
+                    consecutiveFailures += 1
+                } else {
                     streamSendJob = launch(Dispatchers.IO) {
                         val ok = try {
-                            sendFrame()
+                            withTimeout(2_500L) { sendFrame() }
                         } catch (_: Exception) {
                             false
                         }
@@ -1541,7 +1543,6 @@ class MainActivity : AppCompatActivity() {
         data class FramePacket(
             val payload: HashMap<String, Any>,
             val nv21: ImageUtils.Nv21Frame,
-            val depthImage: android.media.Image?
             val depth: DepthUtils.DepthFrame?
         )
 
@@ -1559,8 +1560,6 @@ class MainActivity : AppCompatActivity() {
             }.getOrDefault(emptyList())
 
             val frame = sceneView.arFrame ?: return@withContext null
-
-            var depthImage: android.media.Image? = null
             try {
                 val cam = frame.camera
                 if (cam.trackingState != TrackingState.TRACKING) return@withContext null
@@ -1573,18 +1572,16 @@ class MainActivity : AppCompatActivity() {
 
                 val nv21 = try {
                     ImageUtils.yuv420ToNv21(image, swapUv = settingsPrefs.getBoolean(PREF_CAMERA_SWAP_UV, false))
-                    ImageUtils.yuv420ToNv21(image)
                 } finally {
                     runCatching { image.close() }
                 }
 
-                depthImage = DepthUtils.tryAcquireDepth16(frame)
-                val depthImage = DepthUtils.tryAcquireDepth16(frame)
-                val depthFrame = depthImage?.let {
+                val acquiredDepth = DepthUtils.tryAcquireDepth16(frame)
+                val depthFrame = acquiredDepth?.let { acquired ->
                     try {
-                        DepthUtils.copyDepth16(it)
+                        DepthUtils.copyDepth16(acquired.image, acquired.isRaw)
                     } finally {
-                        runCatching { it.close() }
+                        runCatching { acquired.image.close() }
                     }
                 }
 
@@ -1609,7 +1606,7 @@ class MainActivity : AppCompatActivity() {
                     try {
                         val buf = pc.points
                         val pointCount = buf.remaining() / 4
-                        val cap = 1000
+                        val cap = 300
                         val step = maxOf(1, pointCount / cap)
                         val out = ArrayList<List<Float>>(min(pointCount, cap))
                         var i = 0
@@ -1638,6 +1635,8 @@ class MainActivity : AppCompatActivity() {
                         "width" to dims[0].toInt(),
                         "height" to dims[1].toInt()
                     ),
+                    "rgb_width" to nv21.width,
+                    "rgb_height" to nv21.height,
                     "pose" to mapOf(
                         "position" to position,
                         "quaternion" to quaternion
@@ -1645,46 +1644,28 @@ class MainActivity : AppCompatActivity() {
                     "point_cloud" to points
                 )
 
+                val originPose = originAnchorNode?.anchor?.pose
+                if (originPose != null) {
+                    val oq = FloatArray(4)
+                    originPose.getRotationQuaternion(oq, 0)
+                    basePayload["origin_anchor_pose"] = mapOf(
+                        "position" to listOf(originPose.tx(), originPose.ty(), originPose.tz()),
+                        "quaternion" to listOf(oq[0], oq[1], oq[2], oq[3])
+                    )
+                }
+
                 if (manualMeasurements.isNotEmpty()) {
                     basePayload["manual_measurements"] = manualMeasurements
                 }
 
-                FramePacket(basePayload, nv21, depthImage)
                 FramePacket(basePayload, nv21, depthFrame)
             } catch (_: Exception) {
-                runCatching { depthImage?.close() }
                 null
             }
         }
 
         if (packet == null) return true
 
-        val payload = withContext(Dispatchers.Default) {
-            val depthFrame = packet.depthImage?.let { image ->
-                try {
-                    DepthUtils.copyDepth16(image)
-                } catch (_: Exception) {
-                    null
-                } finally {
-                    runCatching { image.close() }
-                }
-            }
-
-            packet.payload.apply {
-                this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(packet.nv21.data, packet.nv21.width, packet.nv21.height, 75)
-                if (depthFrame != null) {
-                    this["depth_base64"] = DepthUtils.depthBytesToBase64(depthFrame.bytes)
-                    this["depth_width"] = depthFrame.width
-                    this["depth_height"] = depthFrame.height
-                    this["depth_scale"] = depthFrame.scaleMPerUnit
-                }
-            }
-        }
-
-        withContext(Dispatchers.Main) {
-            if (payload.containsKey("depth_base64")) {
-                depthUnavailableStreak = 0
-            } else {
         withContext(Dispatchers.Main) {
             if (packet.depth == null) {
                 depthUnavailableStreak += 1
@@ -1706,6 +1687,9 @@ class MainActivity : AppCompatActivity() {
                     this["depth_width"] = depth.width
                     this["depth_height"] = depth.height
                     this["depth_scale"] = depth.scaleMPerUnit
+                    this["depth_is_raw"] = depth.isRaw
+                    this["depth_format"] = depth.format
+                    this["depth_invalid_value"] = depth.invalidValue
                 }
             }
         }
