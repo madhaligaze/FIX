@@ -25,6 +25,38 @@ from world.occupancy import OCCUPIED
 
 router = APIRouter(tags=["legacy"])
 
+
+@router.get("/health")
+def health(request: Request) -> dict:
+    """Lightweight health endpoint for Android client."""
+    state = request.app.state.runtime
+
+    version = "dev"
+    try:
+        import os as _os
+
+        v = _os.getenv("APP_VERSION") or _os.getenv("BACKEND_VERSION")
+        if v:
+            version = str(v)
+        else:
+            import tomllib
+            from pathlib import Path as _Path
+
+            pyproj = _Path(__file__).resolve().parents[1] / "pyproject.toml"
+            if pyproj.exists():
+                data = tomllib.loads(pyproj.read_text(encoding="utf-8"))
+                version = str(data.get("project", {}).get("version") or version)
+    except Exception:
+        pass
+
+    modules = {"legacy": True, "export": True, "session_v2": True}
+    try:
+        modules["policy"] = bool(getattr(state, "policy", None))
+    except Exception:
+        pass
+
+    return {"status": "ok", "version": version, "modules": modules}
+
 # Android API usage audit (from ApiService.kt) for compatibility adapters:
 # - POST /session/start -> expects {session_id,status} JSON.
 # - POST /session/stream/{session_id} -> sends JSON map (often base64 image/depth + optional geometry fields), expects {status, ai_hints?}.
