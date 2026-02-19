@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from api.routes_export import router as export_router
 from api.routes_legacy import router as legacy_router
+from api.routes_log import router as log_router
 from api.routes_planning_v2 import router as planning_router
 from api.routes_session_v2 import router as session_router
 from api.state import RuntimeState
@@ -120,6 +121,7 @@ def create_app() -> FastAPI:
     app.include_router(planning_router)
     app.include_router(export_router)
     app.include_router(legacy_router)
+    app.include_router(log_router)
 
     sessions_dir = Path(app.state.runtime.config.storage.sessions_root)
     sessions_dir.mkdir(parents=True, exist_ok=True)

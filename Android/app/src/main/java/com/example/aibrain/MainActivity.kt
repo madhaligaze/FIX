@@ -52,6 +52,8 @@ import okhttp3.logging.HttpLoggingInterceptor
 import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlin.math.min
 import com.example.aibrain.measurement.ARRuler
 import com.example.aibrain.measurement.MeasurementType
@@ -100,6 +102,7 @@ class MainActivity : AppCompatActivity() {
         private const val MAX_POINTS = 20
         private const val PREFS_NAME = "app_settings"
         private const val PREF_SERVER_BASE_URL = "server_base_url"
+        private const val KEY_SESSION_HISTORY = "session_history_json"
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -725,36 +728,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onSettingsClicked() {
-        val currentBaseUrl = getCurrentServerUrl()
-        val input = EditText(this).apply {
-            hint = "http://192.168.1.10:8000/"
-            setSingleLine()
-            setText(currentBaseUrl)
-            setSelection(text.length)
-        }
-
-        AlertDialog.Builder(this)
-            .setTitle("⚙️ Настройки сервера")
-            .setMessage("Укажите IP/URL backend сервера. Пример: http://192.168.1.10:8000/")
-            .setView(input)
-            .setPositiveButton("Сохранить") { _, _ ->
-                val normalizedUrl = normalizeBaseUrl(input.text.toString())
-                if (normalizedUrl == null) {
-                    showError("Неверный URL сервера")
-                    return@setPositiveButton
-                }
-
-                settingsPrefs.edit().putString(PREF_SERVER_BASE_URL, normalizedUrl).apply()
-                rebuildApiClient()
-                showHint("✓ Сервер обновлен: $normalizedUrl")
-            }
-            .setNeutralButton("По умолчанию") { _, _ ->
-                settingsPrefs.edit().remove(PREF_SERVER_BASE_URL).apply()
-                rebuildApiClient()
-                showHint("✓ Восстановлен сервер по умолчанию: ${getCurrentServerUrl()}")
-            }
-            .setNegativeButton("Отмена", null)
-            .show()
+        startActivity(android.content.Intent(this, SettingsActivity::class.java))
     }
 
     private fun rebuildApiClient() {
@@ -1242,6 +1216,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun rememberSessionInHistory(sessionId: String) {
+        try {
+            val raw = settingsPrefs.getString(KEY_SESSION_HISTORY, "") ?: ""
+            val arr = runCatching { JSONArray(raw) }.getOrNull() ?: JSONArray()
+            val rec = JSONObject().apply {
+                put("session_id", sessionId)
+                put("timestamp_ms", System.currentTimeMillis())
+            }
+            val out = JSONArray()
+            out.put(rec)
+            for (i in 0 until minOf(arr.length(), 50)) out.put(arr.get(i))
+            settingsPrefs.edit().putString(KEY_SESSION_HISTORY, out.toString()).apply()
+        } catch (_: Exception) {
+        }
+    }
+
     private suspend fun doStartSession() {
         val base = getCurrentServerUrl().trimEnd('/')
         viewModel.setConnectionState(ConnectionStatus.UNKNOWN, base)
@@ -1268,6 +1258,7 @@ class MainActivity : AppCompatActivity() {
                     val sessionId = response.body()!!.session_id
                     currentSessionId = sessionId
                     viewModel.setSessionId(sessionId)
+                    rememberSessionInHistory(sessionId)
 
                     consecutiveFailures = 0
                     frameCount = 0
