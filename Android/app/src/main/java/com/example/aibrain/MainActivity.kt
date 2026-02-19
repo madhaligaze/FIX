@@ -4,7 +4,6 @@ import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.content.Context
 import android.content.SharedPreferences
-import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -24,6 +23,8 @@ import android.widget.TextView
 import android.widget.Switch
 import android.widget.ProgressBar
 import android.widget.Toast
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
@@ -131,10 +132,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btn3DModel: Button
     private lateinit var btnAnalyze: Button
 
-    // Кнопки выбора вариантов
-    private lateinit var btnVariant1: Button
-    private lateinit var btnVariant2: Button
-    private lateinit var btnVariant3: Button
+    // Варианты конструкции
+    private lateinit var rvVariants: RecyclerView
+    private lateinit var variantAdapter: VariantOptionAdapter
     private lateinit var btnPhysics: Button
     private lateinit var btnAccept: Button
 
@@ -181,6 +181,14 @@ class MainActivity : AppCompatActivity() {
     private var frameCount = 0
     private var lastQualityScore = 0.0
     private val hintHistory: ArrayDeque<String> = ArrayDeque()
+
+    // Hint ticker (queue instead of overwrite)
+    private val hintQueue: ArrayDeque<String> = ArrayDeque()
+    private var hintTickerJob: Job? = null
+
+    // Results state
+    private var lastAcceptedOption: ScaffoldOption? = null
+    private var lastRevisionId: String? = null
     private val userMarkers = mutableListOf<Map<String, Float>>()
     private val anchorNodes = mutableListOf<AnchorNode>()
     private var lightingSetup = false
@@ -291,6 +299,10 @@ class MainActivity : AppCompatActivity() {
         viewModel.setConnectionState(ConnectionStatus.UNKNOWN, "")
 
         transitionTo(AppState.IDLE)
+
+        // Start hint ticker after views are ready
+        startHintTicker()
+
     }
 
     private fun initViews() {
@@ -319,10 +331,11 @@ class MainActivity : AppCompatActivity() {
         btn3DModel = findViewById(R.id.btn_3d_model)
         btnAnalyze = findViewById(R.id.btn_analyze)
 
-        // Кнопки вариантов
-        btnVariant1 = findViewById(R.id.btn_variant_1)
-        btnVariant2 = findViewById(R.id.btn_variant_2)
-        btnVariant3 = findViewById(R.id.btn_variant_3)
+        // Variants list
+        rvVariants = findViewById(R.id.rv_variants)
+        variantAdapter = VariantOptionAdapter { idx -> onVariantSelected(idx) }
+        rvVariants.layoutManager = LinearLayoutManager(this, LinearLayoutManager.VERTICAL, false)
+        rvVariants.adapter = variantAdapter
         btnPhysics = findViewById(R.id.btn_physics)
         btnAccept = findViewById(R.id.btn_accept)
 
@@ -411,10 +424,6 @@ class MainActivity : AppCompatActivity() {
         btnAnalyze.setOnClickListener { onAnalyzeClicked() }
         tvAiHint.setOnClickListener { showHintHistoryDialog() }
 
-        // Выбор вариантов
-        btnVariant1.setOnClickListener { onVariantSelected(0) }
-        btnVariant2.setOnClickListener { onVariantSelected(1) }
-        btnVariant3.setOnClickListener { onVariantSelected(2) }
         btnPhysics.setOnClickListener { onPhysicsClicked() }
         btnAccept.setOnClickListener { onAcceptClicked() }
 
@@ -486,6 +495,17 @@ class MainActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════════════════════════════
 
     private fun onStartClicked() {
+        if (appState == AppState.RESULTS) {
+            // restart flow from RESULTS
+            lastAcceptedOption = null
+            lastRevisionId = null
+            current3DModel = null
+            selectedVariantIndex = 0
+            show3DPreview = false
+            clearARAnchors()
+            sceneBuilder.clearScene()
+            transitionTo(AppState.IDLE)
+        }
         if (appState != AppState.IDLE) return
 
         showHint("⚡ Инициализация системы...")
@@ -553,16 +573,7 @@ class MainActivity : AppCompatActivity() {
         if (appState != AppState.SELECTING) return
 
         selectedVariantIndex = index
-
-        listOf(btnVariant1, btnVariant2, btnVariant3).forEachIndexed { i, btn ->
-            if (i == index) {
-                btn.setBackgroundColor(ContextCompat.getColor(this, R.color.cyan_primary))
-                btn.setTextColor(Color.BLACK)
-            } else {
-                btn.setBackgroundColor(ContextCompat.getColor(this, R.color.transparent_panel))
-                btn.setTextColor(ContextCompat.getColor(this, R.color.cyan_primary))
-            }
-        }
+        variantAdapter.setSelected(index)
 
         visualizeScaffoldVariant(selectedVariantIndex)
 
@@ -603,24 +614,29 @@ class MainActivity : AppCompatActivity() {
 
         showHint("✅ Вариант «${option.variant_name}» утвержден!")
         transitionTo(AppState.RESULTS)
+        lastAcceptedOption = option
+        lastRevisionId = null
 
         scope.launch {
             sendLogEvent(
                 "VARIANT_ACCEPTED",
                 mapOf("variant_index" to selectedVariantIndex, "variant_name" to option.variant_name)
             )
-            delay(600)
+            delay(300)
             currentSessionId?.let { sid ->
                 runCatching {
                     val resp = api.exportLatest(sid)
                     if (resp.isSuccessful && resp.body() != null) {
                         val rev = resp.body()!!.revision_id ?: resp.body()!!.rev_id.orEmpty()
-                        if (rev.isNotBlank()) showHint("✓ Экспорт сформирован: ${rev.take(8)}")
+                        if (rev.isNotBlank()) {
+                            lastRevisionId = rev
+                            showHint("✓ Экспорт сформирован: ${rev.take(8)}")
+                        }
                     }
                 }
             }
-            delay(2000)
-            showFinalResults(option)
+            delay(450)
+            showResultsBottomSheet()
         }
     }
 
@@ -1162,9 +1178,63 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showHint(text: String) {
-        tvAiHint.text = text
+        // enqueue instead of overwriting
+        hintQueue.addLast(text)
         hintHistory.addLast(text)
         while (hintHistory.size > 10) hintHistory.removeFirst()
+    }
+
+    private fun startHintTicker() {
+        if (hintTickerJob != null) return
+        hintTickerJob = scope.launch {
+            while (isActive) {
+                val next = if (hintQueue.isNotEmpty()) hintQueue.removeFirst() else null
+                if (next == null) {
+                    delay(250)
+                    continue
+                }
+
+                // fade out -> swap text -> fade in
+                tvAiHint.animate()
+                    .alpha(0f)
+                    .setDuration(180)
+                    .withEndAction {
+                        tvAiHint.text = next
+                        tvAiHint.animate().alpha(1f).setDuration(180).start()
+                    }
+                    .start()
+
+                delay(2800)
+            }
+        }
+    }
+
+    private fun showResultsBottomSheet() {
+        val opt = lastAcceptedOption ?: return
+        val sid = currentSessionId.orEmpty()
+        val rev = lastRevisionId.orEmpty()
+        val critique = opt.ai_critique?.joinToString("\n")?.trim().orEmpty()
+
+        val sheet = ResultsBottomSheet.newInstance(
+            sessionId = sid,
+            revisionId = rev,
+            variantName = opt.variant_name,
+            safetyScore = opt.safety_score,
+            physicsStatus = opt.physics?.status ?: "UNKNOWN",
+            critique = critique
+        )
+        sheet.listener = object : ResultsBottomSheet.Listener {
+            override fun onExportRequested() {
+                onExportClicked()
+            }
+
+            override fun onNewScanRequested() {
+                // trigger restart flow
+                transitionTo(AppState.IDLE)
+                onStartClicked()
+            }
+        }
+        sheet.show(supportFragmentManager, "results_sheet")
     }
 
     private fun updateFrameCounter() {
@@ -1281,6 +1351,7 @@ class MainActivity : AppCompatActivity() {
 
         showError("Не удалось создать сессию: " + (lastError ?: "UNKNOWN"))
         transitionTo(AppState.IDLE)
+
     }
 
     private fun startStreamingLoop() {
@@ -1527,14 +1598,11 @@ class MainActivity : AppCompatActivity() {
             selectedVariantIndex = 0
             transitionTo(AppState.SELECTING)
 
-            // Подписи на кнопках вариантов
             val opts = model.options.orEmpty()
-            btnVariant1.text = opts.getOrNull(0)?.variant_name ?: "Вариант 1"
-            btnVariant2.text = opts.getOrNull(1)?.variant_name ?: "Вариант 2"
-            btnVariant3.text = opts.getOrNull(2)?.variant_name ?: "Вариант 3"
+            variantAdapter.submit(opts, selected = 0)
 
             // Показать первый вариант
-            visualizeScaffoldVariant(0)
+            if (opts.isNotEmpty()) onVariantSelected(0)
         }
     }
 
@@ -1668,11 +1736,6 @@ class MainActivity : AppCompatActivity() {
         showHint("📊 Карта нагрузок обновлена")
     }
 
-    private fun showFinalResults(option: ScaffoldOption) {
-        val score = option.safety_score
-        val status = option.physics?.status ?: "UNKNOWN"
-        showHint("🏁 Готово: safety $score%, physics=$status")
-    }
 
 
 
