@@ -55,6 +55,7 @@ import java.util.concurrent.TimeUnit
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 import kotlin.math.min
 import com.example.aibrain.measurement.ARRuler
 import com.example.aibrain.measurement.MeasurementType
@@ -180,7 +181,11 @@ class MainActivity : AppCompatActivity() {
     private var isReconnecting = false
     private var frameCount = 0
     private var lastQualityScore = 0.0
+    private val qualityMinForAnalyze = 40
     private val hintHistory: ArrayDeque<String> = ArrayDeque()
+    private val tutorialPrefs by lazy { getSharedPreferences(AppPrefs.PREFS_NAME, Context.MODE_PRIVATE) }
+    private val tutorialDoneKey = "tutorial_done_v1"
+    private var tutorialOverlay: TutorialOverlay? = null
 
     // Hint ticker (queue instead of overwrite)
     private val hintQueue: ArrayDeque<String> = ArrayDeque()
@@ -189,8 +194,9 @@ class MainActivity : AppCompatActivity() {
     // Results state
     private var lastAcceptedOption: ScaffoldOption? = null
     private var lastRevisionId: String? = null
-    private val userMarkers = mutableListOf<Map<String, Float>>()
+    private val userMarkers = mutableListOf<PlacedAnchor>()
     private val anchorNodes = mutableListOf<AnchorNode>()
+    private val anchorMarkerNodes: MutableMap<String, Node> = mutableMapOf()
     private var lightingSetup = false
     private var mainAnchorNode: AnchorNode? = null
 
@@ -297,6 +303,7 @@ class MainActivity : AppCompatActivity() {
 
         startHealthLoop()
         viewModel.setConnectionState(ConnectionStatus.UNKNOWN, "")
+        maybeShowTutorial()
 
         transitionTo(AppState.IDLE)
 
@@ -559,6 +566,21 @@ class MainActivity : AppCompatActivity() {
         if (userMarkers.size < MIN_POINTS_FOR_MODEL) {
             showHint("📍 Требуется минимум $MIN_POINTS_FOR_MODEL точки. Сейчас: ${userMarkers.size}")
             vibrate()
+            return
+        }
+
+        if (lastQualityScore >= 1.0 && lastQualityScore < qualityMinForAnalyze.toDouble()) {
+            AlertDialog.Builder(this)
+                .setTitle("Недостаточное качество")
+                .setMessage("Quality=${lastQualityScore.toInt()}%. Нужно >= $qualityMinForAnalyze% для анализа. Продолжить всё равно?")
+                .setPositiveButton("Продолжить") { _, _ ->
+                    showHint("🧠 Запуск анализа структуры...")
+                    stopStreaming()
+                    transitionTo(AppState.MODELING)
+                    scope.launch { doRequestModeling() }
+                }
+                .setNegativeButton("Отмена", null)
+                .show()
             return
         }
 
@@ -849,14 +871,11 @@ class MainActivity : AppCompatActivity() {
 
     private suspend fun syncAnchorsToServer() {
         val sid = currentSessionId ?: return
-        val anchors = userMarkers.mapIndexed { index, m ->
-            val x = m["x"] ?: 0f
-            val y = m["y"] ?: 0f
-            val z = m["z"] ?: 0f
+        val anchors = userMarkers.map { marker ->
             AnchorPointRequest(
-                id = "a" + (index + 1),
+                id = marker.id,
                 kind = "support",
-                position = listOf(x, y, z),
+                position = listOf(marker.x, marker.y, marker.z),
                 confidence = 1.0f
             )
         }
@@ -1165,6 +1184,60 @@ class MainActivity : AppCompatActivity() {
         val clamped = v.coerceIn(0.0, 100.0)
         pbQuality.progress = clamped.toInt()
         tvQuality.text = "${clamped.toInt()}%"
+        if (clamped >= 1.0 && clamped < qualityMinForAnalyze.toDouble()) {
+            showHint("⚠️ Качество низкое: ${clamped.toInt()}%. Нужно >= $qualityMinForAnalyze% для анализа.")
+        }
+    }
+
+    private fun maybeShowTutorial() {
+        val done = tutorialPrefs.getBoolean(tutorialDoneKey, false)
+        if (done) return
+
+        tutorialOverlay = TutorialOverlay(
+            activity = this,
+            onDone = {
+                tutorialPrefs.edit().putBoolean(tutorialDoneKey, true).apply()
+                tutorialOverlay?.dismiss()
+                tutorialOverlay = null
+            }
+        ).also { it.show() }
+    }
+
+    private fun confirmDeleteAnchor(anchorId: String) {
+        AlertDialog.Builder(this)
+            .setTitle("Удалить маркер?")
+            .setMessage("Маркер будет удалён локально и отправлен на сервер при следующем sync.")
+            .setPositiveButton("Удалить") { _, _ -> removeAnchorById(anchorId) }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun removeAnchorById(anchorId: String) {
+        val before = userMarkers.size
+        userMarkers.removeAll { it.id == anchorId }
+        if (before == userMarkers.size) return
+
+        val markerNode = anchorMarkerNodes.remove(anchorId)
+        runCatching { markerNode?.setParent(null) }
+
+        val iterator = anchorNodes.iterator()
+        while (iterator.hasNext()) {
+            val anchorNode = iterator.next()
+            if ((anchorNode.name ?: "") == anchorId) {
+                runCatching { anchorNode.anchor?.detach() }
+                anchorNode.setParent(null)
+                iterator.remove()
+                break
+            }
+        }
+
+        updatePointsCount()
+        btnAnalyze.isEnabled = userMarkers.size >= MIN_POINTS_FOR_MODEL
+        showHint("🗑 Маркер удалён")
+
+        scope.launch {
+            runCatching { syncAnchorsToServer() }
+        }
     }
 
     private fun showHintHistoryDialog() {
@@ -1646,11 +1719,18 @@ class MainActivity : AppCompatActivity() {
         anchorNodes.add(anchorNode)
 
         val p = anchor.pose
-        userMarkers.add(mapOf(
-            "x" to p.tx(),
-            "y" to p.ty(),
-            "z" to p.tz()
-        ))
+        val markerId = "a-${UUID.randomUUID().toString().take(8)}"
+        userMarkers.add(
+            PlacedAnchor(
+                id = markerId,
+                x = p.tx(),
+                y = p.ty(),
+                z = p.tz()
+            )
+        )
+        anchorNode.name = markerId
+        anchorMarkerNodes[markerId] = marker
+        marker.setOnTapListener { _, _ -> confirmDeleteAnchor(markerId) }
 
         updatePointsCount()
         btnAnalyze.isEnabled = userMarkers.size >= MIN_POINTS_FOR_MODEL
@@ -2098,6 +2178,10 @@ class MainActivity : AppCompatActivity() {
     private fun clearARAnchors() {
         anchorNodes.forEach { it.anchor?.detach(); it.setParent(null) }
         anchorNodes.clear()
+        anchorMarkerNodes.clear()
+        userMarkers.clear()
+        updatePointsCount()
+        btnAnalyze.isEnabled = false
         sceneBuilder.clearScene()
     }
 }
