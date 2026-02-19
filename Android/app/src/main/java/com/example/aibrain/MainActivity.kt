@@ -1424,6 +1424,7 @@ class MainActivity : AppCompatActivity() {
                     "frame_id" to ("frm_" + frameCount),
                     "timestamp" to (System.currentTimeMillis() / 1000.0),
                     "rgb_base64" to rgbBase64,
+                    "measurements_json" to runCatching { arRuler.exportMeasurements() }.getOrDefault(""),
                     "intrinsics" to mapOf(
                         "fx" to fx,
                         "fy" to fy,
