@@ -4,14 +4,17 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.card.MaterialCardView
 
 class VariantOptionAdapter(
-    private var items: List<ScaffoldOption> = emptyList(),
-    private var selectedIndex: Int = 0,
-    private val onSelect: (Int) -> Unit,
+    private val onSelect: (Int) -> Unit
 ) : RecyclerView.Adapter<VariantOptionAdapter.VH>() {
+
+    private var items: List<ScaffoldOption> = emptyList()
+    private var selectedIndex: Int = 0
+
     fun submit(newItems: List<ScaffoldOption>, selected: Int = 0) {
         items = newItems
         selectedIndex = selected.coerceIn(0, maxOf(0, items.size - 1))
@@ -47,19 +50,28 @@ class VariantOptionAdapter(
         fun bind(opt: ScaffoldOption, selected: Boolean, index: Int) {
             tvTitle.text = opt.variant_name.ifBlank { "Variant ${index + 1}" }
             tvSafety.text = "Safety: ${opt.safety_score}%"
-            tvWeight.text = opt.stats?.total_weight_kg?.let { "Weight: ${it}kg" } ?: "Weight: --"
-            tvStats.text = "Beams: ${opt.stats?.total_beams ?: "--"} | Nodes: ${opt.stats?.total_nodes ?: "--"}"
-            tvPreview.text = opt.ai_critique?.firstOrNull()?.trim().orEmpty()
 
+            val weight = opt.stats?.total_weight_kg
+            tvWeight.text = if (weight != null) "Weight: ${weight}kg" else "Weight: --"
+
+            val beams = opt.stats?.total_beams
+            val nodes = opt.stats?.total_nodes
+            tvStats.text = "Beams: ${beams ?: "--"} | Nodes: ${nodes ?: "--"}"
+
+            val preview = opt.ai_critique?.firstOrNull()?.trim().orEmpty()
+            tvPreview.text = preview
+
+            val ctx = itemView.context
             if (selected) {
                 card.strokeWidth = 2
-                card.strokeColor = 0xFF00F5FF.toInt()
-                card.setCardBackgroundColor(0x3321D4FF)
+                card.strokeColor = ContextCompat.getColor(ctx, R.color.cyan_primary)
+                card.setCardBackgroundColor(ContextCompat.getColor(ctx, R.color.cyan_alpha_10))
             } else {
                 card.strokeWidth = 1
-                card.strokeColor = 0x3300F5FF
-                card.setCardBackgroundColor(0x1A0A101A)
+                card.strokeColor = ContextCompat.getColor(ctx, R.color.cyan_alpha_20)
+                card.setCardBackgroundColor(ContextCompat.getColor(ctx, R.color.transparent_panel))
             }
+
             card.setOnClickListener { onSelect(index) }
         }
     }

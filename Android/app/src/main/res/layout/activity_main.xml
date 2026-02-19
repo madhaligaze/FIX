@@ -812,54 +812,14 @@
             android:lineSpacingExtra="2dp"
             android:visibility="gone" />
 
-        <!-- Variant Buttons -->
-        <LinearLayout
+        <!-- Variants List -->
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/rv_variants"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:layout_marginBottom="12dp">
-
-            <Button
-                android:id="@+id/btn_variant_1"
-                android:layout_width="0dp"
-                android:layout_height="72dp"
-                android:layout_weight="1"
-                android:layout_marginEnd="8dp"
-                android:text="ВАРИАНТ 1\n---%"
-                android:textColor="#FF00F5FF"
-                android:textSize="11sp"
-                android:fontFamily="monospace"
-                android:background="@drawable/btn_variant"
-                android:stateListAnimator="@null"
-                android:elevation="0dp" />
-
-            <Button
-                android:id="@+id/btn_variant_2"
-                android:layout_width="0dp"
-                android:layout_height="72dp"
-                android:layout_weight="1"
-                android:layout_marginEnd="8dp"
-                android:text="ВАРИАНТ 2\n---%"
-                android:textColor="#FF00F5FF"
-                android:textSize="11sp"
-                android:fontFamily="monospace"
-                android:background="@drawable/btn_variant"
-                android:stateListAnimator="@null"
-                android:elevation="0dp" />
-
-            <Button
-                android:id="@+id/btn_variant_3"
-                android:layout_width="0dp"
-                android:layout_height="72dp"
-                android:layout_weight="1"
-                android:text="ВАРИАНТ 3\n---%"
-                android:textColor="#FF00F5FF"
-                android:textSize="11sp"
-                android:fontFamily="monospace"
-                android:background="@drawable/btn_variant"
-                android:stateListAnimator="@null"
-                android:elevation="0dp" />
-        </LinearLayout>
+            android:layout_marginBottom="12dp"
+            android:overScrollMode="never"
+            android:scrollbars="none" />
 
         <!-- Action Buttons -->
         <LinearLayout
