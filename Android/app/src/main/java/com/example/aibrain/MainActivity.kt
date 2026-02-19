@@ -6,6 +6,7 @@ import android.Manifest
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -33,6 +34,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
@@ -256,8 +259,20 @@ class MainActivity : AppCompatActivity() {
     // LIFECYCLE
     // ══════════════════════════════════════════════════════════════════════
 
+
+
+    private fun applySystemBars() {
+        WindowCompat.setDecorFitsSystemWindows(window, true)
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = ContextCompat.getColor(this, R.color.navigation_bar)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applySystemBars()
         setContentView(R.layout.activity_main)
 
         settingsPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
