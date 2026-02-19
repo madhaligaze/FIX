@@ -1827,6 +1827,7 @@ class MainActivity : AppCompatActivity() {
         if (originAnchorNode == null) {
             originAnchorNode = anchorNode
             layerGlbManager?.setLayersRoot(originAnchorNode)
+            voxelVisualizer.setRootParent(originAnchorNode)
         }
 
         val p = anchor.pose
@@ -2292,6 +2293,7 @@ class MainActivity : AppCompatActivity() {
         userMarkers.clear()
         originAnchorNode = null
         layerGlbManager?.setLayersRoot(null)
+        voxelVisualizer.setRootParent(null)
         updatePointsCount()
         btnAnalyze.isEnabled = false
         sceneBuilder.clearScene()
