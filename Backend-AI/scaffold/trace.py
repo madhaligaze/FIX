@@ -13,6 +13,23 @@ def trace_candidate_grid(trace: list[dict[str, Any]], meta: dict[str, Any] | Non
     add_trace_event(trace, "solver_candidate_grid", meta or {})
 
 
+def trace_element_added(
+    trace: list[dict[str, Any]],
+    element: dict[str, Any],
+    reason: str,
+) -> None:
+    add_trace_event(
+        trace,
+        "solver_element_added",
+        {
+            "reason": str(reason),
+            "type": element.get("type"),
+            "pose": element.get("pose"),
+            "dims": element.get("dims"),
+        },
+    )
+
+
 def trace_validator_result(trace: list[dict[str, Any]], valid: bool, violations: list[dict]) -> None:
     add_trace_event(trace, "solver_validated", {"valid": bool(valid), "violations": violations})
 

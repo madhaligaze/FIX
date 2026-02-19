@@ -199,3 +199,115 @@ def evaluate_unknown_policy(
         required_clearance_m=0.0,
         reason=reason,
     )
+
+
+def check_points_against_unknown(world, points, *, mode: str = "buffer", buffer_m: float = 0.5) -> list[dict[str, Any]]:
+    """Legacy helper: returns per-point unknown violations."""
+    violations: list[dict[str, Any]] = []
+    occ = getattr(world, "occupancy", None)
+    for i, p in enumerate(points or []):
+        label = "unknown"
+        try:
+            if occ is not None and hasattr(occ, "query"):
+                q = occ.query([p])
+                if q and int(q[0]) != 0:
+                    label = "known"
+        except Exception:
+            label = "unknown"
+
+        if mode == "buffer" and label == "unknown":
+            violations.append(
+                {
+                    "type": "UNKNOWN_BUFFER",
+                    "point_index": i,
+                    "position": [float(p[0]), float(p[1]), float(p[2])],
+                    "buffer_m": float(buffer_m),
+                }
+            )
+    return violations
+
+
+def apply_unknown_policy(world, anchors, policy) -> dict[str, Any]:
+    """
+    Compatibility adapter expected by session routes.
+
+    Returns a serializable policy decision for status endpoints.
+    """
+    cfg = UnknownPolicyConfig(
+        mode=getattr(policy, "unknown_mode", "buffer"),
+        forbid_radius_m=float(getattr(policy, "unknown_forbid_radius_m", 0.35)),
+        buffer_radius_m=float(getattr(policy, "unknown_buffer_radius_m", 0.50)),
+        buffer_clearance_m=float(getattr(policy, "unknown_buffer_clearance_m", 0.15)),
+        max_unknown_fraction=float(getattr(policy, "unknown_max_fraction", 0.05)),
+        samples_per_region=int(getattr(policy, "unknown_samples_per_region", 256)),
+    )
+
+    occupancy = getattr(world, "occupancy", None)
+
+    def _sample(p_w: tuple[float, float, float]) -> str:
+        if occupancy is None:
+            return "unknown"
+        try:
+            if hasattr(occupancy, "sample_label"):
+                return str(occupancy.sample_label(p_w))
+            if hasattr(occupancy, "label_at_world"):
+                return str(occupancy.label_at_world(p_w))
+        except Exception:
+            return "unknown"
+        return "unknown"
+
+    critical_points = []
+    for a in anchors or []:
+        try:
+            p = a.get("position") if isinstance(a, dict) else None
+            if p and len(p) == 3:
+                critical_points.append((float(p[0]), float(p[1]), float(p[2])))
+        except Exception:
+            continue
+
+    if not critical_points:
+        critical_points = [(0.0, 0.0, 0.0)]
+
+    decision = evaluate_unknown_policy(
+        cfg,
+        UnknownSampler(_sample),
+        critical_points_w=critical_points,
+        decision_id="session_status_unknown_policy",
+    )
+
+    occ_stats = {}
+    occupancy = getattr(world, "occupancy", None)
+    if occupancy is not None and hasattr(occupancy, "stats"):
+        try:
+            occ_stats = occupancy.stats(points=critical_points) or {}
+        except Exception:
+            occ_stats = {}
+
+    unknown_ratio = float(decision.unknown_fraction)
+    total = float(occ_stats.get("total", 0) or 0)
+    if total > 0:
+        unknown_ratio = float(occ_stats.get("unknown", 0) or 0) / total
+
+    violations: list[dict[str, Any]] = []
+    if cfg.mode == "forbid" and (not decision.ok):
+        violations.append({"type": "UNKNOWN_FORBID", "reason": decision.reason})
+    if cfg.mode == "buffer" and float(decision.required_clearance_m) > 0:
+        violations.append(
+            {
+                "type": "UNKNOWN_BUFFER",
+                "required_clearance_m": float(decision.required_clearance_m),
+                "reason": decision.reason,
+            }
+        )
+
+    return {
+        "ok": decision.ok,
+        "mode": decision.mode,
+        "unknown_fraction": decision.unknown_fraction,
+        "unknown_ratio_near_support": unknown_ratio,
+        "radius_m": decision.radius_m,
+        "required_clearance_m": decision.required_clearance_m,
+        "reason": decision.reason,
+        "violations": violations,
+        "counts": {"violations": len(violations)},
+    }

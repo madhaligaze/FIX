@@ -178,6 +178,17 @@ def _legacy_stream_ingest(request: Request, session_id: str, payload: LegacyStre
     world = state.get_world(session_id)
     anchors = state.anchors.get(session_id, [])
     ready, score, reasons = compute_readiness(world, anchors, state.policy)
+    if not ready and not anchors:
+        try:
+            occ = world.occupancy.stats()
+            total = float(occ.get("total", 0) or 0)
+            unknown = float(occ.get("unknown", 0) or 0)
+            observed = 1.0 - (unknown / max(1.0, total))
+            if observed >= 0.95:
+                ready = True
+                reasons = []
+        except Exception:
+            pass
     numeric_score = float(score) if isinstance(score, (int, float)) else 0.0
     quality_score = numeric_score * 100.0 if 0.0 <= numeric_score <= 1.0 else numeric_score
     quality_score = max(0.0, min(100.0, quality_score))

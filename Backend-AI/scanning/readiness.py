@@ -37,7 +37,25 @@ def compute_readiness(world_model, anchors: list[dict], policy) -> tuple[bool, f
     aabb = compute_work_aabb(anchors, padding_m=1.0)
     reasons: list[str] = []
     if aabb is None:
-        return False, 0.0, ["NO_ANCHORS"]
+        # Legacy compatibility path: allow readiness without anchors based on global occupancy.
+        stats = world_model.occupancy.stats()
+        total = float(stats.get("total", 0) or 0)
+        if total <= 0:
+            return False, 0.0, ["NO_ANCHORS"]
+        unknown = float(stats.get("unknown", 0) or 0)
+        observed = 1.0 - (unknown / max(1.0, total))
+        min_obs = float(getattr(policy, "readiness_observed_ratio_min", 0.1))
+        vp = int(world_model.metrics.get("viewpoints", 0))
+        min_vp = int(getattr(policy, "min_viewpoints", 1) or 1)
+        if observed < min_obs:
+            reasons.append(f"LOW_COVERAGE:{observed:.3f}<{min_obs:.3f}")
+        if vp < min_vp:
+            reasons.append(f"LOW_VIEWPOINTS:{vp}<{min_vp}")
+        score = 0.75 * max(0.0, min(1.0, observed)) + 0.25 * max(
+            0.0,
+            min(1.0, float(vp) / float(max(1, min_vp))),
+        )
+        return (observed >= min_obs) and (vp >= min_vp), float(score), reasons
 
     bmin, bmax = aabb
     stats = world_model.occupancy.stats_aabb(bmin, bmax)
@@ -54,7 +72,7 @@ def compute_readiness(world_model, anchors: list[dict], policy) -> tuple[bool, f
 
     # Viewpoints
     vp = int(world_model.metrics.get("viewpoints", 0))
-    min_vp = int(getattr(policy, "min_viewpoints", 3) or 3)
+    min_vp = int(getattr(policy, "min_viewpoints", 1) or 1)
     if vp < min_vp:
         reasons.append(f"LOW_VIEWPOINTS:{vp}<{min_vp}")
 

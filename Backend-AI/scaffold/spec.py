@@ -35,3 +35,17 @@ class Catalog:
 
 
 DEFAULT_CATALOG = Catalog()
+
+
+@dataclass(frozen=True)
+class ScaffoldSpec:
+    default_height_m: float = 4.0
+    min_bay_m: float = 1.2
+    max_bay_m: float = 3.0
+    post_radius_m: float = 0.03
+    ledger_radius_m: float = 0.025
+    brace_radius_m: float = 0.02
+    ledger_lengths_m: tuple[float, ...] = (1.2, 1.8, 2.4, 3.0)
+
+
+DEFAULT_SPEC = ScaffoldSpec()
