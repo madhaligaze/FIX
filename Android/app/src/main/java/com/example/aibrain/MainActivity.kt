@@ -304,7 +304,7 @@ class MainActivity : AppCompatActivity() {
             requestCameraPermission()
         }
         sceneBuilder = SceneBuilder(sceneView)
-        physicsAnimator = PhysicsAnimator(sceneView, sceneBuilder, this)
+        // physicsAnimator is initialized below, after soundManager is created
 
         showLoadingDialog("Загрузка моделей...")
         lifecycleScope.launch {
@@ -327,6 +327,8 @@ class MainActivity : AppCompatActivity() {
         viewModel = StructureViewModel(api)
         soundManager = SoundManager(this)
         voxelVisualizer = VoxelVisualizer(sceneView, lifecycleScope)
+        // Pass shared soundManager to avoid double SoundPool instance
+        physicsAnimator = PhysicsAnimator(sceneView, sceneBuilder, this, soundManager)
 
         lifecycleScope.launch {
             viewModel.structureState.collect { state ->
@@ -539,6 +541,8 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         stopStreaming()
         stopHealthLoop()
+        voxelPollJob?.cancel()
+        voxelPollJob = null
         scope.cancel()
         clearARAnchors()
 
@@ -994,7 +998,7 @@ class MainActivity : AppCompatActivity() {
             if (success) {
                 vibrate(30)
 
-                val pointCount = arRuler.getCurrentDistance()
+                val pointCount = arRuler.getPointCount()
                 tvRulerPointCount.text = "$pointCount"
 
                 if (pointCount >= 2) {
@@ -1501,7 +1505,7 @@ class MainActivity : AppCompatActivity() {
         streamJob = scope.launch {
             while (isActive && isStreaming && currentSessionId == sid) {
                 if (streamSendJob?.isActive == true) {
-                    consecutiveFailures += 1
+                    // Previous frame still sending — skip this tick (backpressure, NOT a failure)
                 } else {
                     streamSendJob = launch(Dispatchers.IO) {
                         val ok = try {

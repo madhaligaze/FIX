@@ -23,10 +23,10 @@ import kotlin.random.Random
 class PhysicsAnimator(
     private val sceneView: ArSceneView,
     private val sceneBuilder: SceneBuilder,
-    context: Context
+    context: Context,
+    // Shared SoundManager injected from caller (MainActivity) to avoid double SoundPool
+    private val soundManager: SoundManager? = null
 ) {
-
-    private val soundManager = SoundManager(context)
     private val effectScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val particleSystem = ParticleSystem(sceneView, effectScope)
     private val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -44,7 +44,7 @@ class PhysicsAnimator(
             return
         }
 
-        soundManager.play(SoundType.COLLAPSE, volume = 1.0f, pitch = 0.8f)
+        soundManager?.play(SoundType.COLLAPSE, volume = 1.0f, pitch = 0.8f)
         vibrateCollapse(collapsedIds.size)
 
         collapsedIds.forEach { id ->
@@ -70,7 +70,7 @@ class PhysicsAnimator(
 
             if (nextY <= groundY) {
                 val impactIntensity = (-state.velocityY / 10f).coerceIn(0.3f, 1.0f)
-                soundManager.play3D(
+                soundManager?.play3D(
                     SoundType.DUST_IMPACT,
                     distance = currentPos.length(),
                     pitch = 0.8f + Random.nextFloat() * 0.4f
@@ -129,13 +129,13 @@ class PhysicsAnimator(
     fun stopAll() {
         activeAnimations.clear()
         sceneView.scene.removeOnUpdateListener(::onUpdate)
-        soundManager.stopAll()
+        soundManager?.stopAll()
     }
 
     fun release() {
         stopAll()
         effectScope.cancel()
-        soundManager.release()
+        // NOTE: soundManager is owned by the caller (MainActivity) — do NOT release it here
     }
 
     private data class FallingState(

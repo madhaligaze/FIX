@@ -20,9 +20,8 @@ class ARSessionManager(
             val session = sceneView.session ?: return@addOnUpdateListener
             if (sessionConfigured) return@addOnUpdateListener
 
-            val rawDepthMode = enumValues<Config.DepthMode>().firstOrNull { it.name == "RAW_DEPTH_ONLY" }
             val selectedDepthMode = when {
-                rawDepthMode != null && session.isDepthModeSupported(rawDepthMode) -> rawDepthMode
+                session.isDepthModeSupported(Config.DepthMode.RAW_DEPTH_ONLY) -> Config.DepthMode.RAW_DEPTH_ONLY
                 session.isDepthModeSupported(Config.DepthMode.AUTOMATIC) -> Config.DepthMode.AUTOMATIC
                 else -> Config.DepthMode.DISABLED
             }
