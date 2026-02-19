@@ -2,8 +2,10 @@ package com.example.aibrain
 
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
+import android.Manifest
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -29,8 +31,10 @@ import androidx.recyclerview.widget.RecyclerView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
 import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
@@ -44,6 +48,7 @@ import com.example.aibrain.scene.PhysicsAnimator
 import com.example.aibrain.scene.SceneBuilder
 import com.example.aibrain.scene.LightingSetup
 import com.example.aibrain.scene.LayerGlbManager
+import com.google.ar.core.exceptions.CameraNotAvailableException
 import com.google.ar.sceneform.ArSceneView
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.floatingactionbutton.FloatingActionButton
@@ -104,6 +109,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val REQ_CAMERA_PERMISSION = 1001
         private const val MAX_SESSION_RETRY = 5
         private const val SESSION_RETRY_DELAY_MS = 1_500L
         private const val MAX_FAIL_WARN = 3
@@ -122,6 +128,7 @@ class MainActivity : AppCompatActivity() {
     // UI ЭЛЕМЕНТЫ - ОСНОВНЫЕ
     // ══════════════════════════════════════════════════════════════════════
     private lateinit var sceneView: ArSceneView
+    private var arCoreInstallRequested: Boolean = false
     private lateinit var arManager: ARSessionManager
     private lateinit var tvAiHint: TextView
     private lateinit var tvFrameCounter: TextView
@@ -257,9 +264,15 @@ class MainActivity : AppCompatActivity() {
         rebuildApiClient()
 
         initViews()
-        setupARScene()
         setupClickListeners()
-        initializeRuler()
+
+        // Camera permission is required for ARCore / ruler.
+        if (hasCameraPermission()) {
+            setupARScene()
+            initializeRuler()
+        } else {
+            requestCameraPermission()
+        }
         sceneBuilder = SceneBuilder(sceneView)
         physicsAnimator = PhysicsAnimator(sceneView, sceneBuilder, this)
 
@@ -268,7 +281,12 @@ class MainActivity : AppCompatActivity() {
             val result = ModelAssets.loadAll(this@MainActivity)
             result.onSuccess {
                 hideLoadingDialog()
-                Log.d("ModelAssets", "✅ Все модели загружены успешно")
+                if (ModelAssets.isReady()) {
+                    Log.d("ModelAssets", "✅ Все модели загружены успешно")
+                } else {
+                    Log.w("ModelAssets", "⚠️ 3D модели не найдены в assets/. Используется упрощенный режим.")
+                    showError("3D модели не найдены. Используется упрощенный режим.")
+                }
             }
             result.onFailure { error ->
                 hideLoadingDialog()
@@ -1495,10 +1513,14 @@ class MainActivity : AppCompatActivity() {
                     null
                 } ?: return@withContext null
 
-                val rgbBase64 = try {
-                    ImageUtils.imageToBase64(image)
+                val nv21 = try {
+                    ImageUtils.copyToNv21(image)
                 } finally {
                     try { image.close() } catch (_: Exception) { }
+                }
+
+                val rgbBase64 = withContext(Dispatchers.Default) {
+                    ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, 75)
                 }
 
                 // Intrinsics
@@ -2176,4 +2198,70 @@ class MainActivity : AppCompatActivity() {
         btnAnalyze.isEnabled = false
         sceneBuilder.clearScene()
     }
+
+
+    private fun hasCameraPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestCameraPermission() {
+        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA_PERMISSION)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_CAMERA_PERMISSION) {
+            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                setupARScene()
+                initializeRuler()
+            } else {
+                showError("Нет доступа к камере. AR и рулетка недоступны.")
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+
+        if (!hasCameraPermission()) {
+            requestCameraPermission()
+            return
+        }
+
+        // Ensure ARCore is installed / updated.
+        try {
+            when (ArCoreApk.getInstance().requestInstall(this, !arCoreInstallRequested)) {
+                ArCoreApk.InstallStatus.INSTALL_REQUESTED -> {
+                    arCoreInstallRequested = true
+                    return
+                }
+
+                ArCoreApk.InstallStatus.INSTALLED -> {
+                    // continue
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("MainActivity", "ARCore install/request failed: ${e.message}", e)
+            showError("ARCore не установлен или не поддерживается.")
+            return
+        }
+
+        try {
+            sceneView.resume()
+        } catch (e: CameraNotAvailableException) {
+            Log.e("MainActivity", "Camera not available on resume", e)
+            showError("Камера недоступна. Закройте другие приложения, использующие камеру.")
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        runCatching { sceneView.pause() }
+    }
+
 }

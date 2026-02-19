@@ -34,17 +34,40 @@ class SoundManager(private val context: Context) {
      */
     private fun loadSounds() {
         try {
-            sounds[SoundType.COLLAPSE] = soundPool.load(context, R.raw.metal_crash, 1)
-            sounds[SoundType.PLACE] = soundPool.load(context, R.raw.metal_place, 1)
-            sounds[SoundType.REMOVE] = soundPool.load(context, R.raw.metal_remove, 1)
-            sounds[SoundType.STRESS] = soundPool.load(context, R.raw.structure_stress, 1)
-            sounds[SoundType.WHOOSH] = soundPool.load(context, R.raw.whoosh_build, 1)
-            sounds[SoundType.DUST_IMPACT] = soundPool.load(context, R.raw.dust_impact, 1)
+            loadIfValid(SoundType.COLLAPSE, R.raw.metal_crash)
+            loadIfValid(SoundType.PLACE, R.raw.metal_place)
+            loadIfValid(SoundType.REMOVE, R.raw.metal_remove)
+            loadIfValid(SoundType.STRESS, R.raw.structure_stress)
+            loadIfValid(SoundType.WHOOSH, R.raw.whoosh_build)
+            loadIfValid(SoundType.DUST_IMPACT, R.raw.dust_impact)
 
             Log.d("SoundManager", "✅ Все звуки загружены")
         } catch (e: Exception) {
             Log.e("SoundManager", "❌ Ошибка загрузки звуков: ${e.message}")
         }
+    }
+
+
+
+    /**
+     * Some repos ship placeholder raw resources (very small). SoundPool will fail and spam logs.
+     * We skip suspiciously-small files to keep startup stable.
+     */
+    private fun loadIfValid(type: SoundType, resId: Int, minBytes: Long = 1024L) {
+        val afd = runCatching { context.resources.openRawResourceFd(resId) }.getOrNull()
+        if (afd == null) {
+            Log.w("SoundManager", "⚠️ raw resource missing for $type")
+            return
+        }
+        val len = afd.length
+        afd.close()
+
+        if (len in 1 until minBytes) {
+            Log.w("SoundManager", "⚠️ raw resource too small ($len bytes) for $type, skipping")
+            return
+        }
+
+        sounds[type] = soundPool.load(context, resId, 1)
     }
 
     /**
