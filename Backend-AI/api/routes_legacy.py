@@ -69,7 +69,19 @@ def _decode_base64(value: str | None) -> bytes | None:
     if not value:
         return None
     try:
-        return base64.b64decode(value)
+        v = value.strip()
+
+        # Accept data-URL payloads, e.g. "data:image/jpeg;base64,AAAA...".
+        # Android normally sends raw base64, but some clients (or future changes) may wrap it.
+        if v.startswith("data:") and "," in v:
+            v = v.split(",", 1)[1].strip()
+
+        # Be tolerant to newlines/spaces and urlsafe base64 variants.
+        v = v.replace("\n", "").replace("\r", "").replace(" ", "")
+        try:
+            return base64.b64decode(v)
+        except Exception:
+            return base64.urlsafe_b64decode(v)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {exc}") from exc
 
