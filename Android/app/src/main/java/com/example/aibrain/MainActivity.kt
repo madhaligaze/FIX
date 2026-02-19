@@ -46,6 +46,7 @@ import io.github.sceneview.ar.ArSceneView
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collectLatest
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import java.util.ArrayDeque
@@ -87,13 +88,6 @@ class MainActivity : AppCompatActivity() {
         RESULTS         // Финальные результаты
     }
 
-    private enum class ConnectionStatus {
-        UNKNOWN,
-        ONLINE,
-        RECONNECTING,
-        OFFLINE
-    }
-
     companion object {
         private const val MAX_SESSION_RETRY = 5
         private const val SESSION_RETRY_DELAY_MS = 1_500L
@@ -122,6 +116,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvModeStatus: TextView
     private lateinit var statusIndicator: View
     private lateinit var tvSystemStatus: TextView
+    private lateinit var connectionDot: View
     private lateinit var pbQuality: ProgressBar
     private lateinit var tvQuality: TextView
     private lateinit var tvAiCritique: TextView
@@ -177,7 +172,6 @@ class MainActivity : AppCompatActivity() {
     private var streamJob: Job? = null
     private var healthJob: Job? = null
     private var voxelPollJob: Job? = null
-    private var connectionStatus: ConnectionStatus = ConnectionStatus.UNKNOWN
     private var lastConnectionDetail: String? = null
     private var consecutiveFailures = 0
     private var isReconnecting = false
@@ -283,8 +277,15 @@ class MainActivity : AppCompatActivity() {
 
         viewModel.saveSnapshot(sceneBuilder.getAllElements(), "Исходное состояние")
 
+        // UI статуса соединения слушает ViewModel (единый источник правды)
+        lifecycleScope.launch {
+            viewModel.connectionState.collectLatest { st ->
+                updateConnectionUi(st.status, st.detail)
+            }
+        }
+
         startHealthLoop()
-        updateConnectionUi(ConnectionStatus.UNKNOWN, "")
+        viewModel.setConnectionState(ConnectionStatus.UNKNOWN, "")
 
         transitionTo(AppState.IDLE)
     }
@@ -301,6 +302,9 @@ class MainActivity : AppCompatActivity() {
         tvModeStatus = findViewById(R.id.tv_mode_status)
         statusIndicator = findViewById(R.id.status_indicator)
         tvSystemStatus = findViewById(R.id.tv_system_status)
+
+        // legacy dot (из аудита) - держим в синхроне
+        connectionDot = findViewById(R.id.connection_dot)
         pbQuality = findViewById(R.id.pb_quality)
         tvQuality = findViewById(R.id.tv_quality)
         tvAiCritique = findViewById(R.id.tv_ai_critique)
@@ -778,7 +782,7 @@ class MainActivity : AppCompatActivity() {
             viewModel.updateApiService(api)
         }
         if (::statusIndicator.isInitialized && ::tvSystemStatus.isInitialized) {
-            updateConnectionUi(ConnectionStatus.UNKNOWN, "${baseUrl}")
+            viewModel.setConnectionState(ConnectionStatus.UNKNOWN, "${baseUrl}")
         }
     }
 
@@ -807,7 +811,6 @@ class MainActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════════════════════════════
 
     private fun updateConnectionUi(status: ConnectionStatus, detail: String? = null) {
-        connectionStatus = status
         lastConnectionDetail = detail
 
         val (dotRes, label) = when (status) {
@@ -818,6 +821,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         statusIndicator.setBackgroundResource(dotRes)
+        connectionDot.setBackgroundResource(dotRes)
         tvSystemStatus.text = if (detail.isNullOrBlank()) label else (label + " | " + detail)
     }
 
@@ -835,15 +839,15 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     val base = getCurrentServerUrl().trimEnd('/')
                     if (ok) {
-                        updateConnectionUi(ConnectionStatus.ONLINE, base)
+                        viewModel.setConnectionState(ConnectionStatus.ONLINE, base)
                     } else {
                         // Если сейчас идет стрим - показываем деградацию, иначе OFFLINE
                         val st = if (isStreaming) ConnectionStatus.RECONNECTING else ConnectionStatus.OFFLINE
-                        updateConnectionUi(st, base)
+                        viewModel.setConnectionState(st, base)
                     }
                 }
 
-                delay(3_000L)
+                delay(15_000L)
             }
         }
     }
@@ -1240,7 +1244,7 @@ class MainActivity : AppCompatActivity() {
 
     private suspend fun doStartSession() {
         val base = getCurrentServerUrl().trimEnd('/')
-        updateConnectionUi(ConnectionStatus.UNKNOWN, base)
+        viewModel.setConnectionState(ConnectionStatus.UNKNOWN, base)
 
         var lastError: String? = null
         for (attempt in 1..MAX_SESSION_RETRY) {
@@ -1253,7 +1257,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 if (!healthOk) {
-                    updateConnectionUi(ConnectionStatus.OFFLINE, base)
+                    viewModel.setConnectionState(ConnectionStatus.OFFLINE, base)
                     lastError = "HEALTH_FAIL"
                     delay(SESSION_RETRY_DELAY_MS * attempt)
                     continue
@@ -1268,7 +1272,7 @@ class MainActivity : AppCompatActivity() {
                     consecutiveFailures = 0
                     frameCount = 0
 
-                    updateConnectionUi(ConnectionStatus.ONLINE, base)
+                    viewModel.setConnectionState(ConnectionStatus.ONLINE, base)
                     showHint("✓ Сессия создана")
                     transitionTo(AppState.SCANNING)
                     startStreamingLoop()
@@ -1280,7 +1284,7 @@ class MainActivity : AppCompatActivity() {
                 lastError = e.message
             }
 
-            updateConnectionUi(ConnectionStatus.RECONNECTING, base)
+            viewModel.setConnectionState(ConnectionStatus.RECONNECTING, base)
             delay(SESSION_RETRY_DELAY_MS * attempt)
         }
 
@@ -1310,12 +1314,12 @@ class MainActivity : AppCompatActivity() {
 
                 if (consecutiveFailures >= MAX_FAIL_RECONNECT) {
                     val base = getCurrentServerUrl().trimEnd('/')
-                    updateConnectionUi(ConnectionStatus.OFFLINE, base)
+                    viewModel.setConnectionState(ConnectionStatus.OFFLINE, base)
                     val backoff = min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * consecutiveFailures.toLong())
                     delay(backoff)
                 } else if (consecutiveFailures > 0) {
                     val base = getCurrentServerUrl().trimEnd('/')
-                    updateConnectionUi(ConnectionStatus.RECONNECTING, base)
+                    viewModel.setConnectionState(ConnectionStatus.RECONNECTING, base)
                 }
 
                 updateFrameCounter()
@@ -1330,6 +1334,18 @@ class MainActivity : AppCompatActivity() {
 
         // 1) Сбор данных кадра с main thread
         val payload = withContext(Dispatchers.Main) {
+            val manualMeasurements = runCatching {
+                arRuler.getSavedMeasurements().map { m ->
+                    mapOf(
+                        "id" to m.id,
+                        "type" to m.type.name,
+                        "distance_m" to m.distance,
+                        "label" to m.label,
+                        "timestamp_ms" to m.timestamp
+                    )
+                }
+            }.getOrDefault(emptyList())
+
             val frame = try {
                 sceneView.arSession?.update()
             } catch (_: Exception) {
@@ -1404,7 +1420,7 @@ class MainActivity : AppCompatActivity() {
                     emptyList()
                 }
 
-                hashMapOf<String, Any>(
+                val basePayload = hashMapOf<String, Any>(
                     "frame_id" to ("frm_" + frameCount),
                     "timestamp" to (System.currentTimeMillis() / 1000.0),
                     "rgb_base64" to rgbBase64,
@@ -1422,6 +1438,11 @@ class MainActivity : AppCompatActivity() {
                     ),
                     "point_cloud" to points
                 )
+
+                if (manualMeasurements.isNotEmpty()) {
+                    basePayload["manual_measurements"] = manualMeasurements
+                }
+                basePayload
             } catch (_: Exception) {
                 null
             }

@@ -13,6 +13,13 @@ class StructureViewModel(
     private var apiService: ApiService
 ) : ViewModel() {
 
+    private val _connectionState = MutableStateFlow(ConnectionState())
+    val connectionState: StateFlow<ConnectionState> = _connectionState
+
+    fun setConnectionState(status: ConnectionStatus, detail: String = "") {
+        _connectionState.value = ConnectionState(status = status, detail = detail)
+    }
+
     private val _editMode = MutableStateFlow(EditMode.EDIT)
     val editMode: StateFlow<EditMode> = _editMode
 
