@@ -26,16 +26,15 @@ import android.widget.TextView
 import android.widget.Switch
 import android.widget.ProgressBar
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.ar.core.ArCoreApk
-import com.google.ar.core.Config
 import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
 import com.google.ar.sceneform.AnchorNode
@@ -109,7 +108,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        private const val REQ_CAMERA_PERMISSION = 1001
         private const val MAX_SESSION_RETRY = 5
         private const val SESSION_RETRY_DELAY_MS = 1_500L
         private const val MAX_FAIL_WARN = 3
@@ -238,6 +236,23 @@ class MainActivity : AppCompatActivity() {
     private var eyeOfAIActive = false
     private var layerGlbManager: LayerGlbManager? = null
     private var exportedLayers: List<UiLayer> = emptyList()
+    private var originAnchorNode: AnchorNode? = null
+    private var streamSendJob: Job? = null
+    private var isArSceneReady = false
+    private var isRulerReady = false
+    private var depthUnavailableStreak = 0
+    private var depthHintShown = false
+    private var arcoreHintShown = false
+
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            startArIfReady()
+        } else {
+            showError("Нет доступа к камере. AR и рулетка недоступны.")
+        }
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // СОСТОЯНИЕ - AR RULER
@@ -268,8 +283,7 @@ class MainActivity : AppCompatActivity() {
 
         // Camera permission is required for ARCore / ruler.
         if (hasCameraPermission()) {
-            setupARScene()
-            initializeRuler()
+            startArIfReady()
         } else {
             requestCameraPermission()
         }
@@ -405,6 +419,20 @@ class MainActivity : AppCompatActivity() {
         tvRulerInstruction = findViewById(R.id.tv_ruler_instruction)
         accuracyDot = findViewById(R.id.accuracy_dot)
         tvAccuracy = findViewById(R.id.tv_accuracy)
+    }
+
+
+    private fun startArIfReady() {
+        if (!::sceneView.isInitialized) return
+        if (!hasCameraPermission()) return
+        if (!isArSceneReady) {
+            setupARScene()
+            isArSceneReady = true
+        }
+        if (!isRulerReady) {
+            initializeRuler()
+            isRulerReady = true
+        }
     }
 
     private fun setupARScene() {
@@ -725,6 +753,7 @@ class MainActivity : AppCompatActivity() {
                 if (layerGlbManager == null) {
                     layerGlbManager = LayerGlbManager(this@MainActivity, sceneView, getCurrentServerUrl())
                 }
+                layerGlbManager?.setLayersRoot(originAnchorNode)
 
                 for (layer in layers) {
                     val path = layer.file?.glb?.path ?: layer.file?.path
@@ -1452,18 +1481,25 @@ class MainActivity : AppCompatActivity() {
 
         isStreaming = true
         streamJob?.cancel()
+        streamSendJob?.cancel()
         streamJob = scope.launch {
             while (isActive && isStreaming && currentSessionId == sid) {
-                val ok = try {
-                    withContext(Dispatchers.IO) { sendFrame() }
-                } catch (_: Exception) {
-                    false
-                }
+                if (streamSendJob?.isActive != true) {
+                    streamSendJob = launch(Dispatchers.IO) {
+                        val ok = try {
+                            sendFrame()
+                        } catch (_: Exception) {
+                            false
+                        }
 
-                if (!ok) {
-                    consecutiveFailures += 1
-                } else {
-                    consecutiveFailures = 0
+                        withContext(Dispatchers.Main) {
+                            if (!ok) {
+                                consecutiveFailures += 1
+                            } else {
+                                consecutiveFailures = 0
+                            }
+                        }
+                    }
                 }
 
                 if (consecutiveFailures >= MAX_FAIL_RECONNECT) {
@@ -1486,8 +1522,13 @@ class MainActivity : AppCompatActivity() {
     private suspend fun sendFrame(): Boolean {
         val sid = currentSessionId ?: return false
 
-        // 1) Сбор данных кадра с main thread
-        val payload = withContext(Dispatchers.Main) {
+        data class FramePacket(
+            val payload: HashMap<String, Any>,
+            val nv21: ImageUtils.Nv21Frame,
+            val depth: DepthUtils.DepthFrame?
+        )
+
+        val packet = withContext(Dispatchers.Main) {
             val manualMeasurements = runCatching {
                 arRuler.getSavedMeasurements().map { m ->
                     mapOf(
@@ -1506,7 +1547,6 @@ class MainActivity : AppCompatActivity() {
                 val cam = frame.camera
                 if (cam.trackingState != TrackingState.TRACKING) return@withContext null
 
-                // RGB
                 val image = try {
                     frame.acquireCameraImage()
                 } catch (_: Exception) {
@@ -1514,36 +1554,31 @@ class MainActivity : AppCompatActivity() {
                 } ?: return@withContext null
 
                 val nv21 = try {
-                    ImageUtils.copyToNv21(image)
+                    ImageUtils.yuv420ToNv21(image)
                 } finally {
-                    try { image.close() } catch (_: Exception) { }
+                    runCatching { image.close() }
                 }
 
-                val rgbBase64 = withContext(Dispatchers.Default) {
-                    ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, 75)
+                val depthImage = DepthUtils.tryAcquireDepth16(frame)
+                val depthFrame = depthImage?.let {
+                    try {
+                        DepthUtils.copyDepth16(it)
+                    } finally {
+                        runCatching { it.close() }
+                    }
                 }
 
-                // Intrinsics
                 val intr = cam.imageIntrinsics
                 val focal = intr.focalLength
                 val pp = intr.principalPoint
                 val dims = intr.imageDimensions
 
-                val fx = focal[0].toDouble()
-                val fy = focal[1].toDouble()
-                val cx = pp[0].toDouble()
-                val cy = pp[1].toDouble()
-                val w = dims[0].toInt()
-                val h = dims[1].toInt()
-
-                // Pose
                 val pose = cam.pose
                 val q = FloatArray(4)
                 pose.getRotationQuaternion(q, 0)
                 val position = listOf(pose.tx(), pose.ty(), pose.tz())
                 val quaternion = listOf(q[0], q[1], q[2], q[3])
 
-                // Point cloud
                 val pc = try {
                     frame.acquirePointCloud()
                 } catch (_: Exception) {
@@ -1560,15 +1595,12 @@ class MainActivity : AppCompatActivity() {
                         var i = 0
                         while (i < total) {
                             val baseIdx = i * 4
-                            val x = buf.get(baseIdx)
-                            val y = buf.get(baseIdx + 1)
-                            val z = buf.get(baseIdx + 2)
-                            out.add(listOf(x, y, z))
+                            out.add(listOf(buf.get(baseIdx), buf.get(baseIdx + 1), buf.get(baseIdx + 2)))
                             i += step
                         }
                         out
                     } finally {
-                        try { pc.release() } catch (_: Exception) { }
+                        runCatching { pc.release() }
                     }
                 } else {
                     emptyList()
@@ -1577,15 +1609,14 @@ class MainActivity : AppCompatActivity() {
                 val basePayload = hashMapOf<String, Any>(
                     "frame_id" to ("frm_" + frameCount),
                     "timestamp" to (System.currentTimeMillis() / 1000.0),
-                    "rgb_base64" to rgbBase64,
                     "measurements_json" to runCatching { arRuler.exportMeasurements() }.getOrDefault(""),
                     "intrinsics" to mapOf(
-                        "fx" to fx,
-                        "fy" to fy,
-                        "cx" to cx,
-                        "cy" to cy,
-                        "width" to w,
-                        "height" to h
+                        "fx" to focal[0].toDouble(),
+                        "fy" to focal[1].toDouble(),
+                        "cx" to pp[0].toDouble(),
+                        "cy" to pp[1].toDouble(),
+                        "width" to dims[0].toInt(),
+                        "height" to dims[1].toInt()
                     ),
                     "pose" to mapOf(
                         "position" to position,
@@ -1597,24 +1628,47 @@ class MainActivity : AppCompatActivity() {
                 if (manualMeasurements.isNotEmpty()) {
                     basePayload["manual_measurements"] = manualMeasurements
                 }
-                basePayload
+
+                FramePacket(basePayload, nv21, depthFrame)
             } catch (_: Exception) {
                 null
             }
         }
 
-        if (payload == null) return true // кадр не готов - не считаем это сетевой ошибкой
+        if (packet == null) return true
 
-        // 2) Отправка
+        withContext(Dispatchers.Main) {
+            if (packet.depth == null) {
+                depthUnavailableStreak += 1
+                if (!depthHintShown && depthUnavailableStreak >= 5) {
+                    depthHintShown = true
+                    showHint("⚠️ Depth недоступен на устройстве или отключён в ARCore")
+                }
+            } else {
+                depthUnavailableStreak = 0
+            }
+        }
+
+        val payload = withContext(Dispatchers.Default) {
+            packet.payload.apply {
+                this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(packet.nv21.data, packet.nv21.width, packet.nv21.height, 75)
+                val depth = packet.depth
+                if (depth != null) {
+                    this["depth_base64"] = DepthUtils.depthBytesToBase64(depth.bytes)
+                    this["depth_width"] = depth.width
+                    this["depth_height"] = depth.height
+                    this["depth_scale"] = depth.scaleMPerUnit
+                }
+            }
+        }
+
         val resp = try {
             api.streamData(sid, payload)
         } catch (_: Exception) {
             return false
         }
 
-        if (!resp.isSuccessful) {
-            return false
-        }
+        if (!resp.isSuccessful) return false
 
         val body = resp.body() ?: return true
 
@@ -1645,6 +1699,8 @@ class MainActivity : AppCompatActivity() {
         isStreaming = false
         streamJob?.cancel()
         streamJob = null
+        streamSendJob?.cancel()
+        streamSendJob = null
     }
 
     private suspend fun doRequestModeling() {
@@ -1732,6 +1788,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         anchorNodes.add(anchorNode)
+        if (originAnchorNode == null) {
+            originAnchorNode = anchorNode
+            layerGlbManager?.setLayersRoot(originAnchorNode)
+        }
 
         val p = anchor.pose
         val markerId = "a-${UUID.randomUUID().toString().take(8)}"
@@ -2194,6 +2254,8 @@ class MainActivity : AppCompatActivity() {
         anchorNodes.clear()
         anchorMarkerNodes.clear()
         userMarkers.clear()
+        originAnchorNode = null
+        layerGlbManager?.setLayersRoot(null)
         updatePointsCount()
         btnAnalyze.isEnabled = false
         sceneBuilder.clearScene()
@@ -2205,24 +2267,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestCameraPermission() {
-        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA_PERMISSION)
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_CAMERA_PERMISSION) {
-            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-            if (granted) {
-                setupARScene()
-                initializeRuler()
-            } else {
-                showError("Нет доступа к камере. AR и рулетка недоступны.")
-            }
-        }
+        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
     override fun onResume() {
@@ -2247,9 +2292,14 @@ class MainActivity : AppCompatActivity() {
             }
         } catch (e: Exception) {
             Log.e("MainActivity", "ARCore install/request failed: ${e.message}", e)
-            showError("ARCore не установлен или не поддерживается.")
+            if (!arcoreHintShown) {
+                arcoreHintShown = true
+                showError("ARCore не установлен или не поддерживается.")
+            }
             return
         }
+
+        startArIfReady()
 
         try {
             sceneView.resume()
@@ -2261,6 +2311,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        stopStreaming()
         runCatching { sceneView.pause() }
     }
 
