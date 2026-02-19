@@ -32,6 +32,12 @@ class ARSessionManager(
                 lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
                 planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
                 depthMode = selectedDepthMode
+
+                depthMode = when {
+                    session.isDepthModeSupported(Config.DepthMode.RAW_DEPTH_ONLY) -> Config.DepthMode.RAW_DEPTH_ONLY
+                    session.isDepthModeSupported(Config.DepthMode.AUTOMATIC) -> Config.DepthMode.AUTOMATIC
+                    else -> Config.DepthMode.DISABLED
+                }
             }
 
             session.configure(config)

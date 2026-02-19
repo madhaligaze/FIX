@@ -55,6 +55,7 @@ object DepthUtils {
         }
 
         return DepthFrame(bytes = out, width = width, height = height) // uint16 little-endian millimeters
+        return DepthFrame(bytes = out, width = width, height = height)
     }
 
     fun depthBytesToBase64(bytes: ByteArray): String = Base64.encodeToString(bytes, Base64.NO_WRAP)

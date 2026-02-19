@@ -6,6 +6,7 @@ import android.Manifest
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -33,6 +34,8 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Plane
@@ -272,8 +275,20 @@ class MainActivity : AppCompatActivity() {
     // LIFECYCLE
     // ══════════════════════════════════════════════════════════════════════
 
+
+
+    private fun applySystemBars() {
+        WindowCompat.setDecorFitsSystemWindows(window, true)
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = ContextCompat.getColor(this, R.color.navigation_bar)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applySystemBars()
         setContentView(R.layout.activity_main)
 
         settingsPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -1527,6 +1542,7 @@ class MainActivity : AppCompatActivity() {
             val payload: HashMap<String, Any>,
             val nv21: ImageUtils.Nv21Frame,
             val depthImage: android.media.Image?
+            val depth: DepthUtils.DepthFrame?
         )
 
         val packet = withContext(Dispatchers.Main) {
@@ -1557,11 +1573,20 @@ class MainActivity : AppCompatActivity() {
 
                 val nv21 = try {
                     ImageUtils.yuv420ToNv21(image, swapUv = settingsPrefs.getBoolean(PREF_CAMERA_SWAP_UV, false))
+                    ImageUtils.yuv420ToNv21(image)
                 } finally {
                     runCatching { image.close() }
                 }
 
                 depthImage = DepthUtils.tryAcquireDepth16(frame)
+                val depthImage = DepthUtils.tryAcquireDepth16(frame)
+                val depthFrame = depthImage?.let {
+                    try {
+                        DepthUtils.copyDepth16(it)
+                    } finally {
+                        runCatching { it.close() }
+                    }
+                }
 
                 val intr = cam.imageIntrinsics
                 val focal = intr.focalLength
@@ -1625,6 +1650,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 FramePacket(basePayload, nv21, depthImage)
+                FramePacket(basePayload, nv21, depthFrame)
             } catch (_: Exception) {
                 runCatching { depthImage?.close() }
                 null
@@ -1659,10 +1685,27 @@ class MainActivity : AppCompatActivity() {
             if (payload.containsKey("depth_base64")) {
                 depthUnavailableStreak = 0
             } else {
+        withContext(Dispatchers.Main) {
+            if (packet.depth == null) {
                 depthUnavailableStreak += 1
                 if (!depthHintShown && depthUnavailableStreak >= 5) {
                     depthHintShown = true
                     showHint("⚠️ Depth недоступен на устройстве или отключён в ARCore")
+                }
+            } else {
+                depthUnavailableStreak = 0
+            }
+        }
+
+        val payload = withContext(Dispatchers.Default) {
+            packet.payload.apply {
+                this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(packet.nv21.data, packet.nv21.width, packet.nv21.height, 75)
+                val depth = packet.depth
+                if (depth != null) {
+                    this["depth_base64"] = DepthUtils.depthBytesToBase64(depth.bytes)
+                    this["depth_width"] = depth.width
+                    this["depth_height"] = depth.height
+                    this["depth_scale"] = depth.scaleMPerUnit
                 }
             }
         }

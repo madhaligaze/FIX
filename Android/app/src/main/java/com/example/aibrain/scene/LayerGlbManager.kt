@@ -35,6 +35,7 @@ class LayerGlbManager(
     fun setLayersRoot(anchor: AnchorNode?) {
         layersRoot = anchor
         val parent: NodeParent = anchor ?: sceneView.scene
+        val parent = anchor ?: sceneView.scene
         nodesByLayerId.values.forEach { it.setParent(parent) }
     }
 
@@ -55,6 +56,7 @@ class LayerGlbManager(
                 this.renderable = renderable
                 this.isEnabled = true
                 setParent(nodeParent)
+                setParent(layersRoot ?: sceneView.scene)
             }
             nodesByLayerId[layerId] = node
             node
