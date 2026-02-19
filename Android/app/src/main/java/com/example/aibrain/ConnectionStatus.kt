@@ -1,7 +1,7 @@
 package com.example.aibrain
 
 /**
- * Единый источник правды по состоянию соединения (для UI и логики).
+ * Единый тип состояния соединения (логика + UI).
  */
 enum class ConnectionStatus {
     UNKNOWN,
