@@ -14,21 +14,24 @@ class ARSessionManager(
     private var sessionConfigured: Boolean = false
 
     fun setupSession() {
-        // Sceneform ArSceneView не имеет lightEstimationMode/depthEnabled как свойства.
-        // Настраиваем ARCore Session через Config один раз, когда Session станет доступна.
         sceneView.planeRenderer.isVisible = true
 
         sceneView.scene.addOnUpdateListener {
             val session = sceneView.session ?: return@addOnUpdateListener
             if (sessionConfigured) return@addOnUpdateListener
 
+            val rawDepthMode = runCatching { Config.DepthMode.valueOf("RAW_DEPTH_ONLY") }.getOrNull()
+            val selectedDepthMode = when {
+                rawDepthMode != null && session.isDepthModeSupported(rawDepthMode) -> rawDepthMode
+                session.isDepthModeSupported(Config.DepthMode.AUTOMATIC) -> Config.DepthMode.AUTOMATIC
+                else -> Config.DepthMode.DISABLED
+            }
+
             val config = Config(session).apply {
                 focusMode = Config.FocusMode.AUTO
                 lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
                 planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-
-                // Depth: включаем, если поддерживается устройством/ARCore.
-                depthMode = Config.DepthMode.AUTOMATIC
+                depthMode = selectedDepthMode
             }
 
             session.configure(config)
