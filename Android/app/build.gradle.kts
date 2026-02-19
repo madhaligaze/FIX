@@ -15,6 +15,9 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        val backendBaseUrl = (project.findProperty("backendBaseUrl") as String?) ?: "http://10.0.2.2:8000/"
+        buildConfigField("String", "BACKEND_BASE_URL", "\"${backendBaseUrl}\"")
     }
 
     buildTypes {
@@ -34,6 +37,10 @@ android {
         jvmTarget = "1.8"
     }
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     // Исключаем конфликтующие META-INF файлы из зависимостей AR-библиотек
     packaging {
         resources {
@@ -43,32 +50,33 @@ android {
     }
 }
 
-// Обходное решение для конфликтов разрешения зависимостей при использовании arsceneview
-configurations.all {
-    resolutionStrategy {
-        // Принудительно используем совместимую версию filament
-        force("com.google.ar.sceneform:core:1.17.1")
-    }
-}
 
 dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
+
+    // Lifecycle (ViewModel + viewModelScope)
+    implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.7.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
 
     // ARCore
     implementation("com.google.ar:core:1.41.0")
 
-    // ArSceneView — версия 0.10.0 совместима с Gradle 8.x (НЕ с 9.x)
-    implementation("io.github.sceneview:arsceneview:0.10.0")
-
+    // Sceneform (maintained continuation) - даёт com.google.ar.sceneform.* классы (Node/AnchorNode/Light/ArSceneView/FrameTime/Camera/...)
+    implementation("com.gorisse.thomas.sceneform:sceneform:1.23.0")
+    implementation("com.gorisse.thomas.sceneform:ux:1.23.0")
     // Retrofit
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
     implementation("com.squareup.retrofit2:converter-gson:2.9.0")
+    // OkHttp (timeouts/logging)
+    implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-jdk8:1.7.3")
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

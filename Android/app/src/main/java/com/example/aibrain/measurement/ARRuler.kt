@@ -9,7 +9,7 @@ import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.Node
 import com.google.ar.sceneform.math.Vector3
 import com.google.ar.sceneform.rendering.*
-import io.github.sceneview.ar.ArSceneView
+import com.google.ar.sceneform.ArSceneView
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -107,7 +107,7 @@ class ARRuler(
     // Настройки
     private var snapToSurface = true
     private var showGrid = true
-    private var units = Units.METRIC
+    var units = Units.METRIC
 
     // Callbacks
     var onMeasurementUpdate: ((Float, String) -> Unit)? = null
@@ -260,11 +260,34 @@ class ARRuler(
     }
 
     /**
+     * Получить сохраненные измерения (копия).
+     */
+    fun getSavedMeasurements(): List<Measurement> {
+        return measurements.toList()
+    }
+
+    /**
      * Экспорт всех измерений в JSON
      */
     fun exportMeasurements(): String {
-        // TODO: Implement JSON export
-        return ""
+        return try {
+            val gson = com.google.gson.Gson()
+            val payload = measurements.map { m ->
+                mapOf(
+                    "id" to m.id,
+                    "type" to m.type.name,
+                    "distance_m" to m.distance,
+                    "label" to m.label,
+                    "timestamp" to m.timestamp,
+                    "points" to m.points.map { p ->
+                        mapOf("x" to p.pose.tx(), "y" to p.pose.ty(), "z" to p.pose.tz())
+                    }
+                )
+            }
+            gson.toJson(payload)
+        } catch (_: Exception) {
+            ""
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -281,8 +304,8 @@ class ARRuler(
                 sceneView.context,
                 com.google.ar.sceneform.rendering.Color(0f, 0.96f, 1f) // Cyan
             ).thenAccept { material ->
-                val sphere = ShapeFactory.makeSphere(
-                    POINT_RADIUS,
+                val sphere = ShapeFactory.makeCube(
+                    Vector3(POINT_RADIUS * 2f, POINT_RADIUS * 2f, POINT_RADIUS * 2f),
                     Vector3.zero(),
                     material
                 )
