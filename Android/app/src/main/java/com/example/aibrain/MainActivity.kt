@@ -123,6 +123,7 @@ class MainActivity : AppCompatActivity() {
         private const val PREFS_NAME = "app_settings"
         private const val PREF_SERVER_BASE_URL = "server_base_url"
         private const val KEY_SESSION_HISTORY = "session_history_json"
+        private const val PREF_CAMERA_SWAP_UV = "camera_swap_uv"
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1540,6 +1541,7 @@ class MainActivity : AppCompatActivity() {
         data class FramePacket(
             val payload: HashMap<String, Any>,
             val nv21: ImageUtils.Nv21Frame,
+            val depthImage: android.media.Image?
             val depth: DepthUtils.DepthFrame?
         )
 
@@ -1558,6 +1560,7 @@ class MainActivity : AppCompatActivity() {
 
             val frame = sceneView.arFrame ?: return@withContext null
 
+            var depthImage: android.media.Image? = null
             try {
                 val cam = frame.camera
                 if (cam.trackingState != TrackingState.TRACKING) return@withContext null
@@ -1569,11 +1572,13 @@ class MainActivity : AppCompatActivity() {
                 } ?: return@withContext null
 
                 val nv21 = try {
+                    ImageUtils.yuv420ToNv21(image, swapUv = settingsPrefs.getBoolean(PREF_CAMERA_SWAP_UV, false))
                     ImageUtils.yuv420ToNv21(image)
                 } finally {
                     runCatching { image.close() }
                 }
 
+                depthImage = DepthUtils.tryAcquireDepth16(frame)
                 val depthImage = DepthUtils.tryAcquireDepth16(frame)
                 val depthFrame = depthImage?.let {
                     try {
@@ -1603,12 +1608,12 @@ class MainActivity : AppCompatActivity() {
                 val points: List<List<Float>> = if (pc != null) {
                     try {
                         val buf = pc.points
-                        val total = buf.remaining() / 4
-                        val cap = 3000
-                        val step = maxOf(1, total / cap)
-                        val out = ArrayList<List<Float>>(min(total, cap))
+                        val pointCount = buf.remaining() / 4
+                        val cap = 1000
+                        val step = maxOf(1, pointCount / cap)
+                        val out = ArrayList<List<Float>>(min(pointCount, cap))
                         var i = 0
-                        while (i < total) {
+                        while (i < pointCount) {
                             val baseIdx = i * 4
                             out.add(listOf(buf.get(baseIdx), buf.get(baseIdx + 1), buf.get(baseIdx + 2)))
                             i += step
@@ -1644,14 +1649,42 @@ class MainActivity : AppCompatActivity() {
                     basePayload["manual_measurements"] = manualMeasurements
                 }
 
+                FramePacket(basePayload, nv21, depthImage)
                 FramePacket(basePayload, nv21, depthFrame)
             } catch (_: Exception) {
+                runCatching { depthImage?.close() }
                 null
             }
         }
 
         if (packet == null) return true
 
+        val payload = withContext(Dispatchers.Default) {
+            val depthFrame = packet.depthImage?.let { image ->
+                try {
+                    DepthUtils.copyDepth16(image)
+                } catch (_: Exception) {
+                    null
+                } finally {
+                    runCatching { image.close() }
+                }
+            }
+
+            packet.payload.apply {
+                this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(packet.nv21.data, packet.nv21.width, packet.nv21.height, 75)
+                if (depthFrame != null) {
+                    this["depth_base64"] = DepthUtils.depthBytesToBase64(depthFrame.bytes)
+                    this["depth_width"] = depthFrame.width
+                    this["depth_height"] = depthFrame.height
+                    this["depth_scale"] = depthFrame.scaleMPerUnit
+                }
+            }
+        }
+
+        withContext(Dispatchers.Main) {
+            if (payload.containsKey("depth_base64")) {
+                depthUnavailableStreak = 0
+            } else {
         withContext(Dispatchers.Main) {
             if (packet.depth == null) {
                 depthUnavailableStreak += 1

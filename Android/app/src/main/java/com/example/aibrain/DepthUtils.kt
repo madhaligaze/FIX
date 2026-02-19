@@ -1,5 +1,6 @@
 package com.example.aibrain
 
+import android.graphics.ImageFormat
 import android.media.Image
 import android.util.Base64
 import com.google.ar.core.Frame
@@ -18,6 +19,8 @@ object DepthUtils {
     }
 
     fun copyDepth16(image: Image): DepthFrame {
+        require(image.format == ImageFormat.DEPTH16) { "Expected DEPTH16 image, got format=${image.format}" }
+        require(image.planes.isNotEmpty()) { "DEPTH16 image has no planes" }
         val plane = image.planes[0]
         val width = image.width
         val height = image.height
@@ -51,6 +54,7 @@ object DepthUtils {
             }
         }
 
+        return DepthFrame(bytes = out, width = width, height = height) // uint16 little-endian millimeters
         return DepthFrame(bytes = out, width = width, height = height)
     }
 

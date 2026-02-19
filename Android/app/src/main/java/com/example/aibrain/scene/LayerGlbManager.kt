@@ -6,6 +6,7 @@ import android.util.Log
 import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.ArSceneView
 import com.google.ar.sceneform.Node
+import com.google.ar.sceneform.NodeParent
 import com.google.ar.sceneform.rendering.ModelRenderable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -14,6 +15,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 import java.util.zip.CRC32
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -23,12 +25,16 @@ class LayerGlbManager(
     private val sceneView: ArSceneView,
     private val baseUrl: String,
 ) {
-    private val client = OkHttpClient()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
     private val nodesByLayerId = mutableMapOf<String, Node>()
     private var layersRoot: AnchorNode? = null
 
     fun setLayersRoot(anchor: AnchorNode?) {
         layersRoot = anchor
+        val parent: NodeParent = anchor ?: sceneView.scene
         val parent = anchor ?: sceneView.scene
         nodesByLayerId.values.forEach { it.setParent(parent) }
     }
@@ -45,9 +51,11 @@ class LayerGlbManager(
 
         return withContext(Dispatchers.Main) {
             nodesByLayerId[layerId]?.setParent(null)
+            val nodeParent: NodeParent = layersRoot ?: sceneView.scene
             val node = Node().apply {
                 this.renderable = renderable
                 this.isEnabled = true
+                setParent(nodeParent)
                 setParent(layersRoot ?: sceneView.scene)
             }
             nodesByLayerId[layerId] = node
