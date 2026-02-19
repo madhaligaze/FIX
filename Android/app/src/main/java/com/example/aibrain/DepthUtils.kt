@@ -69,7 +69,7 @@ object DepthUtils {
                 val rowBase = y * rowStride
                 for (x in 0 until width) {
                     val idx = base + rowBase + x * pixelStride
-                    if (idx < 0 || idx + 1 >= limit) {
+                    if (idx < 0 || idx + 2 > limit) {
                         throw IllegalStateException("DEPTH16 index out of bounds: idx=$idx limit=$limit")
                     }
                     out[dst] = src.get(idx)
