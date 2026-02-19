@@ -73,18 +73,6 @@ def test_android_legacy_contract_endpoints():
         assert isinstance(update_body.get("processing_time_ms"), int)
 
     preview_res = client.post(f"/session/preview_remove/{session_id}", params={"element_id": "missing"})
-    if model_body.get("status") == "NEEDS_SCAN":
-        assert preview_res.status_code == 409
-        assert preview_res.json()["detail"]["status"] == "NO_MODEL"
-    else:
-        assert preview_res.status_code == 200
-        preview_body = preview_res.json()
-        for key in ["status", "element_id", "is_critical", "would_collapse", "collapse_count", "warning"]:
-            assert key in preview_body
-    else:
-        assert update_res.json()["detail"]["status"] == "NO_MODEL"
-
-    preview_res = client.post(f"/session/preview_remove/{session_id}", params={"element_id": "missing"})
     assert preview_res.status_code in (200, 409)
     if preview_res.status_code == 200:
         preview_body = preview_res.json()

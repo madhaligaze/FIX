@@ -49,12 +49,12 @@ class ConnectActivity : AppCompatActivity() {
     private fun doHealthCheck() {
         val url = normalizeBaseUrl(etUrl.text.toString())
         if (url == null) {
-            setStatus(false, "Invalid URL")
+            setStatus(false, getString(R.string.connect_invalid_url))
             btnContinue.isEnabled = false
             return
         }
 
-        setStatus(null, "Checking...")
+        setStatus(null, getString(R.string.connect_status_checking))
         scope.launch {
             val ok = withContext(Dispatchers.IO) {
                 try {
@@ -65,10 +65,10 @@ class ConnectActivity : AppCompatActivity() {
                 }
             }
             if (ok) {
-                setStatus(true, "ONLINE")
+                setStatus(true, getString(R.string.connect_status_online))
                 btnContinue.isEnabled = true
             } else {
-                setStatus(false, "OFFLINE")
+                setStatus(false, getString(R.string.connect_status_offline))
                 btnContinue.isEnabled = false
             }
         }
