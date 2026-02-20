@@ -68,6 +68,9 @@ import java.util.UUID
 import kotlin.math.min
 import kotlin.random.Random
 import com.example.aibrain.measurement.ARRuler
+import com.example.aibrain.offline.OfflineQueue
+import com.example.aibrain.telemetry.CrashReporter
+import com.example.aibrain.util.HeavyOps
 import com.example.aibrain.measurement.MeasurementType
 import com.example.aibrain.measurement.Measurement
 import com.example.aibrain.visualization.VoxelData
@@ -314,6 +317,10 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var settingsPrefs: SharedPreferences
     private lateinit var api: ApiService
+    private lateinit var offlineQueue: OfflineQueue
+    private lateinit var crashReporter: CrashReporter
+    private var lastConnStatus: ConnectionStatus = ConnectionStatus.UNKNOWN
+    @Volatile private var offlineFlushInFlight: Boolean = false
 
     // ══════════════════════════════════════════════════════════════════════
     // LIFECYCLE
@@ -337,6 +344,14 @@ class MainActivity : AppCompatActivity() {
 
         settingsPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         rebuildApiClient()
+        offlineQueue = OfflineQueue(this)
+        crashReporter = CrashReporter(this)
+
+        val prevHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            runCatching { crashReporter.recordError("UNCAUGHT:${t.name}", e, fatal = true) }
+            prevHandler?.uncaughtException(t, e)
+        }
 
         initViews()
         setupClickListeners()
@@ -809,17 +824,23 @@ class MainActivity : AppCompatActivity() {
             measurements_json = measurementsJson.ifBlank { null },
             manual_measurements = measurementConstraints
         )
-        runCatching { api.lockSession(lockPayload) }
-            .onSuccess { resp ->
-                if (resp.isSuccessful && resp.body() != null) {
-                    lastRevisionId = resp.body()!!.rev_id
-                } else {
-                    runCatching { api.exportLatest(sid) }.onSuccess { exp ->
-                        val rev = exp.body()?.revision_id ?: exp.body()?.rev_id.orEmpty()
-                        if (rev.isNotBlank()) lastRevisionId = rev
-                    }
-                }
+        try {
+            val resp = api.lockSession(lockPayload)
+            if (resp.isSuccessful && resp.body() != null) {
+                lastRevisionId = resp.body()!!.rev_id
+                return
             }
+            offlineQueue.enqueueLock(sid, lockPayload)
+            crashReporter.recordError("lockSession", IllegalStateException("HTTP ${resp.code()}"))
+        } catch (e: Exception) {
+            offlineQueue.enqueueLock(sid, lockPayload)
+            crashReporter.recordError("lockSession", e)
+        }
+
+        runCatching { api.exportLatest(sid) }.onSuccess { exp ->
+            val rev = exp.body()?.revision_id ?: exp.body()?.rev_id.orEmpty()
+            if (rev.isNotBlank()) lastRevisionId = rev
+        }
     }
 
     private suspend fun loadExportLayersInternal(
@@ -1071,13 +1092,19 @@ class MainActivity : AppCompatActivity() {
 
                 withContext(Dispatchers.Main) {
                     val base = getCurrentServerUrl().trimEnd('/')
-                    if (ok) {
-                        viewModel.setConnectionState(ConnectionStatus.ONLINE, base)
+                    val newStatus = if (ok) {
+                        ConnectionStatus.ONLINE
                     } else {
-                        // Если сейчас идет стрим - показываем деградацию, иначе OFFLINE
-                        val st = if (isStreaming) ConnectionStatus.RECONNECTING else ConnectionStatus.OFFLINE
-                        viewModel.setConnectionState(st, base)
+                        if (isStreaming) ConnectionStatus.RECONNECTING else ConnectionStatus.OFFLINE
                     }
+                    viewModel.setConnectionState(newStatus, base)
+
+                    if (newStatus == ConnectionStatus.ONLINE && lastConnStatus != ConnectionStatus.ONLINE) {
+                        currentSessionId?.let { sid ->
+                            scope.launch { flushOfflineAndTelemetry(sid, base, newStatus) }
+                        }
+                    }
+                    lastConnStatus = newStatus
                 }
 
                 delay(15_000L)
@@ -1090,8 +1117,38 @@ class MainActivity : AppCompatActivity() {
         healthJob = null
     }
 
-    private suspend fun syncAnchorsToServer() {
-        val sid = currentSessionId ?: return
+    private suspend fun flushOfflineAndTelemetry(sessionId: String, baseUrl: String, status: ConnectionStatus) {
+        if (offlineFlushInFlight) return
+        offlineFlushInFlight = true
+        try {
+            offlineQueue.flushForSession(api, sessionId)
+            crashReporter.flush(
+                api = api,
+                sessionId = sessionId,
+                connectionStatus = status.name,
+                serverBaseUrl = baseUrl,
+                lastExportRev = lastRevisionId,
+                loadedExportRev = loadedExportRevId,
+                lastRevisionId = lastRevisionId,
+                clientStats = buildClientStats()
+            )
+        } finally {
+            offlineFlushInFlight = false
+        }
+    }
+
+    private fun buildClientStats(): Map<String, Any> {
+        val map = HashMap<String, Any>()
+        map["state"] = appState.name
+        map["frame_counter"] = frameCount
+        map["is_streaming"] = isStreaming
+        map["anchors_local"] = userMarkers.size
+        map["last_revision_id"] = (lastRevisionId ?: "")
+        return map
+    }
+
+    private suspend fun syncAnchorsToServer(allowEmpty: Boolean = false): Boolean {
+        val sid = currentSessionId ?: return false
         val anchors = userMarkers.map { marker ->
             AnchorPointRequest(
                 id = marker.id,
@@ -1100,11 +1157,21 @@ class MainActivity : AppCompatActivity() {
                 confidence = 1.0f
             )
         }
-        if (anchors.isEmpty()) return
-
-        val resp = api.postAnchors(AnchorPayload(session_id = sid, anchors = anchors))
-        if (!resp.isSuccessful) {
-            throw IllegalStateException("/session/anchors HTTP " + resp.code())
+        if (anchors.isEmpty() && !allowEmpty) return true
+        val payload = AnchorPayload(session_id = sid, anchors = anchors)
+        return try {
+            val resp = api.postAnchors(payload)
+            if (resp.isSuccessful) {
+                true
+            } else {
+                offlineQueue.enqueueAnchors(sid, payload)
+                crashReporter.recordError("postAnchors", IllegalStateException("HTTP ${resp.code()}"))
+                false
+            }
+        } catch (e: Exception) {
+            offlineQueue.enqueueAnchors(sid, payload)
+            crashReporter.recordError("postAnchors", e)
+            false
         }
     }
 
@@ -2167,30 +2234,35 @@ class MainActivity : AppCompatActivity() {
                     "last_send_ms" to lastSendMs,
                     "conn" to currentConnStatus.name,
                 )
-                val nv21 = ImageUtils.yuvCopyToNv21(packet.yuv, swapUv = packet.swapUv)
-                this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, jpegQuality)
-                val depth = packet.depth
-                if (depth != null) {
-                    this["depth_base64"] = DepthUtils.depthBytesToBase64(depth.bytes)
-                    this["depth_width"] = depth.width
-                    this["depth_height"] = depth.height
-                    // Keep both keys for backend compatibility.
-                    this["depth_scale_m_per_unit"] = depth.scaleMPerUnit
-                    this["depth_scale"] = depth.scaleMPerUnit
-                    this["depth_is_raw"] = depth.isRaw
-                    this["depth_format"] = depth.format
-                    this["depth_invalid_value"] = depth.invalidValue
+                HeavyOps.withPermit {
+                    val nv21 = ImageUtils.yuvCopyToNv21(packet.yuv, swapUv = packet.swapUv)
+                    this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, jpegQuality)
+                    val depth = packet.depth
+                    if (depth != null) {
+                        this["depth_base64"] = DepthUtils.depthBytesToBase64(depth.bytes)
+                        this["depth_width"] = depth.width
+                        this["depth_height"] = depth.height
+                        this["depth_scale_m_per_unit"] = depth.scaleMPerUnit
+                        this["depth_scale"] = depth.scaleMPerUnit
+                        this["depth_is_raw"] = depth.isRaw
+                        this["depth_format"] = depth.format
+                        this["depth_invalid_value"] = depth.invalidValue
+                    }
                 }
             }
         }
 
         val resp = try {
             api.streamData(sid, payload)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            crashReporter.recordError("streamData", e)
             return false
         }
 
-        if (!resp.isSuccessful) return false
+        if (!resp.isSuccessful) {
+            crashReporter.recordError("streamData", IllegalStateException("HTTP ${resp.code()}"))
+            return false
+        }
 
         val body = resp.body() ?: return true
 
@@ -2879,6 +2951,15 @@ class MainActivity : AppCompatActivity() {
         updatePointsCount()
         btnAnalyze.isEnabled = false
         sceneBuilder.clearScene()
+
+        currentSessionId?.let { sid ->
+            scope.launch {
+                syncAnchorsToServer(allowEmpty = true)
+                if (lastConnStatus == ConnectionStatus.ONLINE) {
+                    flushOfflineAndTelemetry(sid, getCurrentServerUrl().trimEnd('/'), lastConnStatus)
+                }
+            }
+        }
     }
 
 

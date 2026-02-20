@@ -71,6 +71,12 @@ interface ApiService {
         @Path("session_id") sessionId: String,
         @Body payload: LogPayload
     ): Response<Unit>
+
+    @POST("/session/report/{session_id}")
+    suspend fun postClientReport(
+        @Path("session_id") sessionId: String,
+        @Body payload: CrashEnvelope
+    ): Response<Unit>
 }
 
 data class SessionResponse(
@@ -309,4 +315,35 @@ data class ReadinessMetrics(
     val min_views_per_anchor: Int = 0,
     val min_viewpoints: Int = 0,
     val anchor_count: Int = 0
+)
+
+
+data class CrashErrorItem(
+    val where: String,
+    val message: String,
+    val timestamp_ms: Long,
+    val stack: String? = null,
+    val fatal: Boolean = false
+)
+
+data class CrashDeviceInfo(
+    val model: String? = null,
+    val manufacturer: String? = null,
+    val sdk: Int? = null
+)
+
+data class CrashEnvelope(
+    val session_id: String? = null,
+    val timestamp_ms: Long,
+    val app_version: String? = null,
+    val build: String? = null,
+    val platform: String? = "android",
+    val device: CrashDeviceInfo? = null,
+    val connection_status: String? = null,
+    val server_base_url: String? = null,
+    val last_export_rev: String? = null,
+    val loaded_export_rev: String? = null,
+    val last_revision_id: String? = null,
+    val client_stats: Map<String, @JvmSuppressWildcards Any> = emptyMap(),
+    val errors: List<CrashErrorItem> = emptyList()
 )

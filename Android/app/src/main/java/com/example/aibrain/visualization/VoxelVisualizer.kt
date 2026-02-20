@@ -8,6 +8,7 @@ import com.google.ar.sceneform.rendering.Material
 import com.google.ar.sceneform.rendering.MaterialFactory
 import com.google.ar.sceneform.rendering.ShapeFactory
 import com.google.ar.sceneform.ArSceneView
+import com.example.aibrain.util.HeavyOps
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.future.await
@@ -38,29 +39,31 @@ class VoxelVisualizer(
         if (isVisible) hideVoxels()
 
         coroutineScope.launch(Dispatchers.Main) {
-            if (materials.isEmpty()) loadMaterials()
+            HeavyOps.withPermit {
+                if (materials.isEmpty()) loadMaterials()
 
-            val source = if (voxelData.size > MAX_VOXELS) {
-                val step = voxelData.size / MAX_VOXELS
-                voxelData.filterIndexed { idx, _ -> idx % step == 0 }.take(MAX_VOXELS)
-            } else {
-                voxelData
-            }
-
-            Log.d(TAG, "Rendering ${source.size} voxels (raw=${voxelData.size})")
-
-            var batchCount = 0
-            for (voxel in source) {
-                if (!isActive) break
-                createVoxelNode(voxel)
-                batchCount++
-                if (batchCount >= BATCH_SIZE) {
-                    batchCount = 0
-                    yield()
+                val source = if (voxelData.size > MAX_VOXELS) {
+                    val step = voxelData.size / MAX_VOXELS
+                    voxelData.filterIndexed { idx, _ -> idx % step == 0 }.take(MAX_VOXELS)
+                } else {
+                    voxelData
                 }
-            }
 
-            isVisible = true
+                Log.d(TAG, "Rendering ${source.size} voxels (raw=${voxelData.size})")
+
+                var batchCount = 0
+                for (voxel in source) {
+                    if (!isActive) break
+                    createVoxelNode(voxel)
+                    batchCount++
+                    if (batchCount >= BATCH_SIZE) {
+                        batchCount = 0
+                        yield()
+                    }
+                }
+
+                isVisible = true
+            }
         }
     }
 
