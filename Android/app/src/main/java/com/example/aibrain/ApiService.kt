@@ -73,13 +73,13 @@ interface ApiService {
     ): Response<Unit>
 
     @POST("/session/report/{session_id}")
-    suspend fun postClientReport(
+    suspend fun postSessionCrashReport(
         @Path("session_id") sessionId: String,
         @Body payload: CrashEnvelope
     ): Response<Unit>
 
     @POST("/telemetry/client_report")
-    suspend fun postClientDiagnostics(
+    suspend fun postClientReport(
         @Body payload: ClientReportEnvelope
     ): Response<SimpleStatusResponse>
 }
