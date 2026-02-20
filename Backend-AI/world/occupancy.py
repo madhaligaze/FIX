@@ -39,9 +39,19 @@ class OccupancyGrid:
         shp = np.asarray(self.grid.shape, dtype=np.int32)
         return bool(np.all(idx >= 0) and np.all(idx < shp))
 
-    # Public alias expected by tests and higher-level checks.
-    def in_bounds(self, idx: np.ndarray) -> bool:
-        return self._in_bounds(idx)
+    def in_bounds(self, *args) -> bool:
+        # Public helper expected by tests and validators.
+        try:
+            if len(args) == 1:
+                a = np.asarray(args[0], dtype=np.int32).reshape(3)
+                return self._in_bounds(a)
+            if len(args) == 3:
+                x, y, z = int(args[0]), int(args[1]), int(args[2])
+                sx, sy, sz = self.grid.shape
+                return 0 <= x < int(sx) and 0 <= y < int(sy) and 0 <= z < int(sz)
+        except Exception:
+            return False
+        return False
 
     def _touch(self, idx: np.ndarray, new_state: int) -> None:
         if not self._in_bounds(idx):
@@ -113,7 +123,17 @@ class OccupancyGrid:
             f = int(np.sum(g == FREE))
             o = int(np.sum(g == OCCUPIED))
             tot = int(g.size)
-            return {"unknown": u, "free": f, "occupied": o, "total": tot}
+            observed = int(f + o)
+            obs_ratio = float(observed) / float(tot) if tot > 0 else 0.0
+            unk_ratio = float(u) / float(tot) if tot > 0 else 0.0
+            return {
+                "unknown": u,
+                "free": f,
+                "occupied": o,
+                "total": tot,
+                "observed_ratio": float(obs_ratio),
+                "unknown_ratio": float(unk_ratio),
+            }
 
         occ = {"unknown": 0, "free": 0, "occupied": 0, "total": 0}
         for p in points:
@@ -127,6 +147,13 @@ class OccupancyGrid:
             occ["free"] += int(np.sum(sub == FREE))
             occ["occupied"] += int(np.sum(sub == OCCUPIED))
             occ["total"] += int(sub.size)
+        tot = int(occ.get("total", 0) or 0)
+        u = int(occ.get("unknown", 0) or 0)
+        f = int(occ.get("free", 0) or 0)
+        o = int(occ.get("occupied", 0) or 0)
+        observed = int(f + o)
+        occ["observed_ratio"] = float(observed) / float(tot) if tot > 0 else 0.0
+        occ["unknown_ratio"] = float(u) / float(tot) if tot > 0 else 0.0
         return occ
 
     def stats_aabb(self, box_min: list[float], box_max: list[float]) -> dict:

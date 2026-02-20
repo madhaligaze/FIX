@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import math
 
 import numpy as np
 
@@ -376,9 +377,11 @@ class WorldModel:
                 continue
             dx = float(p[0]) - ax
             dy = float(p[1]) - ay
-            if (dx * dx + dy * dy) < 0.04:
+            # Count even if camera is exactly at anchor position.
+            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                seen.add(-1)
                 continue
-            az = np.degrees(np.arctan2(dy, dx))
+            az = float(np.degrees(np.arctan2(dy, dx)))
             b = int(np.floor((az + 180.0) / step))
             seen.add(b)
         return int(len(seen))
