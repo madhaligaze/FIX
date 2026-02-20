@@ -84,7 +84,7 @@ class CrashReporter(private val context: Context) {
         )
 
         return@withContext try {
-            val resp = api.postClientDiagnostics(payload)
+            val resp = api.postClientReport(payload)
             if (resp.isSuccessful) {
                 prefs.edit().putLong(KEY_LAST_SENT_MS, System.currentTimeMillis()).apply()
                 true

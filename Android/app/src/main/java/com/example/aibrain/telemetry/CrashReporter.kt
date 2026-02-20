@@ -101,7 +101,7 @@ class CrashReporter(
         )
 
         try {
-            val r = api.postClientReport(sessionId, env)
+            val r = api.postSessionCrashReport(sessionId, env)
             if (r.isSuccessful) {
                 clear()
                 true

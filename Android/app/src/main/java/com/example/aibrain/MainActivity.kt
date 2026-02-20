@@ -177,8 +177,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnExport: Button
     private lateinit var btnSettings: Button
     private lateinit var btnRulerMode: Button
+    private var btnSendReportNow: Button? = null
     private lateinit var fabEyeOfAI: FloatingActionButton
     private lateinit var voxelLegend: LinearLayout
+    private var tvFieldDiag: TextView? = null
 
     // Панели
     private lateinit var controlPanel: LinearLayout
@@ -474,6 +476,10 @@ class MainActivity : AppCompatActivity() {
         btnExport = findViewById(R.id.btn_export)
         btnSettings = findViewById(R.id.btn_settings)
         btnRulerMode = findViewById(R.id.btn_ruler_mode)
+        val reportBtnId = resources.getIdentifier("btn_send_report_now", "id", packageName)
+        if (reportBtnId != 0) btnSendReportNow = findViewById(reportBtnId)
+        val fieldDiagId = resources.getIdentifier("tv_field_diag", "id", packageName)
+        if (fieldDiagId != 0) tvFieldDiag = findViewById(fieldDiagId)
         fabEyeOfAI = findViewById(R.id.fab_eye_of_ai)
         voxelLegend = findViewById(R.id.voxel_legend)
 
@@ -581,6 +587,7 @@ class MainActivity : AppCompatActivity() {
         btnSaveSession.setOnClickListener { onSaveSessionClicked() }
         btnExport.setOnClickListener { onExportClicked() }
         btnSettings.setOnClickListener { onSettingsClicked() }
+        btnSendReportNow?.setOnClickListener { onSendReportNowClicked() }
         fabEyeOfAI.setOnClickListener { toggleEyeOfAI() }
         btnRulerMode.setOnClickListener { toggleRulerMode() }
 
@@ -830,10 +837,10 @@ class MainActivity : AppCompatActivity() {
                 lastRevisionId = resp.body()!!.rev_id
                 return
             }
-            offlineQueue.enqueueLock(sid, lockPayload)
+            offlineQueue.enqueueLock(sid, getCurrentServerUrl())
             crashReporter.recordError("lockSession", IllegalStateException("HTTP ${resp.code()}"))
         } catch (e: Exception) {
-            offlineQueue.enqueueLock(sid, lockPayload)
+            offlineQueue.enqueueLock(sid, getCurrentServerUrl())
             crashReporter.recordError("lockSession", e)
         }
 
@@ -865,7 +872,11 @@ class MainActivity : AppCompatActivity() {
                 if (rev.isNotBlank() && loadedExportRevId != null && loadedExportRevId != rev) {
                     layerGlbManager?.clearAll()
                 }
-                if (rev.isNotBlank()) loadedExportRevId = rev
+                if (rev.isNotBlank()) {
+                    loadedExportRevId = rev
+                    crashReporter.setLastExportRev(rev)
+                    updateFieldDiag()
+                }
 
                 // Revision-aware caching for layers
                 if (layerGlbManager == null) {
@@ -1010,6 +1021,42 @@ class MainActivity : AppCompatActivity() {
         startActivity(android.content.Intent(this, SettingsActivity::class.java))
     }
 
+    private fun onSendReportNowClicked() {
+        val sid = currentSessionId
+        scope.launch {
+            val baseUrl = getCurrentServerUrl()
+            val status = offlineQueue.getStatus(sid ?: "", baseUrl)
+            val queued = mapOf(
+                "anchors_queued" to status.anchorsQueued,
+                "lock_queued" to status.lockQueued,
+                "baseurl_mismatch" to status.mismatchedBaseUrlItems,
+                "base_url" to baseUrl,
+                "conn_status" to currentConnStatus.name,
+            )
+            val ok = crashReporter.sendNow(api, sid, buildClientStats(), queued)
+            withContext(Dispatchers.Main) {
+                if (ok) showHint("✅ Report sent") else showHint("⚠️ Report not sent")
+                updateFieldDiag()
+            }
+        }
+    }
+
+    private fun updateFieldDiag() {
+        val v = tvFieldDiag ?: return
+        val sid = currentSessionId
+        if (sid.isNullOrBlank()) {
+            v.text = "Q A0 L0 | REPORT -"
+            return
+        }
+        val baseUrl = getCurrentServerUrl()
+        val st = offlineQueue.getStatus(sid, baseUrl)
+        val lastSent = crashReporter.getLastSentMs()
+        val report = if (lastSent <= 0L) "-" else "${(System.currentTimeMillis() - lastSent) / 1000L}s"
+        val exportState = if (exportNotReady409) "EXPORT 409" else "EXPORT OK"
+        val mismatch = if (st.mismatchedBaseUrlItems > 0) " | BASEURL!" else ""
+        v.text = "Q A${st.anchorsQueued} L${st.lockQueued} | ${exportState} | R ${report}${mismatch}"
+    }
+
     private fun rebuildApiClient() {
         val baseUrl = getCurrentServerUrl()
 
@@ -1121,7 +1168,7 @@ class MainActivity : AppCompatActivity() {
         if (offlineFlushInFlight) return
         offlineFlushInFlight = true
         try {
-            offlineQueue.flushForSession(api, sessionId)
+            offlineQueue.flushForSession(api, sessionId, baseUrl)
             crashReporter.flush(
                 api = api,
                 sessionId = sessionId,
@@ -1164,12 +1211,12 @@ class MainActivity : AppCompatActivity() {
             if (resp.isSuccessful) {
                 true
             } else {
-                offlineQueue.enqueueAnchors(sid, payload)
+                offlineQueue.enqueueAnchors(sid, getCurrentServerUrl(), anchors)
                 crashReporter.recordError("postAnchors", IllegalStateException("HTTP ${resp.code()}"))
                 false
             }
         } catch (e: Exception) {
-            offlineQueue.enqueueAnchors(sid, payload)
+            offlineQueue.enqueueAnchors(sid, getCurrentServerUrl(), anchors)
             crashReporter.recordError("postAnchors", e)
             false
         }
