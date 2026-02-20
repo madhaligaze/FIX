@@ -147,6 +147,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var connectionDot: View
     private lateinit var pbQuality: ProgressBar
     private lateinit var tvQuality: TextView
+    private lateinit var pbReadiness: ProgressBar
+    private lateinit var tvReadiness: TextView
+    private lateinit var tvReadinessDetail: TextView
     private lateinit var tvAiCritique: TextView
 
     // Основные кнопки
@@ -254,6 +257,10 @@ class MainActivity : AppCompatActivity() {
     private var sendTimeEwmaMs: Double = 0.0
     private var lastSendMs: Long = 0L
     private var nextStreamAttemptAtMs: Long = 0L
+    private var exportPollJob: Job? = null
+    private var readinessPollJob: Job? = null
+    @Volatile private var exportPollInFlight: Boolean = false
+    @Volatile private var pendingExportRevId: String? = null
     private var originAnchorNode: AnchorNode? = null
     private var streamSendJob: Job? = null
     private var isArSceneReady = false
@@ -410,6 +417,9 @@ class MainActivity : AppCompatActivity() {
         connectionDot = findViewById(R.id.connection_dot)
         pbQuality = findViewById(R.id.pb_quality)
         tvQuality = findViewById(R.id.tv_quality)
+        pbReadiness = findViewById(R.id.pb_readiness)
+        tvReadiness = findViewById(R.id.tv_readiness)
+        tvReadinessDetail = findViewById(R.id.tv_readiness_detail)
         tvAiCritique = findViewById(R.id.tv_ai_critique)
 
         // Основные кнопки
@@ -812,6 +822,12 @@ class MainActivity : AppCompatActivity() {
             }
             if (rev.isNotBlank()) loadedExportRevId = rev
 
+            // Revision-aware caching for layers
+            if (layerGlbManager == null) {
+                layerGlbManager = LayerGlbManager(this@MainActivity, sceneView, getCurrentServerUrl())
+            }
+            layerGlbManager?.setCurrentRevision(rev)
+
             val layers = bundle.ui?.layers.orEmpty()
             exportedLayers = layers
             exportedLayerPaths.clear()
@@ -826,9 +842,6 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-            if (layerGlbManager == null) {
-                layerGlbManager = LayerGlbManager(this@MainActivity, sceneView, getCurrentServerUrl())
-            }
             layerGlbManager?.setLayersRoot(originAnchorNode)
 
             for (layer in layers) {
@@ -1378,6 +1391,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateReadinessUI(
+        ready: Boolean?,
+        score: Double?,
+        metrics: ReadinessMetrics?
+    ) {
+        val s0 = (score ?: 0.0).coerceIn(0.0, 1.0)
+        pbReadiness.progress = (s0 * 100.0).toInt()
+        tvReadiness.text = "${(s0 * 100.0).toInt()}%"
+
+        val obsPct = ((metrics?.observed_ratio ?: 0.0) * 100.0).toInt()
+        val vdiv = metrics?.view_diversity ?: 0
+        val minViews = metrics?.min_views_per_anchor ?: 0
+        val vp = metrics?.viewpoints ?: 0
+        val minVp = metrics?.min_viewpoints ?: 0
+        tvReadinessDetail.text = "OBS ${obsPct}% | VDIV ${vdiv}/${minViews} | VP ${vp}/${minVp}" + if (ready == true) " | READY" else ""
+
+        val colorRes = if (ready == true) android.R.color.holo_green_light else android.R.color.holo_orange_light
+        pbReadiness.progressTintList = android.content.res.ColorStateList.valueOf(ContextCompat.getColor(this, colorRes))
+    }
+
     private fun maybeShowTutorial() {
         val done = tutorialPrefs.getBoolean(tutorialDoneKey, false)
         if (done) return
@@ -1639,6 +1672,8 @@ class MainActivity : AppCompatActivity() {
         isStreaming = true
         streamJob?.cancel()
         streamSendJob?.cancel()
+        startExportLatestPolling(sid)
+        startReadinessPolling(sid)
         streamJob = scope.launch {
             while (isActive && isStreaming && currentSessionId == sid) {
                 val nowMs = System.currentTimeMillis()
@@ -1701,6 +1736,75 @@ class MainActivity : AppCompatActivity() {
                 delay(waitMs)
             }
         }
+    }
+
+    private fun startExportLatestPolling(sessionId: String) {
+        exportPollJob?.cancel()
+        exportPollInFlight = false
+        exportPollJob = lifecycleScope.launch {
+            // Poll export/latest so layers update without manual actions.
+            while (isActive && isStreaming && currentSessionId == sessionId) {
+                delay(6500L)
+                if (!isStreaming || currentSessionId != sessionId) break
+                if (exportPollInFlight) continue
+                exportPollInFlight = true
+                try {
+                    val resp = runCatching { api.exportLatest(sessionId) }.getOrNull()
+                    if (resp == null) continue
+                    // 409 NO_EXPORT is expected early - ignore quietly.
+                    if (resp.code() == 409) continue
+                    if (!resp.isSuccessful || resp.body() == null) continue
+
+                    val bundle = resp.body()!!
+                    val rev = bundle.revision_id ?: bundle.rev_id.orEmpty()
+                    if (rev.isBlank()) continue
+
+                    if (originAnchorNode == null) {
+                        pendingExportRevId = rev
+                        continue
+                    }
+
+                    if (loadedExportRevId == null) {
+                        // First seen rev, try loading if origin exists.
+                        pendingExportRevId = rev
+                        loadExportLayersInternal(sessionId, showDialog = false, showOkHint = false)
+                    } else if (loadedExportRevId != rev) {
+                        // New revision - auto reload.
+                        loadExportLayersInternal(sessionId, showDialog = false, showOkHint = false)
+                    }
+                } catch (_: Exception) {
+                    // Ignore polling failures
+                } finally {
+                    exportPollInFlight = false
+                }
+            }
+        }
+    }
+
+    private fun startReadinessPolling(sessionId: String) {
+        readinessPollJob?.cancel()
+        readinessPollJob = lifecycleScope.launch {
+            while (isActive && isStreaming && currentSessionId == sessionId) {
+                delay(1500L)
+                if (!isStreaming || currentSessionId != sessionId) break
+                runCatching { api.getReadiness(sessionId) }.onSuccess { resp ->
+                    if (resp.isSuccessful && resp.body() != null) {
+                        val body = resp.body()!!
+                        withContext(Dispatchers.Main) {
+                            updateReadinessUI(body.ready, body.score, body.readiness_metrics)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun stopReleasePolling() {
+        exportPollJob?.cancel()
+        exportPollJob = null
+        readinessPollJob?.cancel()
+        readinessPollJob = null
+        exportPollInFlight = false
     }
 
     private fun tuneStreaming(ok: Boolean, sendMs: Long) {
@@ -1964,6 +2068,7 @@ class MainActivity : AppCompatActivity() {
         streamJob = null
         streamSendJob?.cancel()
         streamSendJob = null
+        stopReleasePolling()
     }
 
     private fun startAutoVoxelRefresh(sessionId: String) {
@@ -2099,6 +2204,14 @@ class MainActivity : AppCompatActivity() {
             voxelVisualizer.setRootParent(originAnchorNode)
         }
 
+        // If export/latest was already produced (server-side) before origin was set, auto-load now.
+        if (originAnchorNode == anchorNode) {
+            val sid = currentSessionId
+            if (!sid.isNullOrBlank() && !pendingExportRevId.isNullOrBlank()) {
+                scope.launch { loadExportLayersInternal(sid, showDialog = false, showOkHint = false) }
+            }
+        }
+
         val p = anchor.pose
         val markerId = "a-${UUID.randomUUID().toString().take(8)}"
         userMarkers.add(
@@ -2143,6 +2256,7 @@ class MainActivity : AppCompatActivity() {
     private fun resetOriginAndAnchors() {
         clearARAnchors()
         loadedExportRevId = null
+        pendingExportRevId = null
         exportedLayers = emptyList()
         exportedLayerPaths.clear()
         layerGlbManager?.clearAll()

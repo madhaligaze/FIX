@@ -56,6 +56,11 @@ interface ApiService {
         @Body payload: LockPayload
     ): Response<LockResponse>
 
+    @GET("/session/{session_id}/readiness")
+    suspend fun getReadiness(
+        @Path("session_id") sessionId: String
+    ): Response<ReadinessResponse>
+
     @GET("/session/{session_id}/export/latest")
     suspend fun exportLatest(
         @Path("session_id") sessionId: String
@@ -286,4 +291,22 @@ data class LockResponse(
     val trace_ndjson: String? = null,
     val tsdf_available: Boolean? = null,
     val tsdf_reason: String? = null
+)
+
+data class ReadinessResponse(
+    val session_id: String,
+    val ready: Boolean,
+    val score: Double,
+    val reasons: List<String> = emptyList(),
+    val readiness_metrics: ReadinessMetrics? = null
+)
+
+data class ReadinessMetrics(
+    val observed_ratio: Double = 0.0,
+    val view_diversity: Int = 0,
+    val viewpoints: Int = 0,
+    val min_observed_ratio: Double = 0.0,
+    val min_views_per_anchor: Int = 0,
+    val min_viewpoints: Int = 0,
+    val anchor_count: Int = 0
 )
