@@ -1,20 +1,8 @@
 package com.example.aibrain
 
+import com.google.gson.annotations.SerializedName
 import retrofit2.Response
 import retrofit2.http.*
-import com.google.gson.annotations.SerializedName
-
-/**
- * API-интерфейс для связи с Python-сервером.
- *
- * ИСПРАВЛЕНО: модели ответов теперь совпадают с реальными ответами сервера.
- *
- * Сервер /session/stream возвращает:
- *   {"status": "RECEIVING", "ai_hints": {"instructions": [...], "warnings": [...], "quality_score": 85}}
- *
- * Раньше в Android было:
- *   data class HintResponse(val hints: Map<String, List<String>>)  ← НЕВЕРНО
- */
 
 interface ApiService {
 
@@ -30,6 +18,12 @@ interface ApiService {
     @POST("/session/model/{session_id}")
     suspend fun startModeling(
         @Path("session_id") sessionId: String
+    ): Response<ModelingResponse>
+
+    @POST("/session/model/{session_id}")
+    suspend fun startModelingWithMeasurements(
+        @Path("session_id") sessionId: String,
+        @Body payload: ModelingWithMeasurementsPayload
     ): Response<ModelingResponse>
 
     @POST("/session/update/{session_id}")
@@ -74,26 +68,26 @@ interface ApiService {
     ): Response<Unit>
 }
 
-// ── Ответ /session/start ──────────────────────────────────────────────────────
 data class SessionResponse(
     val session_id: String,
     val status: String
 )
 
-// ── Ответ /session/stream ─────────────────────────────────────────────────────
 data class StreamResponse(
     val status: String,
     val ai_hints: AiHints?
 )
 
 data class AiHints(
-    val instructions: List<String>?,   // ["📏 Отойдите на 2 метра", ...]
-    val warnings: List<String>?,        // ["⚠️ Мало AR-точек", ...]
-    val quality_score: Double?,         // 0.0–100.0
-    val is_ready: Boolean?              // true = можно моделировать
+    val instructions: List<String>?,
+    val warnings: List<String>?,
+    val quality_score: Double?,
+    val is_ready: Boolean?,
+    val scan_plan: List<String>? = null,
+    val next_best_views: List<String>? = null,
+    val is_scan_complete: Boolean? = null
 )
 
-// ── Ответ /session/model ──────────────────────────────────────────────────────
 data class ModelingResponse(
     val status: String,
     val options: List<ScaffoldOption>?
@@ -103,8 +97,8 @@ data class ScaffoldOption(
     @SerializedName(value = "variant_name", alternate = ["name"])
     val variant_name: String = "Option",
     val material_info: String = "",
-    val safety_score: Int = 0,           // 0–100, выше = безопаснее
-    val ai_critique: List<String>?,  // самокритика ИИ
+    val safety_score: Int = 0,
+    val ai_critique: List<String>?,
     val elements: List<ScaffoldElement>? = null,
     val full_structure: List<ScaffoldElement>? = null,
     val stats: ScaffoldStats?,
@@ -134,17 +128,28 @@ data class ScaffoldStats(
 )
 
 data class PhysicsResult(
-    val status: String    // "OK" | "COLLAPSE" | "ERROR"
+    val status: String
 )
 
-// ── Ответ /health ─────────────────────────────────────────────────────────────
+data class ModelingWithMeasurementsPayload(
+    val measurements_json: String,
+    val manual_measurements: List<MeasurementConstraint> = emptyList()
+)
+
+data class MeasurementConstraint(
+    val id: String,
+    val type: String,
+    val distance_m: Double,
+    val label: String,
+    val timestamp_ms: Long
+)
+
 data class HealthResponse(
     val status: String,
     val version: String,
     val modules: Map<String, Boolean>?
 )
 
-// ── Запрос/ответ для /session/update ───────────────────────────────────────
 data class UpdateAction(
     val action: String,
     val element_id: String? = null,
@@ -172,7 +177,6 @@ data class CollapsedData(
     val elements: List<String>
 )
 
-// ── Ответ для /session/preview_remove ──────────────────────────────────────
 data class PreviewResponse(
     val status: String,
     val element_id: String,
@@ -181,7 +185,6 @@ data class PreviewResponse(
     val collapse_count: Int,
     val warning: String
 )
-
 
 data class VoxelResponse(
     val status: String,
@@ -203,7 +206,6 @@ data class Bounds(
     val min: List<Float>,
     val max: List<Float>
 )
-
 
 data class SceneBundleResponse(
     val session_id: String,
@@ -253,8 +255,6 @@ data class LogDeviceInfo(
     val sdk: Int
 )
 
-
-// ── /session/anchors ─────────────────────────────────────────────────────
 data class AnchorPayload(
     val session_id: String,
     val anchors: List<AnchorPointRequest>
@@ -272,9 +272,11 @@ data class AnchorsResponse(
     val count: Int
 )
 
-// ── /session/lock ─────────────────────────────────────────────────────
 data class LockPayload(
-    val session_id: String
+    val session_id: String,
+    val selected_variant: String? = null,
+    val measurements_json: String? = null,
+    val manual_measurements: List<MeasurementConstraint> = emptyList()
 )
 
 data class LockResponse(

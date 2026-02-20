@@ -38,6 +38,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.ar.core.ArCoreApk
+import com.google.ar.core.Config
 import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
 import com.google.ar.sceneform.AnchorNode
@@ -124,6 +125,8 @@ class MainActivity : AppCompatActivity() {
         private const val PREF_SERVER_BASE_URL = "server_base_url"
         private const val KEY_SESSION_HISTORY = "session_history_json"
         private const val PREF_CAMERA_SWAP_UV = "camera_swap_uv"
+        private const val DEPTH_SEND_EVERY = 5
+        private const val VOXEL_AUTO_REFRESH_MS = 30_000L
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -247,6 +250,10 @@ class MainActivity : AppCompatActivity() {
     private var depthUnavailableStreak = 0
     private var depthHintShown = false
     private var arcoreHintShown = false
+    private var depthFrameCounter = 0
+    private var currentScanHints: List<String> = emptyList()
+    private var scanHintsVisible = false
+    private var autoVoxelRefreshJob: Job? = null
 
     private val cameraPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -458,7 +465,15 @@ class MainActivity : AppCompatActivity() {
 
         if (!::arManager.isInitialized) {
             arManager = ARSessionManager(this, sceneView)
-            arManager.setupSession()
+        }
+        val sessionOk = arManager.setupSession()
+        if (!sessionOk) {
+            showError("ARCore сессия не запустилась. Убедитесь что ARCore обновлён и камера доступна.")
+            return
+        }
+        if (arManager.depthMode == Config.DepthMode.DISABLED && !depthHintShown) {
+            depthHintShown = true
+            showHint("ℹ️ Устройство не поддерживает Depth API — depth-данные недоступны")
         }
 
 
@@ -541,10 +556,12 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         stopStreaming()
         stopHealthLoop()
+        stopAutoVoxelRefresh()
         voxelPollJob?.cancel()
         voxelPollJob = null
         scope.cancel()
         clearARAnchors()
+        layerGlbManager?.clearNodes()
 
         if (::arRuler.isInitialized) {
             arRuler.clearAll()
@@ -576,6 +593,7 @@ class MainActivity : AppCompatActivity() {
             selectedVariantIndex = 0
             show3DPreview = false
             clearARAnchors()
+            layerGlbManager?.clearNodes()
             sceneBuilder.clearScene()
             transitionTo(AppState.IDLE)
         }
@@ -643,7 +661,9 @@ class MainActivity : AppCompatActivity() {
                     showHint("🧠 Запуск анализа структуры...")
                     stopStreaming()
                     transitionTo(AppState.MODELING)
-                    scope.launch { doRequestModeling() }
+                    val mJson = runCatching { if (::arRuler.isInitialized) arRuler.exportMeasurements() else "" }.getOrDefault("")
+                    val mList = runCatching { if (::arRuler.isInitialized) arRuler.getSavedMeasurements().map { m -> MeasurementConstraint(m.id, m.type.name, m.distance.toDouble(), m.label, m.timestamp) } else emptyList<MeasurementConstraint>() }.getOrDefault(emptyList())
+                    scope.launch { doRequestModeling(mJson, mList) }
                 }
                 .setNegativeButton("Отмена", null)
                 .show()
@@ -654,7 +674,9 @@ class MainActivity : AppCompatActivity() {
         stopStreaming()
         transitionTo(AppState.MODELING)
 
-        scope.launch { doRequestModeling() }
+        val measurementsJson = runCatching { if (::arRuler.isInitialized) arRuler.exportMeasurements() else "" }.getOrDefault("")
+        val measurementConstraints = runCatching { if (::arRuler.isInitialized) arRuler.getSavedMeasurements().map { m -> MeasurementConstraint(m.id, m.type.name, m.distance.toDouble(), m.label, m.timestamp) } else emptyList<MeasurementConstraint>() }.getOrDefault(emptyList())
+        scope.launch { doRequestModeling(measurementsJson, measurementConstraints) }
     }
 
     private fun onVariantSelected(index: Int) {
@@ -712,20 +734,41 @@ class MainActivity : AppCompatActivity() {
             )
             delay(300)
             currentSessionId?.let { sid ->
-                runCatching {
-                    val resp = api.exportLatest(sid)
-                    if (resp.isSuccessful && resp.body() != null) {
-                        val rev = resp.body()!!.revision_id ?: resp.body()!!.rev_id.orEmpty()
-                        if (rev.isNotBlank()) {
-                            lastRevisionId = rev
-                            showHint("✓ Экспорт сформирован: ${rev.take(8)}")
-                        }
-                    }
-                }
+                doLockSession(sid, option)
             }
             delay(450)
             showResultsBottomSheet()
         }
+    }
+
+
+    private suspend fun doLockSession(sid: String, option: ScaffoldOption) {
+        val measurementsJson = runCatching { if (::arRuler.isInitialized) arRuler.exportMeasurements() else "" }.getOrDefault("")
+        val measurementConstraints = runCatching {
+            if (::arRuler.isInitialized) {
+                arRuler.getSavedMeasurements().map { m ->
+                    MeasurementConstraint(m.id, m.type.name, m.distance.toDouble(), m.label, m.timestamp)
+                }
+            } else emptyList()
+        }.getOrDefault(emptyList())
+
+        val lockPayload = LockPayload(
+            session_id = sid,
+            selected_variant = option.variant_name,
+            measurements_json = measurementsJson.ifBlank { null },
+            manual_measurements = measurementConstraints
+        )
+        runCatching { api.lockSession(lockPayload) }
+            .onSuccess { resp ->
+                if (resp.isSuccessful && resp.body() != null) {
+                    lastRevisionId = resp.body()!!.rev_id
+                } else {
+                    runCatching { api.exportLatest(sid) }.onSuccess { exp ->
+                        val rev = exp.body()?.revision_id ?: exp.body()?.rev_id.orEmpty()
+                        if (rev.isNotBlank()) lastRevisionId = rev
+                    }
+                }
+            }
     }
 
     private fun onSaveSessionClicked() {
@@ -778,7 +821,7 @@ class MainActivity : AppCompatActivity() {
                 for (layer in layers) {
                     val path = layer.file?.glb?.path ?: layer.file?.path
                     if (path.isNullOrBlank()) continue
-                    runCatching { layerGlbManager?.loadLayer(layer.id, path) }
+                    runCatching { layerGlbManager?.loadOrShowLayer(layer.id, path) }
                 }
 
                 showLayersDialog()
@@ -1251,8 +1294,14 @@ class MainActivity : AppCompatActivity() {
         val clamped = v.coerceIn(0.0, 100.0)
         pbQuality.progress = clamped.toInt()
         tvQuality.text = "${clamped.toInt()}%"
-        if (clamped >= 1.0 && clamped < qualityMinForAnalyze.toDouble()) {
-            showHint("⚠️ Качество низкое: ${clamped.toInt()}%. Нужно >= $qualityMinForAnalyze% для анализа.")
+        val colorRes = when {
+            clamped >= qualityMinForAnalyze -> android.R.color.holo_green_light
+            clamped >= qualityMinForAnalyze * 0.6 -> android.R.color.holo_orange_light
+            else -> android.R.color.holo_red_light
+        }
+        pbQuality.progressTintList = android.content.res.ColorStateList.valueOf(ContextCompat.getColor(this, colorRes))
+        if (!scanHintsVisible && clamped >= 1.0 && clamped < qualityMinForAnalyze.toDouble()) {
+            showHint("⚠️ Качество: ${clamped.toInt()}%. Нужно >= $qualityMinForAnalyze%")
         }
     }
 
@@ -1580,7 +1629,9 @@ class MainActivity : AppCompatActivity() {
                     runCatching { image.close() }
                 }
 
-                val acquiredDepth = DepthUtils.tryAcquireDepth16(frame)
+                val shouldSendDepth = (depthFrameCounter % DEPTH_SEND_EVERY == 0)
+                depthFrameCounter++
+                val acquiredDepth = if (shouldSendDepth) DepthUtils.tryAcquireDepth16(frame) else null
                 val depthFrame = acquiredDepth?.let { acquired ->
                     try {
                         DepthUtils.copyDepth16(acquired.image, acquired.isRaw)
@@ -1711,20 +1762,31 @@ class MainActivity : AppCompatActivity() {
         withContext(Dispatchers.Main) {
             frameCount += 1
             val hints = body.ai_hints
+            when (body.status) {
+                "NEEDS_SCAN" -> {
+                    val scanDirections = buildList {
+                        hints?.scan_plan?.let { addAll(it) }
+                        hints?.next_best_views?.let { addAll(it) }
+                    }.distinct()
+                    if (scanDirections.isNotEmpty()) showScanHintsBar(scanDirections)
+                }
+                "READY" -> {
+                    hideScanHintsBar()
+                    if (userMarkers.size >= MIN_POINTS_FOR_MODEL && !hasRedZones) startPlayButtonPulse()
+                }
+                else -> if (hints?.is_scan_complete == true) hideScanHintsBar()
+            }
             if (hints != null) {
                 updateQualityUI(hints.quality_score)
                 val msg = when {
-                    !hints.warnings.isNullOrEmpty() -> hints.warnings.joinToString("\n")
-                    !hints.instructions.isNullOrEmpty() -> hints.instructions.joinToString("\n")
+                    !hints.warnings.isNullOrEmpty() -> hints.warnings!!.joinToString("\n")
+                    !hints.scan_plan.isNullOrEmpty() && body.status == "NEEDS_SCAN" -> "📍 Нужно досканировать: " + hints.scan_plan!!.take(2).joinToString(" | ")
+                    !hints.instructions.isNullOrEmpty() -> hints.instructions!!.joinToString("\n")
                     else -> null
                 }
-                if (!msg.isNullOrBlank()) {
-                    showHint(msg)
-                }
-
-                if (userMarkers.size >= MIN_POINTS_FOR_MODEL) {
-                    btnAnalyze.isEnabled = true
-                }
+                if (!msg.isNullOrBlank()) showHint(msg)
+                if (userMarkers.size >= MIN_POINTS_FOR_MODEL) btnAnalyze.isEnabled = true
+                if (hints.is_ready == true && !hasRedZones) startPlayButtonPulse()
             }
         }
 
@@ -1739,7 +1801,49 @@ class MainActivity : AppCompatActivity() {
         streamSendJob = null
     }
 
-    private suspend fun doRequestModeling() {
+    private fun startAutoVoxelRefresh(sessionId: String) {
+        stopAutoVoxelRefresh()
+        autoVoxelRefreshJob = lifecycleScope.launch {
+            while (isActive && eyeOfAIActive) {
+                delay(VOXEL_AUTO_REFRESH_MS)
+                if (!eyeOfAIActive || currentSessionId != sessionId) break
+                runCatching { api.getVoxels(sessionId) }.onSuccess { response ->
+                    if (response.isSuccessful && response.body() != null) {
+                        val voxelResponse = response.body()!!
+                        if (voxelResponse.total_count > 0) {
+                            currentVoxelData = voxelResponse.voxels.map { v ->
+                                VoxelData(v.position, v.type, v.color, v.alpha.toFloat(), voxelResponse.resolution.toFloat(), v.radius)
+                            }
+                            voxelVisualizer.setRootParent(originAnchorNode)
+                            voxelVisualizer.showVoxels(currentVoxelData!!)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun stopAutoVoxelRefresh() {
+        autoVoxelRefreshJob?.cancel()
+        autoVoxelRefreshJob = null
+    }
+
+    private fun showScanHintsBar(hints: List<String>) {
+        if (appState != AppState.SCANNING) return
+        currentScanHints = hints
+        scanHintsVisible = true
+        tvAiCritique.visibility = View.VISIBLE
+        tvAiCritique.text = hints.take(3).joinToString("\n") { "📍 $it" }
+        tvAiCritique.setTextColor(android.graphics.Color.parseColor("#FF6600"))
+    }
+
+    private fun hideScanHintsBar() {
+        currentScanHints = emptyList()
+        scanHintsVisible = false
+        if (tvAiCritique.text.toString().startsWith("📍")) tvAiCritique.visibility = View.GONE
+    }
+
+    private suspend fun doRequestModeling(measurementsJson: String = "", measurementConstraints: List<MeasurementConstraint> = emptyList()) {
         val sid = currentSessionId
         if (sid.isNullOrBlank()) {
             withContext(Dispatchers.Main) {
@@ -1759,7 +1863,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val response = try {
-            api.startModeling(sid)
+            if (measurementsJson.isNotBlank() || measurementConstraints.isNotEmpty()) api.startModelingWithMeasurements(sid, ModelingWithMeasurementsPayload(measurementsJson, measurementConstraints)) else api.startModeling(sid)
         } catch (e: Exception) {
             withContext(Dispatchers.Main) {
                 showError("Ошибка моделирования: " + (e.message ?: "UNKNOWN"))
@@ -1785,8 +1889,8 @@ class MainActivity : AppCompatActivity() {
             val opts = model.options.orEmpty()
             variantAdapter.submit(opts, selected = 0)
 
-            // Показать первый вариант
             if (opts.isNotEmpty()) onVariantSelected(0)
+            if (measurementConstraints.isNotEmpty()) showHint("📐 ${measurementConstraints.size} измерений использовано как ограничения")
         }
     }
 
@@ -2018,6 +2122,7 @@ class MainActivity : AppCompatActivity() {
             voxelLegend.visibility = View.GONE
             fabEyeOfAI.setImageResource(R.drawable.ic_eye)
             eyeOfAIActive = false
+            stopAutoVoxelRefresh()
             soundManager.play(SoundType.WHOOSH, volume = 0.3f, pitch = 0.8f)
             return
         }
@@ -2051,6 +2156,7 @@ class MainActivity : AppCompatActivity() {
                     eyeOfAIActive = true
                     soundManager.play(SoundType.WHOOSH, volume = 0.5f, pitch = 1.5f)
                     showToast("👁️ Теперь вы видите глазами ИИ! Вокселей: ${voxelResponse.total_count}")
+                    startAutoVoxelRefresh(sessionId)
                 } else {
                     showError("Не удалось загрузить воксели")
                 }
@@ -2345,11 +2451,17 @@ class MainActivity : AppCompatActivity() {
             Log.e("MainActivity", "Camera not available on resume", e)
             showError("Камера недоступна. Закройте другие приложения, использующие камеру.")
         }
+
+        if (eyeOfAIActive) {
+            val sid = currentSessionId
+            if (!sid.isNullOrBlank()) startAutoVoxelRefresh(sid)
+        }
     }
 
     override fun onPause() {
         super.onPause()
         stopStreaming()
+        stopAutoVoxelRefresh()
         runCatching { sceneView.pause() }
     }
 
