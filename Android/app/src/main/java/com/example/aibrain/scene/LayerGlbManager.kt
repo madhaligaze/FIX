@@ -25,12 +25,25 @@ class LayerGlbManager(
     private val sceneView: ArSceneView,
     private val baseUrl: String,
 ) {
+    sealed class LayerState {
+        object NotLoaded : LayerState()
+        object Loading : LayerState()
+        data class Loaded(val visible: Boolean) : LayerState()
+        data class Error(val reason: String) : LayerState()
+    }
+
+    var onStateChanged: ((layerId: String, state: LayerState) -> Unit)? = null
+
+    private val layerStates = mutableMapOf<String, LayerState>()
+    private val nodesByLayerId = mutableMapOf<String, Node>()
+    private val renderableCache = mutableMapOf<String, ModelRenderable>()
+    private val cachedFilePath = mutableMapOf<String, File>()
+    private var layersRoot: AnchorNode? = null
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
         .build()
-    private val nodesByLayerId = mutableMapOf<String, Node>()
-    private var layersRoot: AnchorNode? = null
 
     fun setLayersRoot(anchor: AnchorNode?) {
         layersRoot = anchor
@@ -38,73 +51,162 @@ class LayerGlbManager(
         nodesByLayerId.values.forEach { it.setParent(parent) }
     }
 
+    suspend fun loadOrShowLayer(layerId: String, relativePath: String) {
+        when (val st = layerStates[layerId]) {
+            is LayerState.Loaded -> {
+                setVisible(layerId, true)
+                return
+            }
+            is LayerState.Loading -> return
+            is LayerState.Error -> Log.w(TAG, "Layer $layerId had error '${st.reason}', retrying")
+            else -> Unit
+        }
+        loadLayerSafe(layerId, relativePath)
+    }
+
+    // Backward compatibility for existing callers.
     suspend fun loadLayer(layerId: String, relativePath: String): Node {
-        val cached = withContext(Dispatchers.IO) { downloadToCache(layerId, relativePath) }
-        val renderable = withContext(Dispatchers.Main) {
-            ModelRenderable.builder()
-                .setSource(context, Uri.fromFile(cached.file))
-                .setRegistryId("${cached.file.absolutePath}:${cached.contentTag}")
-                .build()
-                .await()
+        loadOrShowLayer(layerId, relativePath)
+        return nodesByLayerId[layerId]
+            ?: throw IllegalStateException("Layer $layerId failed to load")
+    }
+
+    private suspend fun loadLayerSafe(layerId: String, relativePath: String) {
+        setState(layerId, LayerState.Loading)
+
+        renderableCache[layerId]?.let {
+            placeNode(layerId, it)
+            setState(layerId, LayerState.Loaded(visible = true))
+            return
         }
 
-        return withContext(Dispatchers.Main) {
-            nodesByLayerId[layerId]?.setParent(null)
-            val nodeParent: NodeParent = layersRoot ?: sceneView.scene
-            val node = Node().apply {
-                this.renderable = renderable
-                this.isEnabled = true
-                setParent(nodeParent)
-            }
-            nodesByLayerId[layerId] = node
-            node
+        val cacheFile = try {
+            withContext(Dispatchers.IO) { downloadToCache(layerId, relativePath) }
+        } catch (e: Exception) {
+            setState(layerId, LayerState.Error("Download failed: ${e.message}"))
+            return
         }
+
+        val renderable = try {
+            withContext(Dispatchers.Main) {
+                ModelRenderable.builder()
+                    .setSource(context, Uri.fromFile(cacheFile))
+                    .setRegistryId("${cacheFile.absolutePath}:${cacheFile.length()}")
+                    .build()
+                    .await()
+            }
+        } catch (e: Exception) {
+            setState(layerId, LayerState.Error("Renderable build failed: ${e.message}"))
+            return
+        }
+
+        renderableCache[layerId] = renderable
+        cachedFilePath[layerId] = cacheFile
+
+        withContext(Dispatchers.Main) {
+            placeNode(layerId, renderable)
+            setState(layerId, LayerState.Loaded(visible = true))
+        }
+    }
+
+    private fun placeNode(layerId: String, renderable: ModelRenderable) {
+        nodesByLayerId[layerId]?.setParent(null)
+        val parent: NodeParent = layersRoot ?: sceneView.scene
+        val node = Node().apply {
+            this.renderable = renderable
+            isEnabled = true
+            setParent(parent)
+        }
+        nodesByLayerId[layerId] = node
     }
 
     fun setVisible(layerId: String, visible: Boolean) {
-        nodesByLayerId[layerId]?.isEnabled = visible
+        val node = nodesByLayerId[layerId] ?: return
+        node.isEnabled = visible
+        if (layerStates[layerId] is LayerState.Loaded) {
+            val state = LayerState.Loaded(visible)
+            layerStates[layerId] = state
+            onStateChanged?.invoke(layerId, state)
+        }
+    }
+
+    fun toggleLayer(layerId: String): Boolean {
+        val current = (layerStates[layerId] as? LayerState.Loaded)?.visible ?: false
+        setVisible(layerId, !current)
+        return !current
+    }
+
+    fun showAllLayers() = nodesByLayerId.keys.forEach { setVisible(it, true) }
+
+    fun hideAllLayers() = nodesByLayerId.keys.forEach { setVisible(it, false) }
+
+    suspend fun refreshLayer(layerId: String, relativePath: String) {
+        nodesByLayerId.remove(layerId)?.setParent(null)
+        renderableCache.remove(layerId)
+        cachedFilePath.remove(layerId)?.let { runCatching { it.delete() } }
+        layerStates.remove(layerId)
+        loadLayerSafe(layerId, relativePath)
+    }
+
+    fun clearNodes() {
+        nodesByLayerId.values.forEach { it.setParent(null) }
+        nodesByLayerId.clear()
+        layerStates.clear()
     }
 
     fun clearAll() {
-        nodesByLayerId.values.forEach { it.setParent(null) }
-        nodesByLayerId.clear()
+        clearNodes()
+        renderableCache.clear()
+        cachedFilePath.values.forEach { runCatching { it.delete() } }
+        cachedFilePath.clear()
     }
 
-    private data class CachedLayerFile(val file: File, val contentTag: String)
+    fun getLayerState(layerId: String): LayerState = layerStates[layerId] ?: LayerState.NotLoaded
+    fun isLayerVisible(layerId: String): Boolean = (layerStates[layerId] as? LayerState.Loaded)?.visible == true
+    fun isLayerLoaded(layerId: String): Boolean = layerStates[layerId] is LayerState.Loaded
 
-    private fun downloadToCache(layerId: String, relativePath: String): CachedLayerFile {
+    private fun setState(layerId: String, state: LayerState) {
+        layerStates[layerId] = state
+        onStateChanged?.invoke(layerId, state)
+    }
+
+    private fun downloadToCache(layerId: String, relativePath: String): File {
         val cleanPath = relativePath.removePrefix("/")
-        val full = baseUrl.trimEnd('/') + "/" + cleanPath
-        Log.i("LayerGlbManager", "Downloading layer $layerId from $full")
-        val req = Request.Builder().url(full).build()
+        val fullUrl = baseUrl.trimEnd('/') + "/" + cleanPath
+        val req = Request.Builder().url(fullUrl).build()
         client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) {
-                throw IllegalStateException("Failed to download layer=$layerId url=$full: HTTP ${resp.code}")
+                throw IllegalStateException("HTTP ${resp.code} for layer=$layerId url=$fullUrl")
             }
-            val bytes = resp.body?.bytes() ?: throw IllegalStateException("Empty response body for layer=$layerId url=$full")
+            val bytes = resp.body?.bytes() ?: throw IllegalStateException("Empty body for layer=$layerId")
             val crc = CRC32().apply { update(bytes) }.value.toString(16)
             val out = File(context.cacheDir, "layer_${layerId}_$crc.glb")
-            out.writeBytes(bytes)
-            cleanupLayerCache(layerId, keepLatest = 10)
-            return CachedLayerFile(file = out, contentTag = crc)
+            if (!out.exists() || out.length() != bytes.size.toLong()) {
+                out.writeBytes(bytes)
+                cleanupLayerCache(layerId, keepLatest = 3)
+            }
+            return out
         }
     }
 
     private fun cleanupLayerCache(layerId: String, keepLatest: Int) {
-        val files = context.cacheDir.listFiles { file ->
-            file.isFile && file.name.startsWith("layer_${layerId}_") && file.name.endsWith(".glb")
-        }?.sortedByDescending { it.lastModified() } ?: return
+        val files = context.cacheDir
+            .listFiles { f -> f.isFile && f.name.startsWith("layer_${layerId}_") && f.name.endsWith(".glb") }
+            ?.sortedByDescending { it.lastModified() }
+            ?: return
+        files.drop(keepLatest).forEach { runCatching { it.delete() } }
+    }
 
-        files.drop(keepLatest).forEach {
-            runCatching { it.delete() }
+    private companion object {
+        const val TAG = "LayerGlbManager"
+    }
+}
+
+private suspend fun <T> CompletableFuture<T>.await(): T =
+    suspendCancellableCoroutine { cont ->
+        whenComplete { value, error ->
+            if (error != null) cont.resumeWithException(error)
+            else cont.resume(value)
         }
+        cont.invokeOnCancellation { cancel(true) }
     }
-}
-
-private suspend fun <T> CompletableFuture<T>.await(): T = suspendCancellableCoroutine { cont ->
-    whenComplete { value, error ->
-        if (error != null) cont.resumeWithException(error)
-        else cont.resume(value)
-    }
-    cont.invokeOnCancellation { cancel(true) }
-}
