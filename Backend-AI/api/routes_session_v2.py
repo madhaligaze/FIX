@@ -6,7 +6,7 @@ from pydantic import BaseModel, ValidationError
 from api.ingest import ingest_frame
 from contracts.frame_packet import AnchorPoint, FramePacketMeta
 from policy.unknown_space import apply_unknown_policy
-from scanning.readiness import compute_readiness
+from scanning.readiness import compute_readiness, compute_readiness_metrics
 from validation.frame_validation import validate_and_normalize_frame_meta
 from world.mesh_export import env_mesh_obj_bytes
 
@@ -149,12 +149,29 @@ def lock_session(request: Request, payload: LockPayload) -> dict:
     }
 
 
+@router.get("/session/{session_id}/readiness")
+def session_readiness(request: Request, session_id: str) -> dict:
+    state = request.app.state.runtime
+    world = state.get_world(session_id)
+    anchors = state.anchors.get(session_id, [])
+    ready, score, reasons = compute_readiness(world, anchors, state.policy)
+    metrics = compute_readiness_metrics(world, anchors, state.policy)
+    return {
+        "session_id": session_id,
+        "ready": ready,
+        "score": score,
+        "reasons": reasons,
+        "readiness_metrics": metrics,
+    }
+
+
 @router.get("/session/{session_id}/status")
 def session_status(request: Request, session_id: str) -> dict:
     state = request.app.state.runtime
     world = state.get_world(session_id)
     anchors = state.anchors.get(session_id, [])
     ready, score, reasons = compute_readiness(world, anchors, state.policy)
+    readiness_metrics = compute_readiness_metrics(world, anchors, state.policy)
     unknown = apply_unknown_policy(world, anchors, state.policy)
     sg = state.get_scene_graph(session_id)
     return {
@@ -162,6 +179,7 @@ def session_status(request: Request, session_id: str) -> dict:
         "ready": ready,
         "score": score,
         "reasons": reasons,
+        "readiness_metrics": readiness_metrics,
         "metrics": world.serialize_state(),
         "unknown_policy": unknown,
         "perception_unavailable": state.perception_unavailable,

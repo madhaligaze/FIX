@@ -42,6 +42,16 @@ class LayerGlbManager(
     private val cachedFilePath = mutableMapOf<String, File>()
     private var layersRoot: AnchorNode? = null
 
+    private var currentRevisionSafe: String = "rev_none"
+    private val keepLatestRevs: Int = 5
+    private val keepLatestLayerFilesPerRev: Int = 3
+
+    fun setCurrentRevision(revId: String?) {
+        currentRevisionSafe = sanitizeRevId(revId)
+        // Opportunistic cleanup
+        cleanupOldRevisions()
+    }
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
@@ -166,10 +176,19 @@ class LayerGlbManager(
     }
 
     fun clearAll() {
+        // Clears nodes + in-memory renderables, but keeps on-disk cache (rev-aware).
+        clearNodes()
+        renderableCache.clear()
+        cachedFilePath.clear()
+    }
+
+    fun clearAllHard() {
+        // Clears everything including cached files.
         clearNodes()
         renderableCache.clear()
         cachedFilePath.values.forEach { runCatching { it.delete() } }
         cachedFilePath.clear()
+        cleanupOldRevisions(keep = 0)
     }
 
     fun getLayerState(layerId: String): LayerState = layerStates[layerId] ?: LayerState.NotLoaded
@@ -191,17 +210,52 @@ class LayerGlbManager(
             }
             val bytes = resp.body?.bytes() ?: throw IllegalStateException("Empty body for layer=$layerId")
             val crc = CRC32().apply { update(bytes) }.value.toString(16)
-            val out = File(context.cacheDir, "layer_${layerId}_$crc.glb")
+
+            val revDir = getRevisionDir()
+            if (!revDir.exists()) revDir.mkdirs()
+
+            val out = File(revDir, "layer_${layerId}_$crc.glb")
             if (!out.exists() || out.length() != bytes.size.toLong()) {
                 out.writeBytes(bytes)
-                cleanupLayerCache(layerId, keepLatest = 3)
             }
+
+            // Cleanup policies:
+            // - keep latest N revisions
+            // - keep latest K layer files per layerId inside this revision dir
+            cleanupOldRevisions()
+            cleanupLayerCacheInDir(revDir, layerId, keepLatest = keepLatestLayerFilesPerRev)
+
             return out
         }
     }
 
-    private fun cleanupLayerCache(layerId: String, keepLatest: Int) {
-        val files = context.cacheDir
+    private fun getRevisionDir(): File {
+        // cacheDir/layers_rev_<revSafe>/
+        return File(context.cacheDir, "layers_rev_${currentRevisionSafe}")
+    }
+
+    private fun sanitizeRevId(revId: String?): String {
+        val raw = (revId ?: "").trim()
+        if (raw.isBlank()) return "rev_none"
+        val safe = raw
+            .lowercase()
+            .replace(Regex("[^a-z0-9_\\-]"), "_")
+            .take(48)
+        return if (safe.isBlank()) "rev_none" else safe
+    }
+
+    private fun cleanupOldRevisions(keep: Int = keepLatestRevs) {
+        val dirs = context.cacheDir
+            .listFiles { f -> f.isDirectory && f.name.startsWith("layers_rev_") }
+            ?.sortedByDescending { it.lastModified() }
+            ?: return
+        dirs.drop(keep).forEach { dir ->
+            runCatching { dir.deleteRecursively() }
+        }
+    }
+
+    private fun cleanupLayerCacheInDir(revDir: File, layerId: String, keepLatest: Int) {
+        val files = revDir
             .listFiles { f -> f.isFile && f.name.startsWith("layer_${layerId}_") && f.name.endsWith(".glb") }
             ?.sortedByDescending { it.lastModified() }
             ?: return

@@ -78,3 +78,51 @@ def compute_readiness(world_model, anchors: list[dict], policy) -> tuple[bool, f
         (not supports) or (view_div >= min_views)
     )
     return bool(ready), float(score), reasons
+
+
+
+def compute_readiness_metrics(world_model, anchors: list[dict], policy) -> dict:
+    """Return structured readiness metrics for UI.
+
+    This intentionally mirrors compute_readiness() so Android can display:
+      - observed_ratio
+      - view_diversity (min views across supports)
+      - viewpoints
+      - thresholds (mins)
+    """
+    aabb = compute_work_aabb(anchors, padding_m=1.0)
+    metrics: dict = {
+        "anchor_count": int(len(anchors or [])),
+        "observed_ratio": 0.0,
+        "view_diversity": 0,
+        "viewpoints": int(world_model.metrics.get("viewpoints", 0) or 0),
+        "min_observed_ratio": float(getattr(policy, "readiness_observed_ratio_min", 0.1)),
+        "min_views_per_anchor": int(getattr(policy, "min_views_per_anchor", 3) or 3),
+        "min_viewpoints": int(getattr(policy, "min_viewpoints", 3) or 3),
+    }
+
+    if aabb is None:
+        st = world_model.occupancy.stats()
+        total = float(st.get("total", 0) or 0.0)
+        if total > 0:
+            metrics["observed_ratio"] = float(st.get("observed_ratio", 0.0) or 0.0)
+        return metrics
+
+    bmin, bmax = aabb
+    stats = world_model.occupancy.stats_aabb(bmin, bmax)
+    total = float(stats.get("total", 1) or 1.0)
+    free = float(stats.get("free", 0) or 0.0)
+    occ = float(stats.get("occupied", 0) or 0.0)
+    metrics["observed_ratio"] = float((free + occ) / max(1.0, total))
+
+    supports = [a for a in anchors if a.get("kind") == "support" and isinstance(a.get("position"), (list, tuple))]
+    view_counts: list[int] = []
+    if supports and hasattr(world_model, "anchor_view_count"):
+        for s in supports:
+            pos = list(s.get("position"))
+            try:
+                view_counts.append(int(world_model.anchor_view_count(pos, bins_deg=45.0)))
+            except Exception:
+                view_counts.append(0)
+    metrics["view_diversity"] = int(min(view_counts) if view_counts else 0)
+    return metrics
