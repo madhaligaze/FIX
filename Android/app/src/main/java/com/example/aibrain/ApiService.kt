@@ -77,6 +77,11 @@ interface ApiService {
         @Path("session_id") sessionId: String,
         @Body payload: CrashEnvelope
     ): Response<Unit>
+
+    @POST("/telemetry/client_report")
+    suspend fun postClientDiagnostics(
+        @Body payload: ClientReportEnvelope
+    ): Response<SimpleStatusResponse>
 }
 
 data class SessionResponse(
@@ -346,4 +351,26 @@ data class CrashEnvelope(
     val last_revision_id: String? = null,
     val client_stats: Map<String, @JvmSuppressWildcards Any> = emptyMap(),
     val errors: List<CrashErrorItem> = emptyList()
+)
+
+
+data class SimpleStatusResponse(
+    val status: String
+)
+
+data class ClientErrorItem(
+    val timestamp_ms: Long,
+    val tag: String,
+    val message: String,
+    val stack: String? = null
+)
+
+data class ClientReportEnvelope(
+    val session_id: String? = null,
+    val timestamp_ms: Long,
+    val client_stats: Map<String, @JvmSuppressWildcards Any> = emptyMap(),
+    val last_export_rev: String? = null,
+    val queued_actions: Map<String, @JvmSuppressWildcards Any> = emptyMap(),
+    val last_errors: List<ClientErrorItem> = emptyList(),
+    val device: LogDeviceInfo? = null
 )

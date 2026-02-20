@@ -104,6 +104,43 @@ class OccupancyGrid:
                 idx2 = ((p_w - self.origin) / self.voxel_size).astype(np.int32)
                 self._touch(idx2, OCCUPIED)
 
+    def occupied_points(
+        self,
+        *,
+        box_min: list[float] | None = None,
+        box_max: list[float] | None = None,
+        max_points: int = 50_000,
+    ) -> list[list[float]]:
+        """Return centers of occupied voxels as point list (world coords)."""
+        g = self.grid
+        if box_min is not None and box_max is not None:
+            bmin = np.asarray(box_min, dtype=np.float32).reshape(3)
+            bmax = np.asarray(box_max, dtype=np.float32).reshape(3)
+            lo = np.minimum(bmin, bmax)
+            hi = np.maximum(bmin, bmax)
+            i0 = ((lo - self.origin) / self.voxel_size).astype(np.int32)
+            i1 = ((hi - self.origin) / self.voxel_size).astype(np.int32) + 1
+            i0 = np.maximum(i0, 0)
+            i1 = np.minimum(i1, np.asarray(g.shape, dtype=np.int32))
+            if np.any(i1 <= i0):
+                return []
+            sub = g[i0[0]:i1[0], i0[1]:i1[1], i0[2]:i1[2]]
+            idx = np.argwhere(sub == OCCUPIED)
+            if idx.size == 0:
+                return []
+            idx = idx + i0.reshape(1, 3)
+        else:
+            idx = np.argwhere(g == OCCUPIED)
+            if idx.size == 0:
+                return []
+
+        if max_points > 0 and idx.shape[0] > int(max_points):
+            step = int(max(1, idx.shape[0] // int(max_points)))
+            idx = idx[::step]
+
+        pts = self.origin.reshape(1, 3) + (idx.astype(np.float32) + 0.5) * float(self.voxel_size)
+        return pts.tolist()
+
     def query(self, points: list[list[float]]) -> list[int]:
         pts = np.array(points, dtype=np.float32)
         idx = ((pts - self.origin) / self.voxel_size).astype(np.int32)
