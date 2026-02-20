@@ -197,10 +197,21 @@ class WorldModel:
     def update_from_frame(
         self,
         meta: dict,
-        rgb_bytes: bytes,
-        depth_bytes: bytes | None,
-        pointcloud_bytes: bytes | None,
+        rgb_bytes: bytes | None = None,
+        depth_bytes: bytes | None = None,
+        pointcloud_bytes: bytes | None = None,
+        # Compatibility with older tests/callers passing keyword names.
+        rgb: bytes | None = None,
+        depth: bytes | None = None,
+        pointcloud: bytes | None = None,
     ) -> None:
+        # Prefer explicit positional args, but accept legacy keyword aliases.
+        if rgb_bytes is None:
+            rgb_bytes = rgb
+        if depth_bytes is None:
+            depth_bytes = depth
+        if pointcloud_bytes is None:
+            pointcloud_bytes = pointcloud
         del rgb_bytes
         self.metrics["frames"] = int(self.metrics.get("frames", 0)) + 1
 
