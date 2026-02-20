@@ -246,6 +246,8 @@ class MainActivity : AppCompatActivity() {
     private val exportedLayerPaths: MutableMap<String, String> = mutableMapOf()
     private var loadedExportRevId: String? = null
     private var currentConnStatus: ConnectionStatus = ConnectionStatus.UNKNOWN
+    @Volatile private var streamPendingTick: Boolean = false
+    @Volatile private var streamImmediateNextTick: Boolean = false
     private var nextStreamAttemptAtMs: Long = 0L
     private var originAnchorNode: AnchorNode? = null
     private var streamSendJob: Job? = null
@@ -511,6 +513,15 @@ class MainActivity : AppCompatActivity() {
         // Основные действия
         btnStart.setOnClickListener { onStartClicked() }
         btnAddPoint.setOnClickListener { onAddPointClicked() }
+        btnAddPoint.setOnLongClickListener {
+            if (originAnchorNode == null) {
+                showHint("ℹ️ Origin ещё не задан. Долгое нажатие работает после установки первой опоры")
+                true
+            } else {
+                confirmResetOrigin()
+                true
+            }
+        }
         btnScan.setOnClickListener { onScanClicked() }
         btn3DModel.setOnClickListener { on3DModelClicked() }
         btnAnalyze.setOnClickListener { onAnalyzeClicked() }
@@ -741,6 +752,8 @@ class MainActivity : AppCompatActivity() {
             delay(300)
             currentSessionId?.let { sid ->
                 doLockSession(sid, option)
+                // Auto-refresh export layers after locking (if origin is set).
+                loadExportLayersInternal(sid, showDialog = false, showOkHint = false)
             }
             delay(450)
             showResultsBottomSheet()
@@ -777,6 +790,62 @@ class MainActivity : AppCompatActivity() {
             }
     }
 
+    private suspend fun loadExportLayersInternal(
+        sid: String,
+        showDialog: Boolean,
+        showOkHint: Boolean
+    ) {
+        try {
+            val response = api.exportLatest(sid)
+            if (!response.isSuccessful || response.body() == null) {
+                throw IllegalStateException("HTTP ${response.code()}")
+            }
+            val bundle = response.body()!!
+            val rev = bundle.revision_id ?: bundle.rev_id.orEmpty()
+            if (rev.isNotBlank() && loadedExportRevId != null && loadedExportRevId != rev) {
+                layerGlbManager?.clearAll()
+            }
+            if (rev.isNotBlank()) loadedExportRevId = rev
+
+            val layers = bundle.ui?.layers.orEmpty()
+            exportedLayers = layers
+            exportedLayerPaths.clear()
+            for (layer in layers) {
+                val path = layer.file?.glb?.path ?: layer.file?.path
+                if (!path.isNullOrBlank()) exportedLayerPaths[layer.id] = path
+            }
+
+            if (originAnchorNode == null) {
+                if (showDialog) showLayersDialog()
+                showHint("⚠️ Сначала поставь origin anchor (кнопка опоры), потом загружай слои")
+                return
+            }
+
+            if (layerGlbManager == null) {
+                layerGlbManager = LayerGlbManager(this@MainActivity, sceneView, getCurrentServerUrl())
+            }
+            layerGlbManager?.setLayersRoot(originAnchorNode)
+
+            for (layer in layers) {
+                val path = exportedLayerPaths[layer.id]
+                if (path.isNullOrBlank()) continue
+                val key = "layer_visible_${layer.id}"
+                val def = layer.default_on ?: true
+                val wantVisible = settingsPrefs.getBoolean(key, def)
+                if (wantVisible) {
+                    runCatching { layerGlbManager?.loadOrShowLayer(layer.id, path) }
+                } else {
+                    layerGlbManager?.setVisible(layer.id, false)
+                }
+            }
+
+            if (showDialog) showLayersDialog()
+            if (showOkHint) showHint("✓ Слои обновлены")
+        } catch (e: Exception) {
+            if (showOkHint) showHint("❌ Ошибка загрузки слоёв: ${e.message}")
+        }
+    }
+
     private fun onSaveSessionClicked() {
         val sid = currentSessionId
         if (sid.isNullOrBlank()) {
@@ -811,53 +880,7 @@ class MainActivity : AppCompatActivity() {
 
         showHint("📦 Загрузка export/latest...")
         scope.launch {
-            try {
-                val response = api.exportLatest(sid)
-                if (!response.isSuccessful || response.body() == null) {
-                    throw IllegalStateException("HTTP ${response.code()}")
-                }
-                val bundle = response.body()!!
-                val rev = bundle.revision_id ?: bundle.rev_id.orEmpty()
-                if (rev.isNotBlank() && loadedExportRevId != null && loadedExportRevId != rev) {
-                    // New revision - clear old layer nodes to avoid mixing bundles.
-                    layerGlbManager?.clearAll()
-                }
-                if (rev.isNotBlank()) loadedExportRevId = rev
-
-                val layers = bundle.ui?.layers.orEmpty()
-                exportedLayers = layers
-                exportedLayerPaths.clear()
-                for (layer in layers) {
-                    val path = layer.file?.glb?.path ?: layer.file?.path
-                    if (!path.isNullOrBlank()) exportedLayerPaths[layer.id] = path
-                }
-                if (originAnchorNode == null) {
-                    showHint("⚠️ Сначала поставь origin anchor (кнопка опоры), потом загружай слои")
-                    showLayersDialog()
-                    return@launch
-                }
-                if (layerGlbManager == null) {
-                    layerGlbManager = LayerGlbManager(this@MainActivity, sceneView, getCurrentServerUrl())
-                }
-                layerGlbManager?.setLayersRoot(originAnchorNode)
-                for (layer in layers) {
-                    val path = exportedLayerPaths[layer.id]
-                    if (path.isNullOrBlank()) continue
-                    val key = "layer_visible_${layer.id}"
-                    val def = layer.default_on ?: true
-                    val wantVisible = settingsPrefs.getBoolean(key, def)
-                    if (wantVisible) {
-                        runCatching { layerGlbManager?.loadOrShowLayer(layer.id, path) }
-                    } else {
-                        layerGlbManager?.setVisible(layer.id, false)
-                    }
-                }
-
-                showLayersDialog()
-                showHint("✓ Слои загружены")
-            } catch (e: Exception) {
-                showHint("❌ Ошибка загрузки слоёв: ${e.message}")
-            }
+            loadExportLayersInternal(sid, showDialog = true, showOkHint = true)
         }
     }
 
@@ -1619,7 +1642,8 @@ class MainActivity : AppCompatActivity() {
                     continue
                 }
                 if (streamSendJob?.isActive == true) {
-                    // Previous frame still sending — skip this tick (backpressure, NOT a failure)
+                    // Backpressure: remember that we need one more tick once current send finishes.
+                    streamPendingTick = true
                 } else {
                     streamSendJob = launch(Dispatchers.IO) {
                         val ok = try {
@@ -1633,6 +1657,10 @@ class MainActivity : AppCompatActivity() {
                                 consecutiveFailures += 1
                             } else {
                                 consecutiveFailures = 0
+                            }
+                            if (streamPendingTick) {
+                                streamPendingTick = false
+                                streamImmediateNextTick = true
                             }
                         }
                     }
@@ -1659,7 +1687,9 @@ class MainActivity : AppCompatActivity() {
 
                 updateFrameCounter()
                 updateCameraCoordinates()
-                delay(STREAM_INTERVAL_MS)
+                val waitMs = if (streamImmediateNextTick) 0L else STREAM_INTERVAL_MS
+                streamImmediateNextTick = false
+                delay(waitMs)
             }
         }
     }
@@ -2054,6 +2084,29 @@ class MainActivity : AppCompatActivity() {
         }
 
         showHint("✓ Точка добавлена: ${userMarkers.size}")
+    }
+
+    private fun confirmResetOrigin() {
+        AlertDialog.Builder(this)
+            .setTitle("Сброс origin")
+            .setMessage("Сбросить origin и удалить все точки опоры? Это нужно, если origin поставили неверно.")
+            .setPositiveButton("Сбросить") { _, _ ->
+                resetOriginAndAnchors()
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun resetOriginAndAnchors() {
+        clearARAnchors()
+        loadedExportRevId = null
+        exportedLayers = emptyList()
+        exportedLayerPaths.clear()
+        layerGlbManager?.clearAll()
+        currentVoxelData = null
+        voxelVisualizer.hideVoxels()
+        showHint("✓ Origin сброшен. Поставь новую опору")
+        scope.launch { runCatching { syncAnchorsToServer() } }
     }
 
 
@@ -2478,6 +2531,14 @@ class MainActivity : AppCompatActivity() {
             }
             R.id.action_layers -> {
                 showLayersDialog()
+                true
+            }
+            R.id.action_reset_origin -> {
+                if (originAnchorNode == null) {
+                    showHint("ℹ️ Origin ещё не задан")
+                } else {
+                    confirmResetOrigin()
+                }
                 true
             }
             else -> super.onOptionsItemSelected(item)
