@@ -1595,7 +1595,8 @@ class MainActivity : AppCompatActivity() {
 
         data class FramePacket(
             val payload: HashMap<String, Any>,
-            val nv21: ImageUtils.Nv21Frame,
+            val yuv: ImageUtils.Yuv420Copy,
+            val swapUv: Boolean,
             val depth: DepthUtils.DepthFrame?
         )
 
@@ -1623,8 +1624,10 @@ class MainActivity : AppCompatActivity() {
                     null
                 } ?: return@withContext null
 
-                val nv21 = try {
-                    ImageUtils.yuv420ToNv21(image, swapUv = settingsPrefs.getBoolean(PREF_CAMERA_SWAP_UV, false))
+                val swapUv = settingsPrefs.getBoolean(PREF_CAMERA_SWAP_UV, false)
+                val yuvCopy = try {
+                    // Copy planes quickly on main thread while Image is valid.
+                    ImageUtils.copyYuv420(image)
                 } finally {
                     runCatching { image.close() }
                 }
@@ -1690,8 +1693,8 @@ class MainActivity : AppCompatActivity() {
                         "width" to dims[0].toInt(),
                         "height" to dims[1].toInt()
                     ),
-                    "rgb_width" to nv21.width,
-                    "rgb_height" to nv21.height,
+                    "rgb_width" to yuvCopy.width,
+                    "rgb_height" to yuvCopy.height,
                     "pose" to mapOf(
                         "position" to position,
                         "quaternion" to quaternion
@@ -1713,7 +1716,7 @@ class MainActivity : AppCompatActivity() {
                     basePayload["manual_measurements"] = manualMeasurements
                 }
 
-                FramePacket(basePayload, nv21, depthFrame)
+                FramePacket(basePayload, yuvCopy, swapUv, depthFrame)
             } catch (_: Exception) {
                 null
             }
@@ -1735,12 +1738,15 @@ class MainActivity : AppCompatActivity() {
 
         val payload = withContext(Dispatchers.Default) {
             packet.payload.apply {
-                this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(packet.nv21.data, packet.nv21.width, packet.nv21.height, 75)
+                val nv21 = ImageUtils.yuvCopyToNv21(packet.yuv, swapUv = packet.swapUv)
+                this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, 75)
                 val depth = packet.depth
                 if (depth != null) {
                     this["depth_base64"] = DepthUtils.depthBytesToBase64(depth.bytes)
                     this["depth_width"] = depth.width
                     this["depth_height"] = depth.height
+                    // Keep both keys for backend compatibility.
+                    this["depth_scale_m_per_unit"] = depth.scaleMPerUnit
                     this["depth_scale"] = depth.scaleMPerUnit
                     this["depth_is_raw"] = depth.isRaw
                     this["depth_format"] = depth.format

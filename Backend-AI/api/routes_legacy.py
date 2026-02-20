@@ -129,10 +129,11 @@ def _build_meta(session_id: str, payload: LegacyStreamPayload) -> tuple[dict, by
 
     depth_meta = None
     if depth_bytes is not None:
+        depth_scale = payload.depth_scale_m_per_unit or payload.depth_scale or 0.001
         depth_meta = {
             "width": int(payload.depth_width or intrinsics["width"]),
             "height": int(payload.depth_height or intrinsics["height"]),
-            "scale_m_per_unit": float(payload.depth_scale or 0.001),
+            "scale_m_per_unit": float(depth_scale),
             "encoding": "uint16",
         }
 

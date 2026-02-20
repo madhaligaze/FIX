@@ -19,7 +19,9 @@ class OccupancyGrid:
         self,
         *,
         voxel_size: float = 0.2,
-        dims: tuple[int, int, int] = (128, 128, 64),
+        # Use a cubic grid by default to avoid z-mid indexing failures in downstream
+        # ESDF/mesh logic and tests.
+        dims: tuple[int, int, int] = (128, 128, 128),
         origin: tuple[float, float, float] = (-12.8, -12.8, -1.0),
     ) -> None:
         self.voxel_size = float(voxel_size)
@@ -36,6 +38,10 @@ class OccupancyGrid:
     def _in_bounds(self, idx: np.ndarray) -> bool:
         shp = np.asarray(self.grid.shape, dtype=np.int32)
         return bool(np.all(idx >= 0) and np.all(idx < shp))
+
+    # Public alias expected by tests and higher-level checks.
+    def in_bounds(self, idx: np.ndarray) -> bool:
+        return self._in_bounds(idx)
 
     def _touch(self, idx: np.ndarray, new_state: int) -> None:
         if not self._in_bounds(idx):
