@@ -244,6 +244,9 @@ class MainActivity : AppCompatActivity() {
     private var layerGlbManager: LayerGlbManager? = null
     private var exportedLayers: List<UiLayer> = emptyList()
     private val exportedLayerPaths: MutableMap<String, String> = mutableMapOf()
+    private var loadedExportRevId: String? = null
+    private var currentConnStatus: ConnectionStatus = ConnectionStatus.UNKNOWN
+    private var nextStreamAttemptAtMs: Long = 0L
     private var originAnchorNode: AnchorNode? = null
     private var streamSendJob: Job? = null
     private var isArSceneReady = false
@@ -814,6 +817,13 @@ class MainActivity : AppCompatActivity() {
                     throw IllegalStateException("HTTP ${response.code()}")
                 }
                 val bundle = response.body()!!
+                val rev = bundle.revision_id ?: bundle.rev_id.orEmpty()
+                if (rev.isNotBlank() && loadedExportRevId != null && loadedExportRevId != rev) {
+                    // New revision - clear old layer nodes to avoid mixing bundles.
+                    layerGlbManager?.clearAll()
+                }
+                if (rev.isNotBlank()) loadedExportRevId = rev
+
                 val layers = bundle.ui?.layers.orEmpty()
                 exportedLayers = layers
                 exportedLayerPaths.clear()
@@ -967,6 +977,7 @@ class MainActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════════════════════════════
 
     private fun updateConnectionUi(status: ConnectionStatus, detail: String? = null) {
+        currentConnStatus = status
         lastConnectionDetail = detail
 
         val (dotRes, label) = when (status) {
@@ -1381,6 +1392,15 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        if ((originAnchorNode?.name ?: "") == anchorId) {
+            originAnchorNode = null
+            layerGlbManager?.setLayersRoot(null)
+            layerGlbManager?.clearAll()
+            voxelVisualizer.setRootParent(null)
+            currentVoxelData = null
+            showHint("⚠️ Origin anchor удалён. Поставь новую опору, чтобы закрепить слои")
+        }
+
         updatePointsCount()
         btnAnalyze.isEnabled = userMarkers.size >= MIN_POINTS_FOR_MODEL
         showHint("🗑 Маркер удалён")
@@ -1554,6 +1574,12 @@ class MainActivity : AppCompatActivity() {
                     viewModel.setSessionId(sessionId)
                     rememberSessionInHistory(sessionId)
 
+                    // Reset export/layer state for new session.
+                    loadedExportRevId = null
+                    exportedLayers = emptyList()
+                    exportedLayerPaths.clear()
+                    layerGlbManager?.clearAll()
+
                     consecutiveFailures = 0
                     frameCount = 0
 
@@ -1587,6 +1613,11 @@ class MainActivity : AppCompatActivity() {
         streamSendJob?.cancel()
         streamJob = scope.launch {
             while (isActive && isStreaming && currentSessionId == sid) {
+                val nowMs = System.currentTimeMillis()
+                if (nowMs < nextStreamAttemptAtMs) {
+                    delay(min(STREAM_INTERVAL_MS, nextStreamAttemptAtMs - nowMs))
+                    continue
+                }
                 if (streamSendJob?.isActive == true) {
                     // Previous frame still sending — skip this tick (backpressure, NOT a failure)
                 } else {
@@ -1610,11 +1641,20 @@ class MainActivity : AppCompatActivity() {
                 if (consecutiveFailures >= MAX_FAIL_RECONNECT) {
                     val base = getCurrentServerUrl().trimEnd('/')
                     viewModel.setConnectionState(ConnectionStatus.OFFLINE, base)
-                    val backoff = min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * consecutiveFailures.toLong())
-                    delay(backoff)
+
+                    // Exponential backoff once we've declared OFFLINE, to avoid wasting CPU on encoding.
+                    val exp = min(6, consecutiveFailures - MAX_FAIL_RECONNECT)
+                    val backoff = min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * (1L shl exp))
+                    nextStreamAttemptAtMs = nowMs + backoff
                 } else if (consecutiveFailures > 0) {
                     val base = getCurrentServerUrl().trimEnd('/')
                     viewModel.setConnectionState(ConnectionStatus.RECONNECTING, base)
+
+                    // Light backoff while reconnecting.
+                    val backoff = min(1_500L, RECONNECT_BASE_MS * consecutiveFailures.toLong())
+                    nextStreamAttemptAtMs = nowMs + backoff
+                } else {
+                    nextStreamAttemptAtMs = 0L
                 }
 
                 updateFrameCounter()
