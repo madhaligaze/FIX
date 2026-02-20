@@ -243,6 +243,7 @@ class MainActivity : AppCompatActivity() {
     private var eyeOfAIActive = false
     private var layerGlbManager: LayerGlbManager? = null
     private var exportedLayers: List<UiLayer> = emptyList()
+    private val exportedLayerPaths: MutableMap<String, String> = mutableMapOf()
     private var originAnchorNode: AnchorNode? = null
     private var streamSendJob: Job? = null
     private var isArSceneReady = false
@@ -251,6 +252,8 @@ class MainActivity : AppCompatActivity() {
     private var depthHintShown = false
     private var arcoreHintShown = false
     private var depthFrameCounter = 0
+    private var depthUnavailableWarned: Boolean = false
+    private var lastDepthWarningMs: Long = 0L
     private var currentScanHints: List<String> = emptyList()
     private var scanHintsVisible = false
     private var autoVoxelRefreshJob: Job? = null
@@ -813,15 +816,31 @@ class MainActivity : AppCompatActivity() {
                 val bundle = response.body()!!
                 val layers = bundle.ui?.layers.orEmpty()
                 exportedLayers = layers
+                exportedLayerPaths.clear()
+                for (layer in layers) {
+                    val path = layer.file?.glb?.path ?: layer.file?.path
+                    if (!path.isNullOrBlank()) exportedLayerPaths[layer.id] = path
+                }
+                if (originAnchorNode == null) {
+                    showHint("⚠️ Сначала поставь origin anchor (кнопка опоры), потом загружай слои")
+                    showLayersDialog()
+                    return@launch
+                }
                 if (layerGlbManager == null) {
                     layerGlbManager = LayerGlbManager(this@MainActivity, sceneView, getCurrentServerUrl())
                 }
                 layerGlbManager?.setLayersRoot(originAnchorNode)
-
                 for (layer in layers) {
-                    val path = layer.file?.glb?.path ?: layer.file?.path
+                    val path = exportedLayerPaths[layer.id]
                     if (path.isNullOrBlank()) continue
-                    runCatching { layerGlbManager?.loadOrShowLayer(layer.id, path) }
+                    val key = "layer_visible_${layer.id}"
+                    val def = layer.default_on ?: true
+                    val wantVisible = settingsPrefs.getBoolean(key, def)
+                    if (wantVisible) {
+                        runCatching { layerGlbManager?.loadOrShowLayer(layer.id, path) }
+                    } else {
+                        layerGlbManager?.setVisible(layer.id, false)
+                    }
                 }
 
                 showLayersDialog()
@@ -859,13 +878,28 @@ class MainActivity : AppCompatActivity() {
                 isChecked = settingsPrefs.getBoolean(key, def)
                 setOnCheckedChangeListener { _, checked ->
                     settingsPrefs.edit().putBoolean(key, checked).apply()
-                    layerGlbManager?.setVisible(layer.id, checked)
+                    if (checked) {
+                        val path = exportedLayerPaths[layer.id]
+                        if (path.isNullOrBlank()) {
+                            showHint("⚠️ Нет пути для слоя ${layer.id}")
+                        } else {
+                            scope.launch { runCatching { layerGlbManager?.loadOrShowLayer(layer.id, path) } }
+                        }
+                    } else {
+                        layerGlbManager?.setVisible(layer.id, false)
+                    }
                 }
             }
             row.addView(label)
             row.addView(sw)
             container.addView(row)
             layerGlbManager?.setVisible(layer.id, sw.isChecked)
+            if (sw.isChecked) {
+                val path = exportedLayerPaths[layer.id]
+                if (!path.isNullOrBlank()) {
+                    scope.launch { runCatching { layerGlbManager?.loadOrShowLayer(layer.id, path) } }
+                }
+            }
         }
 
         AlertDialog.Builder(this)
@@ -1642,6 +1676,14 @@ class MainActivity : AppCompatActivity() {
                         runCatching { acquired.image.close() }
                     }
                 }
+                if (shouldSendDepth && acquiredDepth == null) {
+                    val now = System.currentTimeMillis()
+                    if (!depthUnavailableWarned || (now - lastDepthWarningMs) > 10_000L) {
+                        depthUnavailableWarned = true
+                        lastDepthWarningMs = now
+                        showHint("ℹ️ Depth недоступен на устройстве - отправляем только point cloud")
+                    }
+                }
 
                 val intr = cam.imageIntrinsics
                 val focal = intr.focalLength
@@ -1714,6 +1756,10 @@ class MainActivity : AppCompatActivity() {
 
                 if (manualMeasurements.isNotEmpty()) {
                     basePayload["manual_measurements"] = manualMeasurements
+                }
+
+                if (shouldSendDepth && depthFrame == null) {
+                    basePayload["depth_unavailable"] = true
                 }
 
                 FramePacket(basePayload, yuvCopy, swapUv, depthFrame)

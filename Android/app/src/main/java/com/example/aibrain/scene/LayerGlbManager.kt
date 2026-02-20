@@ -7,6 +7,8 @@ import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.ArSceneView
 import com.google.ar.sceneform.Node
 import com.google.ar.sceneform.NodeParent
+import com.google.ar.sceneform.math.Quaternion
+import com.google.ar.sceneform.math.Vector3
 import com.google.ar.sceneform.rendering.ModelRenderable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -48,7 +50,13 @@ class LayerGlbManager(
     fun setLayersRoot(anchor: AnchorNode?) {
         layersRoot = anchor
         val parent: NodeParent = anchor ?: sceneView.scene
-        nodesByLayerId.values.forEach { it.setParent(parent) }
+        nodesByLayerId.values.forEach { node ->
+            node.setParent(parent)
+            // Ensure layers are aligned to the origin anchor (identity local transform).
+            node.localPosition = Vector3(0f, 0f, 0f)
+            node.localRotation = Quaternion(0f, 0f, 0f, 1f)
+            node.localScale = Vector3(1f, 1f, 1f)
+        }
     }
 
     suspend fun loadOrShowLayer(layerId: String, relativePath: String) {
@@ -116,6 +124,9 @@ class LayerGlbManager(
             this.renderable = renderable
             isEnabled = true
             setParent(parent)
+            localPosition = Vector3(0f, 0f, 0f)
+            localRotation = Quaternion(0f, 0f, 0f, 1f)
+            localScale = Vector3(1f, 1f, 1f)
         }
         nodesByLayerId[layerId] = node
     }
