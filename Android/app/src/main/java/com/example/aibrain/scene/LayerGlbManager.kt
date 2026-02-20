@@ -3,6 +3,7 @@ package com.example.aibrain.scene
 import android.content.Context
 import android.net.Uri
 import android.util.Log
+import com.example.aibrain.util.HeavyOps
 import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.ArSceneView
 import com.google.ar.sceneform.Node
@@ -200,32 +201,34 @@ class LayerGlbManager(
         onStateChanged?.invoke(layerId, state)
     }
 
-    private fun downloadToCache(layerId: String, relativePath: String): File {
-        val cleanPath = relativePath.removePrefix("/")
-        val fullUrl = baseUrl.trimEnd('/') + "/" + cleanPath
-        val req = Request.Builder().url(fullUrl).build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) {
-                throw IllegalStateException("HTTP ${resp.code} for layer=$layerId url=$fullUrl")
+    private suspend fun downloadToCache(layerId: String, relativePath: String): File {
+        return HeavyOps.withPermit {
+            val cleanPath = relativePath.removePrefix("/")
+            val fullUrl = baseUrl.trimEnd('/') + "/" + cleanPath
+            val req = Request.Builder().url(fullUrl).build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException("HTTP ${resp.code} for layer=$layerId url=$fullUrl")
+                }
+                val bytes = resp.body?.bytes() ?: throw IllegalStateException("Empty body for layer=$layerId")
+                val crc = CRC32().apply { update(bytes) }.value.toString(16)
+
+                val revDir = getRevisionDir()
+                if (!revDir.exists()) revDir.mkdirs()
+
+                val out = File(revDir, "layer_${layerId}_$crc.glb")
+                if (!out.exists() || out.length() != bytes.size.toLong()) {
+                    out.writeBytes(bytes)
+                }
+
+                // Cleanup policies:
+                // - keep latest N revisions
+                // - keep latest K layer files per layerId inside this revision dir
+                cleanupOldRevisions()
+                cleanupLayerCacheInDir(revDir, layerId, keepLatest = keepLatestLayerFilesPerRev)
+
+                out
             }
-            val bytes = resp.body?.bytes() ?: throw IllegalStateException("Empty body for layer=$layerId")
-            val crc = CRC32().apply { update(bytes) }.value.toString(16)
-
-            val revDir = getRevisionDir()
-            if (!revDir.exists()) revDir.mkdirs()
-
-            val out = File(revDir, "layer_${layerId}_$crc.glb")
-            if (!out.exists() || out.length() != bytes.size.toLong()) {
-                out.writeBytes(bytes)
-            }
-
-            // Cleanup policies:
-            // - keep latest N revisions
-            // - keep latest K layer files per layerId inside this revision dir
-            cleanupOldRevisions()
-            cleanupLayerCacheInDir(revDir, layerId, keepLatest = keepLatestLayerFilesPerRev)
-
-            return out
         }
     }
 
