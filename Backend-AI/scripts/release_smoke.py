@@ -51,7 +51,7 @@ def main() -> int:
             return 2
 
     rr = client.post("/session/anchors", json={"session_id": sid, "anchors": [{"id": "a0", "kind": "support", "position": [0.0, 0.0, 0.0], "confidence": 1.0}]})
-    if rr.status_code not in (200, 409):
+    if rr.status_code != 200:
         return 2
 
     rr = client.get(f"/session/{sid}/readiness")
@@ -59,13 +59,12 @@ def main() -> int:
         return 2
 
     rr = client.post(f"/session/{sid}/request_scaffold")
-    if rr.status_code not in (200, 409):
+    if rr.status_code != 200:
         return 2
 
-    if rr.status_code == 200:
-        rr = client.get(f"/session/{sid}/export/latest")
-        if rr.status_code != 200:
-            return 2
+    rr = client.get(f"/session/{sid}/export/latest")
+    if rr.status_code != 200:
+        return 2
 
     print("OK: release smoke passed")
     return 0

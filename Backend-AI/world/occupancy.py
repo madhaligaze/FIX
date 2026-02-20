@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 UNKNOWN = 0
@@ -53,9 +55,9 @@ class OccupancyGrid:
             return False
         return False
 
-    def _touch(self, idx: np.ndarray, new_state: int) -> None:
+    def _touch(self, idx: np.ndarray, new_state: int) -> bool:
         if not self._in_bounds(idx):
-            return
+            return False
         x, y, z = int(idx[0]), int(idx[1]), int(idx[2])
         prev = int(self.grid[x, y, z])
         if prev in (FREE, OCCUPIED) and new_state in (FREE, OCCUPIED) and prev != new_state:
@@ -63,6 +65,7 @@ class OccupancyGrid:
         self.grid[x, y, z] = np.uint8(new_state)
         if self.weights[x, y, z] < np.uint16(65535):
             self.weights[x, y, z] = np.uint16(int(self.weights[x, y, z]) + 1)
+        return True
 
     def integrate_depth(self, depth_u16: np.ndarray, intr: dict, pose: dict, depth_scale: float) -> None:
         # Mark FREE along ray, OCCUPIED at surface (cheap/fast, conservative)
@@ -223,3 +226,67 @@ class OccupancyGrid:
             out[f"[{lo},{hi})"] = int(np.sum((w >= lo) & (w < hi)))
         out[f"[{int(edges[-1])},inf)"] = int(np.sum(w >= int(edges[-1])))
         return out
+
+    def integrate_pointcloud_rays(
+        self,
+        cam_pos_world: np.ndarray,
+        points_world: np.ndarray,
+        *,
+        max_points: int = 6000,
+        stride: int | None = None,
+        max_range_m: float = 8.0,
+    ) -> dict:
+        """
+        Lightweight occupancy integration from a sparse pointcloud (no depth image).
+
+        For each point: mark FREE along the ray from camera to point, and OCCUPIED at the point.
+        This is intentionally conservative and is primarily used to stabilize readiness metrics on
+        pipelines that do not provide depth frames.
+        """
+        if points_world is None:
+            return {"touched": 0, "used_points": 0}
+
+        cam = np.asarray(cam_pos_world, dtype=np.float64).reshape(3)
+        pts = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+        if pts.shape[0] == 0:
+            return {"touched": 0, "used_points": 0}
+
+        # Subsample deterministically to cap work.
+        n = int(pts.shape[0])
+        if stride is None:
+            stride = max(1, n // int(max_points)) if n > max_points else 1
+        pts = pts[:: int(stride)]
+        if pts.shape[0] > int(max_points):
+            pts = pts[: int(max_points)]
+
+        voxel = float(self.voxel_size)
+        step_m = max(0.06, voxel * 0.75)
+
+        touched = 0
+        for p in pts:
+            v = p - cam
+            d = float(np.linalg.norm(v))
+            if d < 1e-6:
+                continue
+            if d > float(max_range_m):
+                # Cap far points - we only need local observation.
+                p = cam + v * (float(max_range_m) / d)
+                v = p - cam
+                d = float(max_range_m)
+
+            # Sample along the ray. Avoid marking the endpoint as FREE.
+            steps = int(max(1, math.floor(d / step_m)))
+            for i in range(steps):
+                t = float(i) / float(steps)
+                q = cam + v * t
+                idx = ((q - self.origin) / self.voxel_size).astype(np.int32)
+                ok = self._touch(idx, FREE)
+                if ok:
+                    touched += 1
+
+            # Mark the endpoint as OCCUPIED.
+            idx2 = ((p - self.origin) / self.voxel_size).astype(np.int32)
+            if self._touch(idx2, OCCUPIED):
+                touched += 1
+
+        return {"touched": int(touched), "used_points": int(pts.shape[0]), "stride": int(stride)}

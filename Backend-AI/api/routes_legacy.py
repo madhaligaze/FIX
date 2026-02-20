@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+
+import numpy as np
 import time
 from typing import Any
 from uuid import uuid4
@@ -102,10 +104,15 @@ def _build_meta(session_id: str, payload: LegacyStreamPayload) -> tuple[dict, by
     pointcloud_bytes = None
     pointcloud_meta = None
     if pc is not None:
-        # Legacy JSON point cloud is stored as UTF-8 JSON bytes for artifact persistence, so the new pipeline
-        # can track original content without assuming a binary schema.
-        pointcloud_bytes = json.dumps(pc).encode("utf-8")
-        pointcloud_meta = {"format": "xyz", "frame": "world"}
+        # Prefer binary float32 XYZ for downstream occupancy warm-up / readiness metrics.
+        # Fall back to JSON if payload shape is unexpected.
+        try:
+            arr = np.asarray(pc, dtype=np.float32).reshape(-1, 3)
+            pointcloud_bytes = arr.astype(np.float32).tobytes()
+            pointcloud_meta = {"format": "xyz", "frame": "world"}
+        except Exception:
+            pointcloud_bytes = json.dumps(pc).encode("utf-8")
+            pointcloud_meta = {"format": "xyz", "frame": "world"}
 
     missing: list[str] = []
     for key in ("fx", "fy", "cx", "cy", "width", "height"):

@@ -61,6 +61,7 @@ import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
+import java.io.File
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONArray
 import org.json.JSONObject
@@ -274,8 +275,12 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var exportPollInFlight: Boolean = false
     @Volatile private var pendingExportRevId: String? = null
     private val exportLoadMutex = Mutex()
+    private val lockExportMutex = Mutex()
     private var exportPollFailures: Int = 0
     private var readinessPollFailures: Int = 0
+    @Volatile private var autoReportInFlight: Boolean = false
+    private var streamErrorStreak: Int = 0
+    private var exportFailStreak: Int = 0
     private var nextExportPollAtMs: Long = 0L
     private var nextReadinessPollAtMs: Long = 0L
     private var exportNotReady409: Boolean = false
@@ -348,10 +353,25 @@ class MainActivity : AppCompatActivity() {
         rebuildApiClient()
         offlineQueue = OfflineQueue(this)
         crashReporter = CrashReporter(this)
+        if (crashReporter.readCrashMarkerSnippet() != null) {
+            maybeAutoReport("crash_marker")
+        }
 
         val prevHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             runCatching { crashReporter.recordError("UNCAUGHT:${t.name}", e, fatal = true) }
+            runCatching {
+                val body = buildString {
+                    append(System.currentTimeMillis())
+                    append("\n")
+                    append(e.javaClass.name)
+                    append(": ")
+                    append(e.message ?: "")
+                    append("\n")
+                    append(android.util.Log.getStackTraceString(e))
+                }
+                File(filesDir, "crash_marker.txt").writeText(body.take(8192))
+            }
             prevHandler?.uncaughtException(t, e)
         }
 
@@ -816,6 +836,7 @@ class MainActivity : AppCompatActivity() {
 
 
     private suspend fun doLockSession(sid: String, option: ScaffoldOption) {
+        lockExportMutex.withLock {
         val measurementsJson = runCatching { if (::arRuler.isInitialized) arRuler.exportMeasurements() else "" }.getOrDefault("")
         val measurementConstraints = runCatching {
             if (::arRuler.isInitialized) {
@@ -848,6 +869,7 @@ class MainActivity : AppCompatActivity() {
             val rev = exp.body()?.revision_id ?: exp.body()?.rev_id.orEmpty()
             if (rev.isNotBlank()) lastRevisionId = rev
         }
+        }
     }
 
     private suspend fun loadExportLayersInternal(
@@ -857,7 +879,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         exportLoadMutex.withLock {
             try {
-                val response = api.exportLatest(sid)
+                val response = lockExportMutex.withLock { api.exportLatest(sid) }
                 if (response.code() == 409) {
                     exportNotReady409 = true
                     // Quiet: export not ready yet.
@@ -931,7 +953,7 @@ class MainActivity : AppCompatActivity() {
         showHint("💾 Формирование export/latest...")
         scope.launch {
             try {
-                val resp = api.exportLatest(sid)
+                val resp = lockExportMutex.withLock { api.exportLatest(sid) }
                 if (!resp.isSuccessful || resp.body() == null) {
                     showError("export/latest: HTTP ${resp.code()}")
                     return@launch
@@ -1192,6 +1214,30 @@ class MainActivity : AppCompatActivity() {
         map["anchors_local"] = userMarkers.size
         map["last_revision_id"] = (lastRevisionId ?: "")
         return map
+    }
+
+    private fun buildQueuedActionsForReport(): Map<String, Any> {
+        val sid = currentSessionId
+        if (sid.isNullOrBlank()) return emptyMap()
+        val baseUrl = getCurrentServerUrl()
+        val queued = HashMap<String, Any>()
+        queued["offline_queue"] = offlineQueue.getStatus(sid, baseUrl)
+        queued["base_url"] = baseUrl
+        queued["conn_status"] = currentConnStatus.name
+        return queued
+    }
+
+    private fun maybeAutoReport(trigger: String) {
+        if (autoReportInFlight) return
+        autoReportInFlight = true
+        val sid = currentSessionId
+        scope.launch(Dispatchers.IO) {
+            try {
+                crashReporter.maybeAutoSend(api, sid, buildClientStats(), buildQueuedActionsForReport(), trigger)
+            } finally {
+                autoReportInFlight = false
+            }
+        }
     }
 
     private suspend fun syncAnchorsToServer(allowEmpty: Boolean = false): Boolean {
