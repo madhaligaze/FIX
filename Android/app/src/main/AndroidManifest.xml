@@ -15,7 +15,7 @@
         android:name="android.hardware.camera.ar"
         android:required="true" />
 
-    <application
+    <application android:name=".AIBrainApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"

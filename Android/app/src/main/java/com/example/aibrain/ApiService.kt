@@ -365,6 +365,14 @@ data class ClientErrorItem(
     val stack: String? = null
 )
 
+data class ClientReproItem(
+    val timestamp_ms: Long,
+    val endpoint: String,
+    val http_code: Int? = null,
+    val body_snippet: String? = null,
+    val error_snippet: String? = null
+)
+
 data class ClientReportEnvelope(
     val session_id: String? = null,
     val timestamp_ms: Long,
@@ -372,5 +380,8 @@ data class ClientReportEnvelope(
     val last_export_rev: String? = null,
     val queued_actions: Map<String, @JvmSuppressWildcards Any> = emptyMap(),
     val last_errors: List<ClientErrorItem> = emptyList(),
-    val device: LogDeviceInfo? = null
+    val device: LogDeviceInfo? = null,
+    val trigger: String? = null,
+    val crash_marker: String? = null,
+    val repro_pack: List<ClientReproItem> = emptyList()
 )

@@ -45,18 +45,13 @@ def test_release_smoke_e2e(tmp_path: Path, monkeypatch, n_frames: int):
         assert rr.status_code == 200, rr.text
 
     rr = client.post("/session/anchors", json={"session_id": sid, "anchors": [{"id": "a0", "kind": "support", "position": [0.0, 0.0, 0.0], "confidence": 1.0}]})
-    assert rr.status_code in (200, 409), rr.text
+    assert rr.status_code == 200, rr.text
 
     rr = client.get(f"/session/{sid}/readiness")
     assert rr.status_code == 200, rr.text
 
     rr = client.post(f"/session/{sid}/request_scaffold")
-    assert rr.status_code in (200, 409), rr.text
-    if rr.status_code == 409:
-        j = rr.json()
-        assert isinstance(j, dict)
-        assert ("status" in j) or ("detail" in j and isinstance(j["detail"], dict) and "status" in j["detail"])
-        return
+    assert rr.status_code == 200, rr.text
 
     rr = client.get(f"/session/{sid}/export/latest")
     assert rr.status_code == 200, rr.text

@@ -83,14 +83,27 @@ class WorldModel:
         if fmt != "xyz":
             return None
 
+        # Some legacy callers may still send JSON-encoded point lists.
+        raw = pointcloud_bytes
         try:
-            pts = np.frombuffer(pointcloud_bytes, dtype=np.float32)
+            if len(raw) > 0 and raw[:1] in (b"[", b"{"):
+                import json as _json
+
+                obj = _json.loads(raw.decode("utf-8"))
+                if isinstance(obj, dict):
+                    obj = obj.get("points") or obj.get("point_cloud") or obj.get("pointcloud")
+                if isinstance(obj, list):
+                    pts = np.asarray(obj, dtype=np.float32).reshape(-1, 3)
+                    return pts if pts.shape[0] >= 1 else None
+        except Exception:
+            pass
+
+        try:
+            pts = np.frombuffer(raw, dtype=np.float32)
             if pts.size % 3 != 0:
                 return None
             pts = pts.reshape(-1, 3)
-            if pts.shape[0] < 50:
-                return None
-            return pts
+            return pts if pts.shape[0] >= 1 else None
         except Exception:
             return None
 
@@ -300,13 +313,35 @@ class WorldModel:
         reasons_icp: list[str] = []
         if pointcloud_bytes:
             pts = self._parse_pointcloud_xyz(meta, pointcloud_bytes)
-            if pts is not None and self._last_cloud_pts is not None:
-                quality_icp, reasons_icp, fit, rmse = self._icp_consistency(
-                    self._last_cloud_pts, pts
-                )
-                self.metrics["icp_fitness"] = fit
-                self.metrics["icp_rmse"] = rmse
             if pts is not None:
+                # Minimal occupancy warm-up from sparse pointcloud when depth is absent.
+                if (not depth_bytes) or (not depth_meta):
+                    try:
+                        cam_pos = np.asarray(pose_used.get("position", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+                        pc_meta = meta.get("pointcloud_meta") or {}
+                        frame = str(pc_meta.get("frame") or "world")
+                        pts_world = pts
+                        if frame == "camera":
+                            T = pose_to_matrix(pose_used)
+                            R = T[:3, :3]
+                            t = T[:3, 3]
+                            pts_world = (pts @ R.T) + t
+                        stats = self.occupancy.integrate_pointcloud_rays(
+                            cam_pos_world=cam_pos,
+                            points_world=pts_world,
+                            max_points=int(pc_meta.get("max_points", 6000) or 6000),
+                        )
+                        self.metrics["pc_occupancy_touched"] = int(stats.get("touched", 0))
+                        self.metrics["pc_used_points"] = int(stats.get("used_points", 0))
+                    except Exception:
+                        pass
+
+                # ICP consistency is only meaningful for sufficiently dense clouds.
+                if self._last_cloud_pts is not None and pts.shape[0] >= 50 and self._last_cloud_pts.shape[0] >= 50:
+                    quality_icp, reasons_icp, fit, rmse = self._icp_consistency(self._last_cloud_pts, pts)
+                    self.metrics["icp_fitness"] = fit
+                    self.metrics["icp_rmse"] = rmse
+
                 self._last_cloud_pts = pts
 
         current_q = str(self.metrics.get("tracking_quality", "UNKNOWN"))
