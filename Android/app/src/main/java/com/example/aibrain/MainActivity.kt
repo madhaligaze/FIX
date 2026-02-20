@@ -66,11 +66,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 import kotlin.math.min
+import kotlin.random.Random
 import com.example.aibrain.measurement.ARRuler
 import com.example.aibrain.measurement.MeasurementType
 import com.example.aibrain.measurement.Measurement
 import com.example.aibrain.visualization.VoxelData
 import com.example.aibrain.visualization.VoxelVisualizer
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * ⚡⚡⚡ ФИНАЛЬНАЯ ВЕРСИЯ MainActivity ⚡⚡⚡
@@ -256,11 +259,19 @@ class MainActivity : AppCompatActivity() {
     private var streamPointCap: Int = 300
     private var sendTimeEwmaMs: Double = 0.0
     private var lastSendMs: Long = 0L
+    private var lastReadinessReady: Boolean? = null
+    private var lastReadinessScore: Double? = null
+    private var lastReadinessMetrics: ReadinessMetrics? = null
     private var nextStreamAttemptAtMs: Long = 0L
     private var exportPollJob: Job? = null
     private var readinessPollJob: Job? = null
     @Volatile private var exportPollInFlight: Boolean = false
     @Volatile private var pendingExportRevId: String? = null
+    private val exportLoadMutex = Mutex()
+    private var exportPollFailures: Int = 0
+    private var readinessPollFailures: Int = 0
+    private var nextExportPollAtMs: Long = 0L
+    private var nextReadinessPollAtMs: Long = 0L
     private var originAnchorNode: AnchorNode? = null
     private var streamSendJob: Job? = null
     private var isArSceneReady = false
@@ -810,57 +821,59 @@ class MainActivity : AppCompatActivity() {
         showDialog: Boolean,
         showOkHint: Boolean
     ) {
-        try {
-            val response = api.exportLatest(sid)
-            if (!response.isSuccessful || response.body() == null) {
-                throw IllegalStateException("HTTP ${response.code()}")
-            }
-            val bundle = response.body()!!
-            val rev = bundle.revision_id ?: bundle.rev_id.orEmpty()
-            if (rev.isNotBlank() && loadedExportRevId != null && loadedExportRevId != rev) {
-                layerGlbManager?.clearAll()
-            }
-            if (rev.isNotBlank()) loadedExportRevId = rev
-
-            // Revision-aware caching for layers
-            if (layerGlbManager == null) {
-                layerGlbManager = LayerGlbManager(this@MainActivity, sceneView, getCurrentServerUrl())
-            }
-            layerGlbManager?.setCurrentRevision(rev)
-
-            val layers = bundle.ui?.layers.orEmpty()
-            exportedLayers = layers
-            exportedLayerPaths.clear()
-            for (layer in layers) {
-                val path = layer.file?.glb?.path ?: layer.file?.path
-                if (!path.isNullOrBlank()) exportedLayerPaths[layer.id] = path
-            }
-
-            if (originAnchorNode == null) {
-                if (showDialog) showLayersDialog()
-                showHint("⚠️ Сначала поставь origin anchor (кнопка опоры), потом загружай слои")
-                return
-            }
-
-            layerGlbManager?.setLayersRoot(originAnchorNode)
-
-            for (layer in layers) {
-                val path = exportedLayerPaths[layer.id]
-                if (path.isNullOrBlank()) continue
-                val key = "layer_visible_${layer.id}"
-                val def = layer.default_on ?: true
-                val wantVisible = settingsPrefs.getBoolean(key, def)
-                if (wantVisible) {
-                    runCatching { layerGlbManager?.loadOrShowLayer(layer.id, path) }
-                } else {
-                    layerGlbManager?.setVisible(layer.id, false)
+        exportLoadMutex.withLock {
+            try {
+                val response = api.exportLatest(sid)
+                if (!response.isSuccessful || response.body() == null) {
+                    throw IllegalStateException("HTTP ${response.code()}")
                 }
-            }
+                val bundle = response.body()!!
+                val rev = bundle.revision_id ?: bundle.rev_id.orEmpty()
+                if (rev.isNotBlank() && loadedExportRevId != null && loadedExportRevId != rev) {
+                    layerGlbManager?.clearAll()
+                }
+                if (rev.isNotBlank()) loadedExportRevId = rev
 
-            if (showDialog) showLayersDialog()
-            if (showOkHint) showHint("✓ Слои обновлены")
-        } catch (e: Exception) {
-            if (showOkHint) showHint("❌ Ошибка загрузки слоёв: ${e.message}")
+                // Revision-aware caching for layers
+                if (layerGlbManager == null) {
+                    layerGlbManager = LayerGlbManager(this@MainActivity, sceneView, getCurrentServerUrl())
+                }
+                layerGlbManager?.setCurrentRevision(rev)
+
+                val layers = bundle.ui?.layers.orEmpty()
+                exportedLayers = layers
+                exportedLayerPaths.clear()
+                for (layer in layers) {
+                    val path = layer.file?.glb?.path ?: layer.file?.path
+                    if (!path.isNullOrBlank()) exportedLayerPaths[layer.id] = path
+                }
+
+                if (originAnchorNode == null) {
+                    if (showDialog) showLayersDialog()
+                    showHint("⚠️ Сначала поставь origin anchor (кнопка опоры), потом загружай слои")
+                    return
+                }
+
+                layerGlbManager?.setLayersRoot(originAnchorNode)
+
+                for (layer in layers) {
+                    val path = exportedLayerPaths[layer.id]
+                    if (path.isNullOrBlank()) continue
+                    val key = "layer_visible_${layer.id}"
+                    val def = layer.default_on ?: true
+                    val wantVisible = settingsPrefs.getBoolean(key, def)
+                    if (wantVisible) {
+                        runCatching { layerGlbManager?.loadOrShowLayer(layer.id, path) }
+                    } else {
+                        layerGlbManager?.setVisible(layer.id, false)
+                    }
+                }
+
+                if (showDialog) showLayersDialog()
+                if (showOkHint) showHint("✓ Слои обновлены")
+            } catch (e: Exception) {
+                if (showOkHint) showHint("❌ Ошибка загрузки слоёв: ${e.message}")
+            }
         }
     }
 
@@ -1396,6 +1409,16 @@ class MainActivity : AppCompatActivity() {
         score: Double?,
         metrics: ReadinessMetrics?
     ) {
+        if (originAnchorNode == null) {
+            pbReadiness.progress = 0
+            tvReadiness.text = "0%"
+            tvReadinessDetail.text = "Place origin anchor"
+            pbReadiness.progressTintList = android.content.res.ColorStateList.valueOf(
+                ContextCompat.getColor(this, android.R.color.holo_orange_light)
+            )
+            return
+        }
+
         val s0 = (score ?: 0.0).coerceIn(0.0, 1.0)
         pbReadiness.progress = (s0 * 100.0).toInt()
         tvReadiness.text = "${(s0 * 100.0).toInt()}%"
@@ -1405,10 +1428,27 @@ class MainActivity : AppCompatActivity() {
         val minViews = metrics?.min_views_per_anchor ?: 0
         val vp = metrics?.viewpoints ?: 0
         val minVp = metrics?.min_viewpoints ?: 0
-        tvReadinessDetail.text = "OBS ${obsPct}% | VDIV ${vdiv}/${minViews} | VP ${vp}/${minVp}" + if (ready == true) " | READY" else ""
 
-        val colorRes = if (ready == true) android.R.color.holo_green_light else android.R.color.holo_orange_light
-        pbReadiness.progressTintList = android.content.res.ColorStateList.valueOf(ContextCompat.getColor(this, colorRes))
+        val netSuffix = when (currentConnStatus) {
+            ConnectionStatus.OFFLINE -> " | NET OFFLINE"
+            ConnectionStatus.RECONNECTING -> " | NET RECONNECT"
+            else -> ""
+        }
+        val pollSuffix = buildString {
+            if (exportPollFailures > 0) append(" | EXP RETRY")
+            if (readinessPollFailures > 0) append(" | RDY RETRY")
+        }
+
+        tvReadinessDetail.text =
+            "OBS ${obsPct}% | VDIV ${vdiv}/${minViews} | VP ${vp}/${minVp}" +
+                (if (ready == true) " | READY" else "") +
+                netSuffix +
+                pollSuffix
+
+        val colorRes =
+            if (ready == true) android.R.color.holo_green_light else android.R.color.holo_orange_light
+        pbReadiness.progressTintList =
+            android.content.res.ColorStateList.valueOf(ContextCompat.getColor(this, colorRes))
     }
 
     private fun maybeShowTutorial() {
@@ -1741,20 +1781,51 @@ class MainActivity : AppCompatActivity() {
     private fun startExportLatestPolling(sessionId: String) {
         exportPollJob?.cancel()
         exportPollInFlight = false
+        exportPollFailures = 0
+        nextExportPollAtMs = 0L
+
         exportPollJob = lifecycleScope.launch {
             // Poll export/latest so layers update without manual actions.
             while (isActive && isStreaming && currentSessionId == sessionId) {
-                delay(6500L)
+                val now = System.currentTimeMillis()
+                if (now < nextExportPollAtMs) {
+                    delay(min(2000L, nextExportPollAtMs - now))
+                    continue
+                }
+
+                val baseIntervalMs = 6500L
+                val jitterMs = Random.nextLong(350L, 1150L)
+
+                val offlinePenalty = when (currentConnStatus) {
+                    ConnectionStatus.OFFLINE -> 3
+                    ConnectionStatus.RECONNECTING -> 2
+                    else -> 1
+                }
+
+                val exp = min(4, exportPollFailures)
+                val backoff = min(30_000L, baseIntervalMs * (1L shl exp) * offlinePenalty.toLong())
+                nextExportPollAtMs = now + backoff + jitterMs
+
                 if (!isStreaming || currentSessionId != sessionId) break
                 if (exportPollInFlight) continue
                 exportPollInFlight = true
                 try {
                     val resp = runCatching { api.exportLatest(sessionId) }.getOrNull()
-                    if (resp == null) continue
+                    if (resp == null) {
+                        exportPollFailures += 1
+                        continue
+                    }
                     // 409 NO_EXPORT is expected early - ignore quietly.
-                    if (resp.code() == 409) continue
-                    if (!resp.isSuccessful || resp.body() == null) continue
+                    if (resp.code() == 409) {
+                        exportPollFailures = 0
+                        continue
+                    }
+                    if (!resp.isSuccessful || resp.body() == null) {
+                        exportPollFailures += 1
+                        continue
+                    }
 
+                    exportPollFailures = 0
                     val bundle = resp.body()!!
                     val rev = bundle.revision_id ?: bundle.rev_id.orEmpty()
                     if (rev.isBlank()) continue
@@ -1773,9 +1844,11 @@ class MainActivity : AppCompatActivity() {
                         loadExportLayersInternal(sessionId, showDialog = false, showOkHint = false)
                     }
                 } catch (_: Exception) {
-                    // Ignore polling failures
+                    exportPollFailures += 1
                 } finally {
                     exportPollInFlight = false
+                    // Update HUD suffixes without changing last readiness metrics.
+                    runCatching { updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics) }
                 }
             }
         }
@@ -1783,17 +1856,47 @@ class MainActivity : AppCompatActivity() {
 
     private fun startReadinessPolling(sessionId: String) {
         readinessPollJob?.cancel()
+        readinessPollFailures = 0
+        nextReadinessPollAtMs = 0L
         readinessPollJob = lifecycleScope.launch {
             while (isActive && isStreaming && currentSessionId == sessionId) {
-                delay(1500L)
+                val now = System.currentTimeMillis()
+                if (now < nextReadinessPollAtMs) {
+                    delay(min(750L, nextReadinessPollAtMs - now))
+                    continue
+                }
+
+                val baseIntervalMs = 1500L
+                val jitterMs = Random.nextLong(150L, 450L)
+
+                val offlinePenalty = when (currentConnStatus) {
+                    ConnectionStatus.OFFLINE -> 4
+                    ConnectionStatus.RECONNECTING -> 2
+                    else -> 1
+                }
+
+                val exp = min(4, readinessPollFailures)
+                val backoff = min(8000L, baseIntervalMs * (1L shl exp) * offlinePenalty.toLong())
+                nextReadinessPollAtMs = now + backoff + jitterMs
+
                 if (!isStreaming || currentSessionId != sessionId) break
-                runCatching { api.getReadiness(sessionId) }.onSuccess { resp ->
-                    if (resp.isSuccessful && resp.body() != null) {
-                        val body = resp.body()!!
-                        withContext(Dispatchers.Main) {
-                            updateReadinessUI(body.ready, body.score, body.readiness_metrics)
-                        }
+
+                val resp = runCatching { api.getReadiness(sessionId) }.getOrNull()
+                if (resp == null || !resp.isSuccessful || resp.body() == null) {
+                    readinessPollFailures += 1
+                    withContext(Dispatchers.Main) {
+                        updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
                     }
+                    continue
+                }
+
+                readinessPollFailures = 0
+                val body = resp.body()!!
+                withContext(Dispatchers.Main) {
+                    lastReadinessReady = body.ready
+                    lastReadinessScore = body.score
+                    lastReadinessMetrics = body.readiness_metrics
+                    updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
                 }
             }
         }
@@ -1805,6 +1908,10 @@ class MainActivity : AppCompatActivity() {
         readinessPollJob?.cancel()
         readinessPollJob = null
         exportPollInFlight = false
+        exportPollFailures = 0
+        readinessPollFailures = 0
+        nextExportPollAtMs = 0L
+        nextReadinessPollAtMs = 0L
     }
 
     private fun tuneStreaming(ok: Boolean, sendMs: Long) {
@@ -2725,6 +2832,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onResume() {
+        if (isStreaming && !currentSessionId.isNullOrBlank()) {
+            startExportLatestPolling(currentSessionId!!)
+            startReadinessPolling(currentSessionId!!)
+        }
         super.onResume()
 
         if (!hasCameraPermission()) {
@@ -2769,6 +2880,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        stopReleasePolling()
         super.onPause()
         stopStreaming()
         stopAutoVoxelRefresh()
