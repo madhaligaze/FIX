@@ -248,6 +248,11 @@ class MainActivity : AppCompatActivity() {
     private var currentConnStatus: ConnectionStatus = ConnectionStatus.UNKNOWN
     @Volatile private var streamPendingTick: Boolean = false
     @Volatile private var streamImmediateNextTick: Boolean = false
+    private var streamIntervalMs: Long = STREAM_INTERVAL_MS
+    private var streamJpegQuality: Int = 72
+    private var streamPointCap: Int = 300
+    private var sendTimeEwmaMs: Double = 0.0
+    private var lastSendMs: Long = 0L
     private var nextStreamAttemptAtMs: Long = 0L
     private var originAnchorNode: AnchorNode? = null
     private var streamSendJob: Job? = null
@@ -641,7 +646,7 @@ class MainActivity : AppCompatActivity() {
         scope.launch {
             repeat(5) {
                 if (!isStreaming) return@launch
-                sendFrame()
+                sendFrameWith(80, 500)
                 delay(300)
             }
             showHint("✓ Сканирование завершено. Качество: ${lastQualityScore.toInt()}%")
@@ -1638,7 +1643,7 @@ class MainActivity : AppCompatActivity() {
             while (isActive && isStreaming && currentSessionId == sid) {
                 val nowMs = System.currentTimeMillis()
                 if (nowMs < nextStreamAttemptAtMs) {
-                    delay(min(STREAM_INTERVAL_MS, nextStreamAttemptAtMs - nowMs))
+                    delay(min(streamIntervalMs, nextStreamAttemptAtMs - nowMs))
                     continue
                 }
                 if (streamSendJob?.isActive == true) {
@@ -1646,11 +1651,14 @@ class MainActivity : AppCompatActivity() {
                     streamPendingTick = true
                 } else {
                     streamSendJob = launch(Dispatchers.IO) {
+                        val t0 = System.nanoTime()
                         val ok = try {
-                            withTimeout(2_500L) { sendFrame() }
+                            withTimeout(2_500L) { sendFrameWith(streamJpegQuality, streamPointCap) }
                         } catch (_: Exception) {
                             false
                         }
+                        val sendMs = ((System.nanoTime() - t0) / 1_000_000L).coerceAtLeast(0L)
+                        lastSendMs = sendMs
 
                         withContext(Dispatchers.Main) {
                             if (!ok) {
@@ -1658,6 +1666,7 @@ class MainActivity : AppCompatActivity() {
                             } else {
                                 consecutiveFailures = 0
                             }
+                            tuneStreaming(ok, lastSendMs)
                             if (streamPendingTick) {
                                 streamPendingTick = false
                                 streamImmediateNextTick = true
@@ -1687,14 +1696,41 @@ class MainActivity : AppCompatActivity() {
 
                 updateFrameCounter()
                 updateCameraCoordinates()
-                val waitMs = if (streamImmediateNextTick) 0L else STREAM_INTERVAL_MS
+                val waitMs = if (streamImmediateNextTick) 0L else streamIntervalMs
                 streamImmediateNextTick = false
                 delay(waitMs)
             }
         }
     }
 
-    private suspend fun sendFrame(): Boolean {
+    private fun tuneStreaming(ok: Boolean, sendMs: Long) {
+        // EWMA send time for adaptive throttling.
+        val x = sendMs.toDouble()
+        sendTimeEwmaMs = if (sendTimeEwmaMs <= 0.0) x else (0.8 * sendTimeEwmaMs + 0.2 * x)
+
+        val minInterval = 300L
+        val maxInterval = 1500L
+
+        if (!ok) {
+            // Back off: reduce quality and point cap quickly.
+            streamJpegQuality = (streamJpegQuality - 6).coerceAtLeast(45)
+            streamPointCap = (streamPointCap - 40).coerceAtLeast(120)
+            streamIntervalMs = (streamIntervalMs + 150L).coerceAtMost(maxInterval)
+            return
+        }
+
+        // Success: slowly restore quality/cap, and adapt interval to keep CPU/network stable.
+        streamJpegQuality = (streamJpegQuality + 1).coerceAtMost(80)
+        streamPointCap = (streamPointCap + 10).coerceAtMost(450)
+
+        val target = (sendTimeEwmaMs * 1.3).toLong().coerceIn(minInterval, maxInterval)
+        streamIntervalMs = ((0.85 * streamIntervalMs.toDouble()) + (0.15 * target.toDouble())).toLong()
+            .coerceIn(minInterval, maxInterval)
+    }
+
+    private suspend fun sendFrame(): Boolean = sendFrameWith(streamJpegQuality, streamPointCap)
+
+    private suspend fun sendFrameWith(jpegQuality: Int, pointCap: Int): Boolean {
         val sid = currentSessionId ?: return false
 
         data class FramePacket(
@@ -1776,7 +1812,7 @@ class MainActivity : AppCompatActivity() {
                     try {
                         val buf = pc.points
                         val pointCount = buf.remaining() / 4
-                        val cap = 300
+                        val cap = pointCap
                         val step = maxOf(1, pointCount / cap)
                         val out = ArrayList<List<Float>>(min(pointCount, cap))
                         var i = 0
@@ -1854,8 +1890,15 @@ class MainActivity : AppCompatActivity() {
 
         val payload = withContext(Dispatchers.Default) {
             packet.payload.apply {
+                this["client_stats"] = mapOf(
+                    "jpeg_quality" to jpegQuality,
+                    "point_cap" to pointCap,
+                    "send_interval_ms" to streamIntervalMs,
+                    "last_send_ms" to lastSendMs,
+                    "conn" to currentConnStatus.name,
+                )
                 val nv21 = ImageUtils.yuvCopyToNv21(packet.yuv, swapUv = packet.swapUv)
-                this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, 75)
+                this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, jpegQuality)
                 val depth = packet.depth
                 if (depth != null) {
                     this["depth_base64"] = DepthUtils.depthBytesToBase64(depth.bytes)
