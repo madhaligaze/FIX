@@ -69,7 +69,7 @@ import kotlin.math.min
 import kotlin.random.Random
 import com.example.aibrain.measurement.ARRuler
 import com.example.aibrain.offline.OfflineQueue
-import com.example.aibrain.telemetry.CrashReporter
+import com.example.aibrain.diagnostics.CrashReporter
 import com.example.aibrain.util.HeavyOps
 import com.example.aibrain.measurement.MeasurementType
 import com.example.aibrain.measurement.Measurement
