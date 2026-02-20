@@ -122,6 +122,7 @@ class MainActivity : AppCompatActivity() {
         private const val RECONNECT_BASE_MS = 2_000L
         private const val RECONNECT_MAX_MS = 30_000L
         private const val STREAM_INTERVAL_MS = 1_000L
+        private const val AUTO_RELOAD_COOLDOWN_MS: Long = 12_000L
         private const val MIN_POINTS_FOR_MODEL = 2
         private const val MAX_POINTS = 20
         private const val PREFS_NAME = "app_settings"
@@ -272,6 +273,11 @@ class MainActivity : AppCompatActivity() {
     private var readinessPollFailures: Int = 0
     private var nextExportPollAtMs: Long = 0L
     private var nextReadinessPollAtMs: Long = 0L
+    private var exportNotReady409: Boolean = false
+    private var lastAutoReloadAtMs: Long = 0L
+    private var pendingAutoReloadRev: String? = null
+    private var isUiActive: Boolean = false
+    private var pollingSessionId: String? = null
     private var originAnchorNode: AnchorNode? = null
     private var streamSendJob: Job? = null
     private var isArSceneReady = false
@@ -824,9 +830,15 @@ class MainActivity : AppCompatActivity() {
         exportLoadMutex.withLock {
             try {
                 val response = api.exportLatest(sid)
+                if (response.code() == 409) {
+                    exportNotReady409 = true
+                    // Quiet: export not ready yet.
+                    return
+                }
                 if (!response.isSuccessful || response.body() == null) {
                     throw IllegalStateException("HTTP ${response.code()}")
                 }
+                exportNotReady409 = false
                 val bundle = response.body()!!
                 val rev = bundle.revision_id ?: bundle.rev_id.orEmpty()
                 if (rev.isNotBlank() && loadedExportRevId != null && loadedExportRevId != rev) {
@@ -1435,6 +1447,7 @@ class MainActivity : AppCompatActivity() {
             else -> ""
         }
         val pollSuffix = buildString {
+            if (exportNotReady409) append(" | NO_EXPORT")
             if (exportPollFailures > 0) append(" | EXP RETRY")
             if (readinessPollFailures > 0) append(" | RDY RETRY")
         }
@@ -1677,6 +1690,9 @@ class MainActivity : AppCompatActivity() {
 
                     // Reset export/layer state for new session.
                     loadedExportRevId = null
+                    exportNotReady409 = false
+                    pendingAutoReloadRev = null
+                    lastAutoReloadAtMs = 0L
                     exportedLayers = emptyList()
                     exportedLayerPaths.clear()
                     layerGlbManager?.clearAll()
@@ -1712,8 +1728,7 @@ class MainActivity : AppCompatActivity() {
         isStreaming = true
         streamJob?.cancel()
         streamSendJob?.cancel()
-        startExportLatestPolling(sid)
-        startReadinessPolling(sid)
+        ensureReleasePollingRunning(sid)
         streamJob = scope.launch {
             while (isActive && isStreaming && currentSessionId == sid) {
                 val nowMs = System.currentTimeMillis()
@@ -1778,6 +1793,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun ensureReleasePollingRunning(sessionId: String) {
+        // Avoid double start on rotation/resume; restart only if session changed or jobs are not active.
+        if (pollingSessionId != sessionId || exportPollJob?.isActive != true || readinessPollJob?.isActive != true) {
+            stopReleasePolling()
+            pollingSessionId = sessionId
+            startExportLatestPolling(sessionId)
+            startReadinessPolling(sessionId)
+        }
+    }
+
     private fun startExportLatestPolling(sessionId: String) {
         exportPollJob?.cancel()
         exportPollInFlight = false
@@ -1787,6 +1812,10 @@ class MainActivity : AppCompatActivity() {
         exportPollJob = lifecycleScope.launch {
             // Poll export/latest so layers update without manual actions.
             while (isActive && isStreaming && currentSessionId == sessionId) {
+                if (!isUiActive) {
+                    delay(500L)
+                    continue
+                }
                 val now = System.currentTimeMillis()
                 if (now < nextExportPollAtMs) {
                     delay(min(2000L, nextExportPollAtMs - now))
@@ -1817,7 +1846,11 @@ class MainActivity : AppCompatActivity() {
                     }
                     // 409 NO_EXPORT is expected early - ignore quietly.
                     if (resp.code() == 409) {
+                        exportNotReady409 = true
                         exportPollFailures = 0
+                        withContext(Dispatchers.Main) {
+                            updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
+                        }
                         continue
                     }
                     if (!resp.isSuccessful || resp.body() == null) {
@@ -1825,6 +1858,7 @@ class MainActivity : AppCompatActivity() {
                         continue
                     }
 
+                    exportNotReady409 = false
                     exportPollFailures = 0
                     val bundle = resp.body()!!
                     val rev = bundle.revision_id ?: bundle.rev_id.orEmpty()
@@ -1835,12 +1869,30 @@ class MainActivity : AppCompatActivity() {
                         continue
                     }
 
+                    val now2 = System.currentTimeMillis()
                     if (loadedExportRevId == null) {
                         // First seen rev, try loading if origin exists.
                         pendingExportRevId = rev
+                        lastAutoReloadAtMs = now2
+                        pendingAutoReloadRev = null
                         loadExportLayersInternal(sessionId, showDialog = false, showOkHint = false)
                     } else if (loadedExportRevId != rev) {
-                        // New revision - auto reload.
+                        // New revision - auto reload, but with cooldown to avoid thrashing.
+                        val dt = now2 - lastAutoReloadAtMs
+                        if (dt < AUTO_RELOAD_COOLDOWN_MS) {
+                            pendingAutoReloadRev = rev
+                        } else {
+                            lastAutoReloadAtMs = now2
+                            pendingAutoReloadRev = null
+                            loadExportLayersInternal(sessionId, showDialog = false, showOkHint = false)
+                        }
+                    }
+
+                    // If we delayed reload due to cooldown, apply it once cooldown passes.
+                    val pending = pendingAutoReloadRev
+                    if (pending != null && pending.isNotBlank() && (System.currentTimeMillis() - lastAutoReloadAtMs) >= AUTO_RELOAD_COOLDOWN_MS) {
+                        lastAutoReloadAtMs = System.currentTimeMillis()
+                        pendingAutoReloadRev = null
                         loadExportLayersInternal(sessionId, showDialog = false, showOkHint = false)
                     }
                 } catch (_: Exception) {
@@ -1860,6 +1912,10 @@ class MainActivity : AppCompatActivity() {
         nextReadinessPollAtMs = 0L
         readinessPollJob = lifecycleScope.launch {
             while (isActive && isStreaming && currentSessionId == sessionId) {
+                if (!isUiActive) {
+                    delay(500L)
+                    continue
+                }
                 val now = System.currentTimeMillis()
                 if (now < nextReadinessPollAtMs) {
                     delay(min(750L, nextReadinessPollAtMs - now))
@@ -1912,6 +1968,9 @@ class MainActivity : AppCompatActivity() {
         readinessPollFailures = 0
         nextExportPollAtMs = 0L
         nextReadinessPollAtMs = 0L
+        exportNotReady409 = false
+        pendingAutoReloadRev = null
+        pollingSessionId = null
     }
 
     private fun tuneStreaming(ok: Boolean, sendMs: Long) {
@@ -2832,9 +2891,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onResume() {
+        isUiActive = true
         if (isStreaming && !currentSessionId.isNullOrBlank()) {
-            startExportLatestPolling(currentSessionId!!)
-            startReadinessPolling(currentSessionId!!)
+            ensureReleasePollingRunning(currentSessionId!!)
         }
         super.onResume()
 
@@ -2880,6 +2939,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        isUiActive = false
         stopReleasePolling()
         super.onPause()
         stopStreaming()
