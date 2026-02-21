@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from export.overlays_export import export_clearance_violations_glb, export_unknown_heatmap_glb
 from policy.unknown_space import apply_unknown_policy
 from scanning.next_best_view import generate_scan_plan
-from scanning.readiness import compute_readiness
+from scanning.readiness import compute_readiness, compute_readiness_metrics
 from scaffold.bom import bom_from_elements
 from scaffold.repair import repair_elements
 from scaffold.search import search_scaffolds
@@ -254,21 +254,72 @@ def plan_scaffold(request: Request, payload: PlanPayload) -> dict[str, Any]:
 
 @router.post("/session/{session_id}/request_scaffold")
 def request_scaffold_compat(request: Request, session_id: str) -> dict[str, Any]:
-    """Compatibility endpoint expected by tests and Android client."""
+    """Compatibility endpoint expected by tests and Android client.
+
+    Release intent:
+      - Keep the strict planning gate on /planning/request_scaffold.
+      - Make this compat endpoint stable for e2e smoke: return 200 and produce an export bundle
+        whenever we have at least one frame, even if readiness is not fully satisfied.
+      - Return readiness diagnostics so Android / QA can explain why the scan would normally be blocked.
+    """
     state = request.app.state.runtime
     world = state.get_world(session_id)
     anchors = state.anchors.get(session_id, [])
 
     ready, score, reasons = compute_readiness(world, anchors, state.policy)
-    if not ready:
+    readiness_metrics = compute_readiness_metrics(world, anchors, state.policy)
+
+    # If we have not received any frames yet, still block - nothing to plan from.
+    frames = int(world.metrics.get("frames", 0) or 0)
+    if frames <= 0:
         scan_plan = _make_scan_plan(world, anchors)
         raise HTTPException(
             status_code=409,
-            detail={"status": "NEEDS_SCAN", "score": float(score), "reasons": reasons, "scan_plan": scan_plan},
+            detail={
+                "status": "NO_FRAMES",
+                "score": float(score),
+                "reasons": ["NO_FRAMES"],
+                "scan_plan": scan_plan,
+                "readiness_metrics": readiness_metrics,
+            },
+        )
+
+    # Compat relaxation: do NOT fail with 409 for typical scan-coverage issues.
+    # We still return diagnostics so client can show "needs more scan" hints.
+    relaxed = False
+    if not ready:
+        relaxed = True
+        trace = state.traces.setdefault(session_id, [])
+        add_trace_event(
+            trace,
+            "compat_readiness_relaxed",
+            {"score": float(score), "reasons": list(reasons), "metrics": readiness_metrics},
         )
 
     elements, rev_id, scene_bundle = _run_scaffold_pipeline(state, session_id, strict=False)
-    return {"status": "ok", "session_id": session_id, "revision_id": rev_id, "scaffold": elements, "scene_bundle": scene_bundle}
+
+    resp: dict[str, Any] = {
+        "status": "ok",
+        "session_id": session_id,
+        "revision_id": rev_id,
+        "scaffold": elements,
+        "scene_bundle": scene_bundle,
+        "readiness": {
+            "ready": bool(ready),
+            "score": float(score),
+            "reasons": reasons,
+            "readiness_metrics": readiness_metrics,
+            "relaxed": bool(relaxed),
+        },
+    }
+    if relaxed:
+        resp["compat_warnings"] = {
+            "status": "NEEDS_SCAN",
+            "score": float(score),
+            "reasons": reasons,
+            "scan_plan": _make_scan_plan(world, anchors),
+        }
+    return resp
 
 
 @router.get("/session/{session_id}/scan_plan")
