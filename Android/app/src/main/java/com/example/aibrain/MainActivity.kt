@@ -51,6 +51,8 @@ import com.example.aibrain.scene.PhysicsAnimator
 import com.example.aibrain.scene.SceneBuilder
 import com.example.aibrain.scene.LightingSetup
 import com.example.aibrain.scene.LayerGlbManager
+import com.example.aibrain.network.NetworkStateController
+import com.google.gson.Gson
 import com.google.ar.core.exceptions.CameraNotAvailableException
 import com.google.ar.sceneform.ArSceneView
 import com.google.android.material.snackbar.Snackbar
@@ -67,7 +69,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 import kotlin.math.min
-import kotlin.random.Random
 import com.example.aibrain.measurement.ARRuler
 import com.example.aibrain.offline.OfflineQueue
 import com.example.aibrain.diagnostics.CrashReporter
@@ -326,7 +327,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var api: ApiService
     private lateinit var offlineQueue: OfflineQueue
     private lateinit var crashReporter: CrashReporter
-    private var lastConnStatus: ConnectionStatus = ConnectionStatus.UNKNOWN
+    private lateinit var netState: NetworkStateController
     @Volatile private var offlineFlushInFlight: Boolean = false
 
     // ══════════════════════════════════════════════════════════════════════
@@ -353,6 +354,7 @@ class MainActivity : AppCompatActivity() {
         rebuildApiClient()
         offlineQueue = OfflineQueue(this)
         crashReporter = CrashReporter(this)
+        netState = NetworkStateController()
         if (crashReporter.readCrashMarkerSnippet() != null) {
             maybeAutoReport("crash_marker")
         }
@@ -1152,31 +1154,32 @@ class MainActivity : AppCompatActivity() {
         healthJob?.cancel()
         healthJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
+                val base = getCurrentServerUrl().trimEnd('/')
+                netState.waitIfNeeded("health")
                 val ok = try {
                     val r = api.healthCheck()
                     r.isSuccessful
                 } catch (_: Exception) {
                     false
                 }
-
+                netState.reportResult(
+                    tag = "health",
+                    success = ok,
+                    baseMs = 15_000L,
+                    maxMs = 90_000L,
+                    errorDetail = if (ok) null else "health_failed"
+                )
                 withContext(Dispatchers.Main) {
-                    val base = getCurrentServerUrl().trimEnd('/')
-                    val newStatus = if (ok) {
-                        ConnectionStatus.ONLINE
-                    } else {
-                        if (isStreaming) ConnectionStatus.RECONNECTING else ConnectionStatus.OFFLINE
-                    }
-                    viewModel.setConnectionState(newStatus, base)
-
-                    if (newStatus == ConnectionStatus.ONLINE && lastConnStatus != ConnectionStatus.ONLINE) {
-                        currentSessionId?.let { sid ->
-                            scope.launch { flushOfflineAndTelemetry(sid, base, newStatus) }
-                        }
-                    }
-                    lastConnStatus = newStatus
+                    val st = netState.getStatus()
+                    currentConnStatus = st
+                    viewModel.setConnectionState(st, base)
                 }
-
-                delay(15_000L)
+                val sid = currentSessionId
+                if (sid != null && netState.getStatus() == ConnectionStatus.ONLINE) {
+                    scope.launch {
+                        maybeFlushOfflineAndTelemetry(sid, base)
+                    }
+                }
             }
         }
     }
@@ -1186,21 +1189,44 @@ class MainActivity : AppCompatActivity() {
         healthJob = null
     }
 
-    private suspend fun flushOfflineAndTelemetry(sessionId: String, baseUrl: String, status: ConnectionStatus) {
+    private suspend fun maybeFlushOfflineAndTelemetry(sessionId: String, baseUrl: String) {
+        // Shared backoff gate for flush operations.
+        netState.waitIfNeeded("flush")
+
+        // Quick check: if there's nothing to flush and no crash marker - skip.
+        val q = runCatching { offlineQueue.getStatus(sessionId, baseUrl) }.getOrNull()
+        val hasQueue = (q != null && (q.anchorsQueued > 0 || q.lockQueued > 0))
+        val hasCrashMarker = (crashReporter.readCrashMarkerSnippet() != null)
+        if (!hasQueue && !hasCrashMarker) {
+            netState.reportResult(tag = "flush", success = true, baseMs = 20_000L, maxMs = 60_000L)
+            return
+        }
+
+        flushOfflineAndTelemetry(sessionId, baseUrl)
+    }
+
+    private suspend fun flushOfflineAndTelemetry(sessionId: String, baseUrl: String) {
         if (offlineFlushInFlight) return
         offlineFlushInFlight = true
         try {
-            offlineQueue.flushForSession(api, sessionId, baseUrl)
+            // Avoid rare races: flush uses the same mutex as user Lock/Export actions.
+            lockExportMutex.withLock {
+                offlineQueue.flushForSession(api, sessionId, baseUrl)
+            }
             crashReporter.flush(
                 api = api,
                 sessionId = sessionId,
-                connectionStatus = status.name,
+                connectionStatus = currentConnStatus.name,
                 serverBaseUrl = baseUrl,
                 lastExportRev = lastRevisionId,
                 loadedExportRev = loadedExportRevId,
                 lastRevisionId = lastRevisionId,
                 clientStats = buildClientStats()
             )
+            netState.reportResult(tag = "flush", success = true, baseMs = 20_000L, maxMs = 60_000L)
+        } catch (e: Exception) {
+            crashReporter.recordException("flushOfflineAndTelemetry", e)
+            netState.reportResult(tag = "flush", success = false, baseMs = 5_000L, maxMs = 90_000L, errorDetail = e.message)
         } finally {
             offlineFlushInFlight = false
         }
@@ -1886,6 +1912,7 @@ class MainActivity : AppCompatActivity() {
         val sid = currentSessionId ?: return
 
         isStreaming = true
+        netState.setStreaming(true)
         streamJob?.cancel()
         streamSendJob?.cancel()
         ensureReleasePollingRunning(sid)
@@ -1913,33 +1940,46 @@ class MainActivity : AppCompatActivity() {
                         withContext(Dispatchers.Main) {
                             if (!ok) {
                                 consecutiveFailures += 1
+                                streamErrorStreak += 1
                             } else {
                                 consecutiveFailures = 0
+                                streamErrorStreak = 0
                             }
+
+                            // Centralized network state update (shared backoff/jitter).
+                            val baseUrl = getCurrentServerUrl().trimEnd('/')
+                            scope.launch(Dispatchers.IO) {
+                                netState.reportResult(
+                                    tag = "stream",
+                                    success = ok,
+                                    baseMs = RECONNECT_BASE_MS,
+                                    maxMs = RECONNECT_MAX_MS,
+                                    errorDetail = if (ok) null else "stream_failed"
+                                )
+                                withContext(Dispatchers.Main) {
+                                    val st = netState.getStatus()
+                                    currentConnStatus = st
+                                    viewModel.setConnectionState(st, baseUrl)
+                                }
+                            }
+
+                            // Auto-telemetry trigger: N stream errors in a row.
+                            if (!ok && streamErrorStreak >= 5) {
+                                maybeAutoReport("stream_errors_streak")
+                            }
+
                             tuneStreaming(ok, lastSendMs)
                             if (streamPendingTick) {
                                 streamPendingTick = false
-                                streamImmediateNextTick = true
                             }
                         }
                     }
                 }
 
-                if (consecutiveFailures >= MAX_FAIL_RECONNECT) {
-                    val base = getCurrentServerUrl().trimEnd('/')
-                    viewModel.setConnectionState(ConnectionStatus.OFFLINE, base)
-
-                    // Exponential backoff once we've declared OFFLINE, to avoid wasting CPU on encoding.
-                    val exp = min(6, consecutiveFailures - MAX_FAIL_RECONNECT)
-                    val backoff = min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * (1L shl exp))
-                    nextStreamAttemptAtMs = nowMs + backoff
-                } else if (consecutiveFailures > 0) {
-                    val base = getCurrentServerUrl().trimEnd('/')
-                    viewModel.setConnectionState(ConnectionStatus.RECONNECTING, base)
-
-                    // Light backoff while reconnecting.
-                    val backoff = min(1_500L, RECONNECT_BASE_MS * consecutiveFailures.toLong())
-                    nextStreamAttemptAtMs = nowMs + backoff
+                if (consecutiveFailures > 0) {
+                    // Shared policy schedules when we may retry heavy stream sends.
+                    val snap = netState.snapshot()
+                    nextStreamAttemptAtMs = snap.nextAllowedAtMsByTag["stream"] ?: (nowMs + RECONNECT_BASE_MS)
                 } else {
                     nextStreamAttemptAtMs = 0L
                 }
@@ -1967,6 +2007,7 @@ class MainActivity : AppCompatActivity() {
         exportPollJob?.cancel()
         exportPollInFlight = false
         exportPollFailures = 0
+        exportFailStreak = 0
         nextExportPollAtMs = 0L
 
         exportPollJob = lifecycleScope.launch {
@@ -1982,32 +2023,34 @@ class MainActivity : AppCompatActivity() {
                     continue
                 }
 
-                val baseIntervalMs = 6500L
-                val jitterMs = Random.nextLong(350L, 1150L)
-
-                val offlinePenalty = when (currentConnStatus) {
-                    ConnectionStatus.OFFLINE -> 3
-                    ConnectionStatus.RECONNECTING -> 2
-                    else -> 1
-                }
-
-                val exp = min(4, exportPollFailures)
-                val backoff = min(30_000L, baseIntervalMs * (1L shl exp) * offlinePenalty.toLong())
-                nextExportPollAtMs = now + backoff + jitterMs
-
                 if (!isStreaming || currentSessionId != sessionId) break
                 if (exportPollInFlight) continue
                 exportPollInFlight = true
                 try {
-                    val resp = runCatching { api.exportLatest(sessionId) }.getOrNull()
+                    // Shared backoff gate (export/latest participates in the same policy).
+                    netState.waitIfNeeded("export_latest")
+
+                    val resp = runCatching { lockExportMutex.withLock { api.exportLatest(sessionId) } }.getOrNull()
                     if (resp == null) {
                         exportPollFailures += 1
+                        exportFailStreak += 1
+                        val nextAt = netState.reportResult(tag = "export_latest", success = false, baseMs = 6500L, maxMs = 30_000L, errorDetail = "export_null")
+                        nextExportPollAtMs = nextAt
+                        crashReporter.recordReproError(endpoint = "/session/" + sessionId + "/export/latest", errorSnippet = "export/latest: null resp")
                         continue
                     }
                     // 409 NO_EXPORT is expected early - ignore quietly.
                     if (resp.code() == 409) {
                         exportNotReady409 = true
                         exportPollFailures = 0
+                        exportFailStreak = 0
+                        crashReporter.recordReproResponse(
+                            endpoint = "/session/" + sessionId + "/export/latest",
+                            httpCode = resp.code(),
+                            bodySnippet = "409 NO_EXPORT"
+                        )
+                        val nextAt = netState.reportResult(tag = "export_latest", success = true, baseMs = 6500L, maxMs = 30_000L)
+                        nextExportPollAtMs = nextAt
                         withContext(Dispatchers.Main) {
                             updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
                         }
@@ -2015,14 +2058,36 @@ class MainActivity : AppCompatActivity() {
                     }
                     if (!resp.isSuccessful || resp.body() == null) {
                         exportPollFailures += 1
+                        exportFailStreak += 1
+                        crashReporter.recordReproError(
+                            endpoint = "/session/" + sessionId + "/export/latest",
+                            httpCode = resp.code(),
+                            errorSnippet = ("export/latest failed: " + resp.code()).take(2048)
+                        )
+                        val nextAt = netState.reportResult(tag = "export_latest", success = false, baseMs = 6500L, maxMs = 30_000L, errorDetail = "export_http_" + resp.code())
+                        nextExportPollAtMs = nextAt
+                        if (exportFailStreak >= 3) {
+                            maybeAutoReport("export_latest_failures")
+                            exportFailStreak = 0
+                        }
                         continue
                     }
 
                     exportNotReady409 = false
                     exportPollFailures = 0
+                    exportFailStreak = 0
                     val bundle = resp.body()!!
                     val rev = bundle.revision_id ?: bundle.rev_id.orEmpty()
                     if (rev.isBlank()) continue
+
+                    crashReporter.recordReproResponse(
+                        endpoint = "/session/" + sessionId + "/export/latest",
+                        httpCode = resp.code(),
+                        bodySnippet = safeJsonSnippet(bundle)
+                    )
+
+                    val nextAt = netState.reportResult(tag = "export_latest", success = true, baseMs = 6500L, maxMs = 30_000L)
+                    nextExportPollAtMs = nextAt
 
                     if (originAnchorNode == null) {
                         pendingExportRevId = rev
@@ -2055,12 +2120,20 @@ class MainActivity : AppCompatActivity() {
                         pendingAutoReloadRev = null
                         loadExportLayersInternal(sessionId, showDialog = false, showOkHint = false)
                     }
-                } catch (_: Exception) {
+                } catch (e: Exception) {
                     exportPollFailures += 1
+                    exportFailStreak += 1
+                    crashReporter.recordReproError(endpoint = "/session/" + sessionId + "/export/latest", errorSnippet = (e.message ?: "exception").take(2048))
+                    val nextAt = netState.reportResult(tag = "export_latest", success = false, baseMs = 6500L, maxMs = 30_000L, errorDetail = e.message)
+                    nextExportPollAtMs = nextAt
                 } finally {
                     exportPollInFlight = false
-                    // Update HUD suffixes without changing last readiness metrics.
-                    runCatching { updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics) }
+                    withContext(Dispatchers.Main) {
+                        val st = netState.getStatus()
+                        currentConnStatus = st
+                        viewModel.setConnectionState(st, getCurrentServerUrl().trimEnd('/'))
+                        runCatching { updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics) }
+                    }
                 }
             }
         }
@@ -2082,20 +2155,10 @@ class MainActivity : AppCompatActivity() {
                     continue
                 }
 
-                val baseIntervalMs = 1500L
-                val jitterMs = Random.nextLong(150L, 450L)
-
-                val offlinePenalty = when (currentConnStatus) {
-                    ConnectionStatus.OFFLINE -> 4
-                    ConnectionStatus.RECONNECTING -> 2
-                    else -> 1
-                }
-
-                val exp = min(4, readinessPollFailures)
-                val backoff = min(8000L, baseIntervalMs * (1L shl exp) * offlinePenalty.toLong())
-                nextReadinessPollAtMs = now + backoff + jitterMs
-
                 if (!isStreaming || currentSessionId != sessionId) break
+
+                // Shared backoff gate (readiness participates in the same policy).
+                netState.waitIfNeeded("readiness")
 
                 val resp = runCatching { api.getReadiness(sessionId) }.getOrNull()
                 if (resp == null || !resp.isSuccessful || resp.body() == null) {
@@ -2103,12 +2166,53 @@ class MainActivity : AppCompatActivity() {
                     withContext(Dispatchers.Main) {
                         updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
                     }
+                    val nextAt = netState.reportResult(
+                        tag = "readiness",
+                        success = false,
+                        baseMs = 1500L,
+                        maxMs = 12_000L,
+                        errorDetail = "readiness_http"
+                    )
+                    nextReadinessPollAtMs = nextAt
+
+                    crashReporter.recordReproError(
+                        endpoint = "/session/" + sessionId + "/readiness",
+                        httpCode = resp?.code(),
+                        errorSnippet = "readiness failed"
+                    )
+
+                    withContext(Dispatchers.Main) {
+                        val st = netState.getStatus()
+                        currentConnStatus = st
+                        viewModel.setConnectionState(st, getCurrentServerUrl().trimEnd('/'))
+                        updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
+                    }
                     continue
                 }
 
                 readinessPollFailures = 0
                 val body = resp.body()!!
+
                 withContext(Dispatchers.Main) {
+                    lastReadinessReady = body.ready
+                    lastReadinessScore = body.score
+                    lastReadinessMetrics = body.readiness_metrics
+                    updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
+                }
+
+                crashReporter.recordReproResponse(
+                    endpoint = "/session/" + sessionId + "/readiness",
+                    httpCode = resp.code(),
+                    bodySnippet = safeJsonSnippet(body)
+                )
+
+                val nextAt = netState.reportResult(tag = "readiness", success = true, baseMs = 1500L, maxMs = 12_000L)
+                nextReadinessPollAtMs = nextAt
+
+                withContext(Dispatchers.Main) {
+                    val st = netState.getStatus()
+                    currentConnStatus = st
+                    viewModel.setConnectionState(st, getCurrentServerUrl().trimEnd('/'))
                     lastReadinessReady = body.ready
                     lastReadinessScore = body.score
                     lastReadinessMetrics = body.readiness_metrics
@@ -2348,12 +2452,15 @@ class MainActivity : AppCompatActivity() {
         val resp = try {
             api.streamData(sid, payload)
         } catch (e: Exception) {
-            crashReporter.recordError("streamData", e)
+            crashReporter.recordException("streamData", e)
+            crashReporter.recordReproError(endpoint = "/session/" + sid + "/stream", errorSnippet = (e.message ?: "exception").take(2048))
             return false
         }
 
         if (!resp.isSuccessful) {
-            crashReporter.recordError("streamData", IllegalStateException("HTTP ${resp.code()}"))
+            val errSnippet = runCatching { resp.errorBody()?.string() }.getOrNull()?.take(2048)
+            crashReporter.recordError("streamData", "HTTP ${resp.code()}")
+            crashReporter.recordReproError(endpoint = "/session/" + sid + "/stream", httpCode = resp.code(), errorSnippet = (errSnippet ?: ("HTTP " + resp.code())).take(2048))
             return false
         }
 
@@ -2395,6 +2502,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun stopStreaming() {
         isStreaming = false
+        runCatching { netState.setStreaming(false) }
         streamJob?.cancel()
         streamJob = null
         streamSendJob?.cancel()
@@ -3048,8 +3156,8 @@ class MainActivity : AppCompatActivity() {
         currentSessionId?.let { sid ->
             scope.launch {
                 syncAnchorsToServer(allowEmpty = true)
-                if (lastConnStatus == ConnectionStatus.ONLINE) {
-                    flushOfflineAndTelemetry(sid, getCurrentServerUrl().trimEnd('/'), lastConnStatus)
+                if (currentConnStatus == ConnectionStatus.ONLINE) {
+                    flushOfflineAndTelemetry(sid, getCurrentServerUrl().trimEnd('/'))
                 }
             }
         }
@@ -3119,6 +3227,14 @@ class MainActivity : AppCompatActivity() {
         stopStreaming()
         stopAutoVoxelRefresh()
         runCatching { sceneView.pause() }
+    }
+
+    private fun safeJsonSnippet(obj: Any): String {
+        return try {
+            Gson().toJson(obj).take(2048)
+        } catch (e: Exception) {
+            ("<json_error:" + (e.message ?: "unknown") + ">").take(256)
+        }
     }
 
 }
