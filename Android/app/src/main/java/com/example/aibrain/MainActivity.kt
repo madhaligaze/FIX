@@ -302,6 +302,7 @@ class MainActivity : AppCompatActivity() {
     private var currentScanHints: List<String> = emptyList()
     private var scanHintsVisible = false
     private var autoVoxelRefreshJob: Job? = null
+    private val gson by lazy { Gson() }
 
     private val cameraPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -3231,7 +3232,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun safeJsonSnippet(obj: Any): String {
         return try {
-            Gson().toJson(obj).take(2048)
+            gson.toJson(obj).take(2048)
         } catch (e: Exception) {
             ("<json_error:" + (e.message ?: "unknown") + ">").take(256)
         }
