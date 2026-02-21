@@ -535,16 +535,15 @@ class MainActivity : AppCompatActivity() {
         if (!::sceneView.isInitialized) return
         if (!hasCameraPermission()) return
         if (!isArSceneReady) {
-            setupARScene()
-            isArSceneReady = true
+            isArSceneReady = setupARScene()
         }
-        if (!isRulerReady) {
+        if (isArSceneReady && !isRulerReady) {
             initializeRuler()
             isRulerReady = true
         }
     }
 
-    private fun setupARScene() {
+    private fun setupARScene(): Boolean {
         // Конфигурацию ARCore Session делаем через ARSessionManager (без SceneView-специфичных API).
 
         if (!::arManager.isInitialized) {
@@ -553,7 +552,7 @@ class MainActivity : AppCompatActivity() {
         val sessionOk = arManager.setupSession()
         if (!sessionOk) {
             showError("ARCore сессия не запустилась. Убедитесь что ARCore обновлён и камера доступна.")
-            return
+            return false
         }
         if (arManager.depthMode == Config.DepthMode.DISABLED && !depthHintShown) {
             depthHintShown = true
@@ -583,6 +582,7 @@ class MainActivity : AppCompatActivity() {
                 delay(100)
             }
         }
+        return true
     }
 
     private fun setupClickListeners() {
