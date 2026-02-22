@@ -166,6 +166,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvReadiness: TextView
     private lateinit var tvReadinessDetail: TextView
     private lateinit var tvAiCritique: TextView
+    private lateinit var tvScanCoach: TextView
 
     // Основные кнопки
     private lateinit var btnStart: Button
@@ -509,6 +510,7 @@ class MainActivity : AppCompatActivity() {
         tvReadiness = findViewById(R.id.tv_readiness)
         tvReadinessDetail = findViewById(R.id.tv_readiness_detail)
         tvAiCritique = findViewById(R.id.tv_ai_critique)
+        tvScanCoach = findViewById(R.id.tv_scan_coach)
 
         // Основные кнопки
         btnStart = findViewById(R.id.btn_start)
@@ -827,8 +829,15 @@ class MainActivity : AppCompatActivity() {
 
         val supportCount = userMarkers.count { it.kind == "support" }
         if (supportCount >= MAX_SUPPORTS) {
-            showHint("⚠️ Достигнут максимум опор: $MAX_SUPPORTS")
+            showHint("⚠️ Достигнут максимум опор: $MAX_SUPPORTS — используй ТОЧКА для доп. меток")
             return
+        }
+
+        if (supportCount == 0) {
+            showHint(
+                "📍 Опора поставлена. Теперь обойди её полукругом (~180°) с камерой, " +
+                        "держа на расстоянии 0.5-2 м. Это даст OBS и VDIV для AI."
+            )
         }
 
         placeAnchor(kind = "support")
@@ -839,6 +848,11 @@ class MainActivity : AppCompatActivity() {
 
         if (userMarkers.size >= MAX_POINTS) {
             showHint("⚠️ Достигнут максимум точек: $MAX_POINTS")
+            return
+        }
+
+        if (userMarkers.none { it.kind == "support" }) {
+            showHint("ℹ️ Сначала поставь хотя бы 1 ОПОРУ — точки без опоры не дают AI якоря")
             return
         }
 
@@ -1832,16 +1846,33 @@ class MainActivity : AppCompatActivity() {
         val vp = metrics?.viewpoints ?: 0
         val minVp = metrics?.min_viewpoints ?: 0
         val minObsPct = ((metrics?.min_observed_ratio ?: 0.0) * 100.0).toInt()
-        val nextAction = if (ready == true) {
-            ""
-        } else if (obsPct < minObsPct) {
-            "\nСканируйте 20-30 сек вокруг опоры (полукруг 180°)"
-        } else if (vdiv < minViews) {
-            "\nОбойдите опору с 3 сторон (разные углы обзора)"
-        } else if (vp < minVp) {
-            "\nСделайте 3-5 разных позиций (шагните влево/вправо)"
-        } else {
-            "\nПродолжайте скан и держите камеру стабильно"
+
+        val metricLine =
+            "OBS ${obsPct}%/${minObsPct}% | VDIV ${vdiv}/${minViews} | VP ${vp}/${minVp}" +
+                    (if (ready == true) " ✅ READY" else "")
+
+        val coachLine: String = when {
+            ready == true -> ""
+            obsPct < minObsPct -> buildString {
+                append("👣 Обойди опору полукругом 180° (~20-30 сек)")
+                val gap = minObsPct - obsPct
+                if (gap > 20) append(" — нужно ещё ${gap}% покрытия")
+            }
+
+            vdiv < minViews -> buildString {
+                val missing = minViews - vdiv
+                append("🔄 Обойди с ${missing + 1} стороны (разные углы, шаг 60°)")
+            }
+
+            vp < minVp -> buildString {
+                val missing = minVp - vp
+                append(
+                    "📸 Сделай ещё ${missing} позици${if (missing == 1) "ю" else "и"}" +
+                            " — шагни влево/вправо или наклони камеру"
+                )
+            }
+
+            else -> "✅ Данных достаточно — нажми АНАЛИЗ"
         }
 
         val netSuffix = when (currentConnStatus) {
@@ -1855,17 +1886,28 @@ class MainActivity : AppCompatActivity() {
             if (readinessPollFailures > 0) append(" | RDY RETRY")
         }
 
-        tvReadinessDetail.text =
-            "OBS ${obsPct}%/${minObsPct}% | VDIV ${vdiv}/${minViews} | VP ${vp}/${minVp}" +
-                    (if (ready == true) " | READY" else "") +
-                    netSuffix +
-                    pollSuffix +
-                    nextAction
+        tvReadinessDetail.text = buildString {
+            append(metricLine)
+            if (netSuffix.isNotEmpty()) append(netSuffix)
+            if (pollSuffix.isNotEmpty()) append(pollSuffix)
+            if (coachLine.isNotEmpty()) append("\n").append(coachLine)
+        }
 
         val colorRes =
             if (ready == true) android.R.color.holo_green_light else android.R.color.holo_orange_light
         pbReadiness.progressTintList =
             android.content.res.ColorStateList.valueOf(ContextCompat.getColor(this, colorRes))
+
+        if (ready != true && appState == AppState.SCANNING && coachLine.isNotEmpty()) {
+            tvScanCoach.visibility = View.VISIBLE
+            tvScanCoach.text = coachLine
+        } else if (ready == true) {
+            tvScanCoach.visibility = View.GONE
+        }
+
+        if (ready != true && s0 >= 0.5 && s0 < 0.9 && coachLine.isNotEmpty()) {
+            showHint(coachLine)
+        }
     }
 
     private fun maybeEmitReadinessHints(
@@ -1888,23 +1930,37 @@ class MainActivity : AppCompatActivity() {
                 rs.startsWith("LOW_VIEWPOINTS") -> {
                     val vp = metrics.viewpoints
                     val minVp = metrics.min_viewpoints
-                    hints.add("📍 Нужно больше ракурсов: VP ${vp}/${minVp}")
+                    val missing = (minVp - vp).coerceAtLeast(1)
+                    hints.add(
+                        "📸 Сделай ещё $missing позици${if (missing == 1) "ю" else "и"}: " +
+                                "шагни в сторону, наклони камеру вверх/вниз"
+                    )
                 }
+
                 rs.startsWith("LOW_VIEW_DIVERSITY") -> {
                     val vd = metrics.view_diversity
                     val minVd = metrics.min_views_per_anchor
-                    hints.add("📍 Обойди опоры по кругу: VDIV ${vd}/${minVd}")
+                    hints.add(
+                        "🔄 Обойди опору с разных сторон (угол 60°+) — " +
+                                "сейчас ${vd}/${minVd} ракурсов засчитано"
+                    )
                 }
+
                 rs.startsWith("LOW_OBSERVED_RATIO") -> {
                     val obs = ((metrics.observed_ratio) * 100.0).toInt()
                     val minObs = ((metrics.min_observed_ratio) * 100.0).toInt()
-                    hints.add("📍 Мало покрытия: OBS ${obs}% (min ${minObs}%)")
+                    hints.add(
+                        "👣 Обойди опору полукругом ~180° и удерживай камеру " +
+                                "2-3 сек на каждой позиции (OBS ${obs}%→${minObs}%)"
+                    )
                 }
+
                 rs == "EMPTY_WORLD" || rs == "EMPTY_AABB" -> {
-                    hints.add("📍 Нет данных скана: подвигайся и досканируй область")
+                    hints.add("🚶 Подойди к опоре на 0.5-1.5 м и медленно пройди рядом")
                 }
+
                 rs == "NO_FRAMES" -> {
-                    hints.add("📍 Нет кадров: включи стрим и подержи камеру на сцене")
+                    hints.add("📡 Нажми START — стрим не активен (или потерялся сигнал)")
                 }
             }
         }
@@ -2127,7 +2183,12 @@ class MainActivity : AppCompatActivity() {
     private fun updatePointsCount() {
         val sup = userMarkers.count { it.kind == "support" }
         val pts = userMarkers.size
-        tvPointsCount.text = "SUP:$sup | PTS:$pts"
+        val supLeft = MAX_SUPPORTS - sup
+        tvPointsCount.text = buildString {
+            append("ОПОР:$sup/$MAX_SUPPORTS")
+            if (supLeft > 0) append(" (ещё ${supLeft} можно)")
+            append(" | ТОЧЕК:${pts - sup}")
+        }
     }
 
     private fun updateCameraCoordinates() {
@@ -2958,8 +3019,9 @@ class MainActivity : AppCompatActivity() {
 
             if (model.status == "NEEDS_SCAN" || opts.isEmpty()) {
                 current3DModel = null
-                val reasons = model.reasons?.joinToString(", ") ?: "Недостаточно данных"
-                showError("Нужно больше сканирования: $reasons")
+                val coachMsg = buildNeedsScanHint(model.reasons.orEmpty(), lastReadinessMetrics)
+                showHint(coachMsg)
+                updateReadinessUI(false, lastReadinessScore, lastReadinessMetrics)
                 transitionTo(AppState.SCANNING)
                 startStreamingLoop()
                 return@withContext
@@ -2972,6 +3034,55 @@ class MainActivity : AppCompatActivity() {
             variantAdapter.submit(opts, selected = 0)
             onVariantSelected(0)
             if (measurementConstraints.isNotEmpty()) showHint("📐 ${measurementConstraints.size} измерений использовано")
+        }
+    }
+
+
+    /**
+     * Формирует конструктивное сообщение "что делать руками" при NEEDS_SCAN.
+     * Избегает красных toast-ошибок; работает как обучающая подсказка.
+     */
+    private fun buildNeedsScanHint(
+        reasons: List<String>,
+        metrics: ReadinessMetrics?
+    ): String {
+        if (reasons.isEmpty()) return "📡 Продолжай сканировать — держи камеру на опоре 20-30 сек"
+
+        val steps = reasons.mapNotNull { reason ->
+            when {
+                reason.startsWith("LOW_OBSERVED_RATIO") -> {
+                    val obs = ((metrics?.observed_ratio ?: 0.0) * 100.0).toInt()
+                    val minObs = ((metrics?.min_observed_ratio ?: 0.0) * 100.0).toInt()
+                    "👣 Обойди опору полукругом 180° (OBS ${obs}%→${minObs}% нужно)"
+                }
+
+                reason.startsWith("LOW_VIEW_DIVERSITY") -> {
+                    val vd = metrics?.view_diversity ?: 0
+                    val minVd = metrics?.min_views_per_anchor ?: 0
+                    "🔄 Обойди с разных углов (60°+ шаг) — ${vd}/${minVd} ракурсов"
+                }
+
+                reason.startsWith("LOW_VIEWPOINTS") -> {
+                    val vp = metrics?.viewpoints ?: 0
+                    val minVp = metrics?.min_viewpoints ?: 0
+                    "📸 Ещё ${(minVp - vp).coerceAtLeast(1)} позици${if ((minVp - vp) == 1) "я" else "и"}" +
+                            " — шагни в сторону или наклони камеру вверх/вниз"
+                }
+
+                reason == "EMPTY_WORLD" || reason == "EMPTY_AABB" ->
+                    "🚶 Подойди на 0.5-1.5 м к опоре и пройди вокруг"
+
+                reason == "NO_FRAMES" ->
+                    "📡 Стрим прерывался — нажми START и снова начни скан"
+
+                else -> null
+            }
+        }
+
+        return if (steps.isEmpty()) {
+            "📡 Сканируй ещё 20-30 сек, держи камеру стабильно"
+        } else {
+            steps.take(2).joinToString("\n")
         }
     }
 
