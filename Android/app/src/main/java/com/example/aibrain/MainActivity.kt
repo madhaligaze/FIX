@@ -860,8 +860,8 @@ class MainActivity : AppCompatActivity() {
 
         visualizeScaffoldVariant(selectedVariantIndex)
 
-        val option = current3DModel?.options?.get(index)
-        if (option != null) {
+        val option = current3DModel?.options?.getOrNull(index) ?: return
+        run {
             showHint("✓ Вариант ${index + 1}: ${option.variant_name} | Надёжность: ${option.safety_score}%")
             val critique = option.ai_critique?.joinToString("\n")?.trim().orEmpty()
             if (critique.isNotBlank()) {
@@ -889,9 +889,10 @@ class MainActivity : AppCompatActivity() {
     private fun onAcceptClicked() {
         if (appState != AppState.SELECTING) return
 
-        val option = current3DModel?.options?.get(selectedVariantIndex)
+        val option = current3DModel?.options?.getOrNull(selectedVariantIndex)
         if (option == null) {
-            showHint("⚠️ Не выбран вариант")
+            showHint("⚠️ Вариант не выбран или список пуст")
+            transitionTo(AppState.SCANNING)
             return
         }
 
@@ -2111,7 +2112,6 @@ class MainActivity : AppCompatActivity() {
         netState.setStreaming(true)
         streamJob?.cancel()
         streamSendJob?.cancel()
-        ensureReleasePollingRunning(sid)
         streamJob = scope.launch {
             while (isActive && isStreaming && currentSessionId == sid) {
                 val nowMs = System.currentTimeMillis()
@@ -2796,15 +2796,24 @@ class MainActivity : AppCompatActivity() {
 
         val model = response.body()!!
         withContext(Dispatchers.Main) {
+            val opts = model.options.orEmpty()
+
+            if (model.status == "NEEDS_SCAN" || opts.isEmpty()) {
+                current3DModel = null
+                val reasons = model.reasons?.joinToString(", ") ?: "Недостаточно данных"
+                showError("Нужно больше сканирования: $reasons")
+                transitionTo(AppState.SCANNING)
+                startStreamingLoop()
+                return@withContext
+            }
+
             current3DModel = model
             selectedVariantIndex = 0
             transitionTo(AppState.SELECTING)
-
-            val opts = model.options.orEmpty()
+            ensureReleasePollingRunning(sid)
             variantAdapter.submit(opts, selected = 0)
-
-            if (opts.isNotEmpty()) onVariantSelected(0)
-            if (measurementConstraints.isNotEmpty()) showHint("📐 ${measurementConstraints.size} измерений использовано как ограничения")
+            onVariantSelected(0)
+            if (measurementConstraints.isNotEmpty()) showHint("📐 ${measurementConstraints.size} измерений использовано")
         }
     }
 
@@ -2815,6 +2824,30 @@ class MainActivity : AppCompatActivity() {
         }
 
         val frame = sceneView.arFrame ?: return
+        val camera = frame.camera
+
+        if (camera.trackingState != TrackingState.TRACKING) {
+            showHint("⚠️ AR трекинг нестабилен. Подержите камеру спокойно и попробуйте снова.")
+            vibrate(150)
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val reason = camera.trackingFailureReason
+            if (reason != com.google.ar.core.TrackingFailureReason.NONE) {
+                val msg = when (reason) {
+                    com.google.ar.core.TrackingFailureReason.INSUFFICIENT_FEATURES ->
+                        "Мало контрастных точек. Направьте камеру на текстурную поверхность."
+                    com.google.ar.core.TrackingFailureReason.EXCESSIVE_MOTION ->
+                        "Слишком быстрое движение. Двигайтесь медленнее."
+                    com.google.ar.core.TrackingFailureReason.INSUFFICIENT_LIGHT ->
+                        "Недостаточно освещения."
+                    else -> "Трекинг нестабилен: $reason"
+                }
+                showHint("⚠️ $msg")
+                return
+            }
+        }
 
         val x = sceneView.width / 2f
         val y = sceneView.height / 2f
