@@ -1889,7 +1889,7 @@ class MainActivity : AppCompatActivity() {
             layerGlbManager?.clearAll()
             if (::voxelVisualizer.isInitialized) {
                 voxelVisualizer.setRootParent(null)
-                voxelVisualizer.clear()
+                voxelVisualizer.hideVoxels()
             }
             currentVoxelData = null
             showHint("⚠️ Origin anchor удалён. Поставь новую опору, чтобы закрепить слои")
@@ -3355,7 +3355,7 @@ class MainActivity : AppCompatActivity() {
         // (or if AR crashed during early startup). Never crash in onDestroy().
         if (::voxelVisualizer.isInitialized) {
             voxelVisualizer.setRootParent(null)
-            voxelVisualizer.clear()
+            voxelVisualizer.hideVoxels()
         }
         updatePointsCount()
         btnAnalyze.isEnabled = false
