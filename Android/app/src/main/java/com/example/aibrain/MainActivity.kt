@@ -131,7 +131,6 @@ class MainActivity : AppCompatActivity() {
         private const val RECONNECT_MAX_MS = 30_000L
         private const val STREAM_INTERVAL_MS = 1_000L
         private const val AUTO_RELOAD_COOLDOWN_MS: Long = 12_000L
-        private const val MIN_POINTS_FOR_MODEL = 2
         private const val MAX_POINTS = 20
         private const val MAX_SUPPORTS = 3
         private const val PREFS_NAME = "app_settings"
@@ -858,8 +857,9 @@ class MainActivity : AppCompatActivity() {
     private fun onAnalyzeClicked() {
         if (appState != AppState.SCANNING) return
 
-        if (userMarkers.size < MIN_POINTS_FOR_MODEL) {
-            showHint("📍 Требуется минимум $MIN_POINTS_FOR_MODEL точки. Сейчас: ${userMarkers.size}")
+        val supportCount = userMarkers.count { it.kind == "support" }
+        if (supportCount < 1) {
+            showHint("📍 Сначала добавьте хотя бы одну опору")
             vibrate()
             return
         }
@@ -2815,7 +2815,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 "READY" -> {
                     hideScanHintsBar()
-                    if (userMarkers.size >= MIN_POINTS_FOR_MODEL && !hasRedZones) startPlayButtonPulse()
+                    if (userMarkers.count { it.kind == "support" } >= 1 && !hasRedZones) startPlayButtonPulse()
                 }
                 else -> if (hints?.is_scan_complete == true) hideScanHintsBar()
             }
@@ -2828,7 +2828,7 @@ class MainActivity : AppCompatActivity() {
                     else -> null
                 }
                 if (!msg.isNullOrBlank()) showHint(msg)
-                if (userMarkers.size >= MIN_POINTS_FOR_MODEL) btnAnalyze.isEnabled = true
+                if (userMarkers.count { it.kind == "support" } >= 1) btnAnalyze.isEnabled = true
                 if (hints.is_ready == true && !hasRedZones) startPlayButtonPulse()
             }
         }
