@@ -414,77 +414,17 @@
         android:scaleType="fitXY" />
 
     <!--═════════════════════════════════════════════════════════════════════-->
-    <!-- CENTER TARGETING RETICLE -->
+    <!-- SMART RETICLE — живой AR-прицел с обратной связью                  -->
+    <!-- GREEN=плоскость найдена / YELLOW=feature point / DIM=поиск         -->
+    <!-- Форма овала отражает наклон поверхности (пол=плоский, стена=круг)  -->
+    <!-- Tap по прицелу = поставить якорь (tap-to-place)                    -->
     <!--═════════════════════════════════════════════════════════════════════-->
-    <FrameLayout
-        android:layout_width="80dp"
-        android:layout_height="80dp"
-        android:layout_gravity="center">
-
-        <!-- Outer Ring -->
-        <View
-            android:layout_width="80dp"
-            android:layout_height="80dp"
-            android:background="@drawable/ic_reticle_outer_ring" />
-
-        <!-- Horizontal Crosshair -->
-        <View
-            android:layout_width="32dp"
-            android:layout_height="2dp"
-            android:layout_gravity="center"
-            android:background="#CC00F5FF" />
-
-        <!-- Vertical Crosshair -->
-        <View
-            android:layout_width="2dp"
-            android:layout_height="32dp"
-            android:layout_gravity="center"
-            android:background="#CC00F5FF" />
-
-        <!-- Center Dot -->
-        <View
-            android:layout_width="6dp"
-            android:layout_height="6dp"
-            android:layout_gravity="center"
-            android:background="@drawable/ic_dot_cyan" />
-
-        <!-- Corner Indicators -->
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="top|start"
-            android:text="┌"
-            android:textColor="#AA00F5FF"
-            android:textSize="24sp"
-            android:fontFamily="monospace" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="top|end"
-            android:text="┐"
-            android:textColor="#AA00F5FF"
-            android:textSize="24sp"
-            android:fontFamily="monospace" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="bottom|start"
-            android:text="└"
-            android:textColor="#AA00F5FF"
-            android:textSize="24sp"
-            android:fontFamily="monospace" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="bottom|end"
-            android:text="┘"
-            android:textColor="#AA00F5FF"
-            android:textSize="24sp"
-            android:fontFamily="monospace" />
-    </FrameLayout>
+    <com.example.aibrain.SmartReticleView
+        android:id="@+id/smart_reticle"
+        android:layout_width="160dp"
+        android:layout_height="160dp"
+        android:layout_gravity="center"
+        android:contentDescription="Нажмите для размещения якоря" />
 
     <!--═════════════════════════════════════════════════════════════════════-->
     <!-- LEFT SIDEBAR DATA -->
