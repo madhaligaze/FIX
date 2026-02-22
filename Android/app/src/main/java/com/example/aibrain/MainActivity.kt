@@ -563,7 +563,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Иногда состояние transient - это нормально (ARCore еще "думает"). Не спамим ошибками, просто ждём следующий onResume.
-        if (availability.isTransient) return false
+        if (availability.isTransient) {
+            Log.d("MainActivity", "ARCore availability is transient: $availability")
+            return false
+        }
 
         if (!availability.isSupported) {
             if (!arcoreHintShown) {
