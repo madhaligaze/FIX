@@ -625,7 +625,11 @@ class MainActivity : AppCompatActivity() {
         }
         val sessionOk = arManager.setupSession()
         if (!sessionOk) {
-            showError("ARCore сессия не запустилась. Убедитесь что ARCore обновлён и камера доступна.")
+            if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.P) {
+                showError("AR требует Android 9+ (API 28+). На вашем устройстве Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}).")
+            } else {
+                showError("ARCore сессия не запустилась. Убедитесь что ARCore обновлён и камера доступна.")
+            }
             return false
         }
         if (arManager.depthMode == Config.DepthMode.DISABLED && !depthHintShown) {
