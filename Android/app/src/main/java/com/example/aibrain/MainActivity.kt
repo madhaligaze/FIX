@@ -308,6 +308,8 @@ class MainActivity : AppCompatActivity() {
     private var isArSceneReady = false
     private var isRulerReady = false
     private var arResumed: Boolean = false
+
+    // Depth session state (cached once per ARCore session)
     private var depthSupported: Boolean? = null
     private var depthAttemptsDisabled: Boolean = false
     private var depthEverReceived: Boolean = false
