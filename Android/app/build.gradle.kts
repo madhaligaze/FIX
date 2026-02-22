@@ -45,9 +45,9 @@ android {
     }
 }
 
-// ВАЖНО: Sceneform 1.23.0 ожидает ARCore линии ~1.31.x.
+// ВАЖНО: Sceneform и ARCore должны быть совместимы.
 // Форсим одну версию, чтобы не получить рантайм-мисматч и NoSuchMethodError в LightEstimate.
-val arCoreVersion = "1.31.0"
+val arCoreVersion = "1.52.0"
 configurations.configureEach {
     resolutionStrategy.force("com.google.ar:core:$arCoreVersion")
 }
