@@ -64,7 +64,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
-import java.util.ArrayDeque
+import kotlin.collections.ArrayDeque
 import java.util.concurrent.TimeUnit
 import java.io.File
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull

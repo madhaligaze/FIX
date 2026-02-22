@@ -25,7 +25,7 @@ class DepthPolicy(
         const val DISABLE_AFTER_STREAK = 20
         const val WARMUP_MS = 3_500L
 
-        const val MAX_DEPTH_PAYLOAD_BYTES = 512 * 1024
+        const val MAX_DEPTH_PAYLOAD_BYTES = 1024 * 1024
     }
 
     val supported: Boolean = arCoreDepthMode != Config.DepthMode.DISABLED
