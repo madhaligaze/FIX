@@ -198,6 +198,9 @@ class ARRuler(
         return calculateTotalDistance()
     }
 
+    /** Количество поставленных точек в текущем измерении */
+    fun getPointCount(): Int = currentPoints.size
+
     /**
      * Измерить высоту от пола до точки
      */

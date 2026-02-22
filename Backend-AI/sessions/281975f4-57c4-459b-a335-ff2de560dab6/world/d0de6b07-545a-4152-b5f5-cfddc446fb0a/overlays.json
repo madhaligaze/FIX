@@ -1,0 +1,81 @@
+{
+  "occupancy": {
+    "unknown": 2097104,
+    "free": 34,
+    "occupied": 14,
+    "total": 2097152,
+    "observed_ratio": 2.288818359375e-05,
+    "unknown_ratio": 0.9999771118164062
+  },
+  "weights_hist": {
+    "[0,1)": 2097104,
+    "[1,2)": 0,
+    "[2,3)": 0,
+    "[3,5)": 11,
+    "[5,10)": 1,
+    "[10,20)": 7,
+    "[20,50)": 11,
+    "[50,100)": 11,
+    "[100,500)": 6,
+    "[500,1000)": 1,
+    "[1000,inf)": 0
+  },
+  "conflicts": 368,
+  "quality_metrics": {
+    "observed_ratio": 2.288818359375e-05,
+    "unknown_ratio": 0.9999771118164062,
+    "conflict_ratio": 0.0,
+    "unknown_ratio_near_anchors": null,
+    "voxel_weight_histogram": {
+      "bins": [
+        0,
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        255
+      ],
+      "counts": [
+        2097104,
+        0,
+        5,
+        6,
+        6,
+        8,
+        11,
+        9,
+        3
+      ]
+    }
+  },
+  "policy": {
+    "unknown_mode": "forbid",
+    "unknown_buffer_m": 0.5,
+    "min_clearance_m": 0.2,
+    "readiness_observed_ratio_min": 0.35,
+    "unknown_ratio_near_support_max": 0.25,
+    "min_viewpoints": 3,
+    "min_views_per_support": 2,
+    "min_views_per_anchor": 3,
+    "scaffold_grid_step_m": 2.0,
+    "scaffold_max_bay_m": 3.07,
+    "scaffold_min_bay_m": 1.57,
+    "scaffold_default_height_m": 4.0,
+    "scaffold_deck_levels_m": [
+      2.0,
+      4.0
+    ],
+    "access_min_corridor_m": 0.7,
+    "stability_require_diagonals": true,
+    "enforce_validators_strict": true,
+    "planner_max_candidates": 24,
+    "planner_repair_rounds": 8,
+    "planner_max_shift_m": 0.6,
+    "planner_score_w_violations": 10.0,
+    "planner_score_w_unknown": 2.0,
+    "planner_score_w_shift": 0.5
+  }
+}

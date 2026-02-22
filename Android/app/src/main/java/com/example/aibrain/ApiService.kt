@@ -1,20 +1,9 @@
 package com.example.aibrain
 
+import com.google.gson.JsonObject
+import com.google.gson.annotations.SerializedName
 import retrofit2.Response
 import retrofit2.http.*
-import com.google.gson.annotations.SerializedName
-
-/**
- * API-интерфейс для связи с Python-сервером.
- *
- * ИСПРАВЛЕНО: модели ответов теперь совпадают с реальными ответами сервера.
- *
- * Сервер /session/stream возвращает:
- *   {"status": "RECEIVING", "ai_hints": {"instructions": [...], "warnings": [...], "quality_score": 85}}
- *
- * Раньше в Android было:
- *   data class HintResponse(val hints: Map<String, List<String>>)  ← НЕВЕРНО
- */
 
 interface ApiService {
 
@@ -30,6 +19,12 @@ interface ApiService {
     @POST("/session/model/{session_id}")
     suspend fun startModeling(
         @Path("session_id") sessionId: String
+    ): Response<ModelingResponse>
+
+    @POST("/session/model/{session_id}")
+    suspend fun startModelingWithMeasurements(
+        @Path("session_id") sessionId: String,
+        @Body payload: ModelingWithMeasurementsPayload
     ): Response<ModelingResponse>
 
     @POST("/session/update/{session_id}")
@@ -62,38 +57,60 @@ interface ApiService {
         @Body payload: LockPayload
     ): Response<LockResponse>
 
+    @GET("/session/{session_id}/readiness")
+    suspend fun getReadiness(
+        @Path("session_id") sessionId: String
+    ): Response<ReadinessResponse>
+
     @GET("/session/{session_id}/export/latest")
     suspend fun exportLatest(
         @Path("session_id") sessionId: String
     ): Response<SceneBundleResponse>
+
+    // Compatibility endpoint (used for readiness/scan hints and e2e smoke stability)
+    @POST("/session/{session_id}/request_scaffold")
+    suspend fun requestScaffoldCompat(
+        @Path("session_id") sessionId: String
+    ): Response<JsonObject>
 
     @POST("/session/log/{session_id}")
     suspend fun logEvent(
         @Path("session_id") sessionId: String,
         @Body payload: LogPayload
     ): Response<Unit>
+
+    @POST("/session/report/{session_id}")
+    suspend fun postSessionCrashReport(
+        @Path("session_id") sessionId: String,
+        @Body payload: CrashEnvelope
+    ): Response<Unit>
+
+    @POST("/telemetry/client_report")
+    suspend fun postClientReport(
+        @Body payload: ClientReportEnvelope
+    ): Response<SimpleStatusResponse>
 }
 
-// ── Ответ /session/start ──────────────────────────────────────────────────────
 data class SessionResponse(
     val session_id: String,
     val status: String
 )
 
-// ── Ответ /session/stream ─────────────────────────────────────────────────────
 data class StreamResponse(
     val status: String,
     val ai_hints: AiHints?
 )
 
 data class AiHints(
-    val instructions: List<String>?,   // ["📏 Отойдите на 2 метра", ...]
-    val warnings: List<String>?,        // ["⚠️ Мало AR-точек", ...]
-    val quality_score: Double?,         // 0.0–100.0
-    val is_ready: Boolean?              // true = можно моделировать
+    val instructions: List<String>?,
+    val warnings: List<String>?,
+    val quality_score: Double?,
+    val is_ready: Boolean?,
+    val scan_plan: List<String>? = null,
+    val next_best_views: List<String>? = null,
+    val is_scan_complete: Boolean? = null
 )
 
-// ── Ответ /session/model ──────────────────────────────────────────────────────
 data class ModelingResponse(
     val status: String,
     val options: List<ScaffoldOption>?
@@ -103,8 +120,8 @@ data class ScaffoldOption(
     @SerializedName(value = "variant_name", alternate = ["name"])
     val variant_name: String = "Option",
     val material_info: String = "",
-    val safety_score: Int = 0,           // 0–100, выше = безопаснее
-    val ai_critique: List<String>?,  // самокритика ИИ
+    val safety_score: Int = 0,
+    val ai_critique: List<String>?,
     val elements: List<ScaffoldElement>? = null,
     val full_structure: List<ScaffoldElement>? = null,
     val stats: ScaffoldStats?,
@@ -134,17 +151,28 @@ data class ScaffoldStats(
 )
 
 data class PhysicsResult(
-    val status: String    // "OK" | "COLLAPSE" | "ERROR"
+    val status: String
 )
 
-// ── Ответ /health ─────────────────────────────────────────────────────────────
+data class ModelingWithMeasurementsPayload(
+    val measurements_json: String,
+    val manual_measurements: List<MeasurementConstraint> = emptyList()
+)
+
+data class MeasurementConstraint(
+    val id: String,
+    val type: String,
+    val distance_m: Double,
+    val label: String,
+    val timestamp_ms: Long
+)
+
 data class HealthResponse(
     val status: String,
     val version: String,
     val modules: Map<String, Boolean>?
 )
 
-// ── Запрос/ответ для /session/update ───────────────────────────────────────
 data class UpdateAction(
     val action: String,
     val element_id: String? = null,
@@ -172,7 +200,6 @@ data class CollapsedData(
     val elements: List<String>
 )
 
-// ── Ответ для /session/preview_remove ──────────────────────────────────────
 data class PreviewResponse(
     val status: String,
     val element_id: String,
@@ -181,7 +208,6 @@ data class PreviewResponse(
     val collapse_count: Int,
     val warning: String
 )
-
 
 data class VoxelResponse(
     val status: String,
@@ -203,7 +229,6 @@ data class Bounds(
     val min: List<Float>,
     val max: List<Float>
 )
-
 
 data class SceneBundleResponse(
     val session_id: String,
@@ -253,8 +278,6 @@ data class LogDeviceInfo(
     val sdk: Int
 )
 
-
-// ── /session/anchors ─────────────────────────────────────────────────────
 data class AnchorPayload(
     val session_id: String,
     val anchors: List<AnchorPointRequest>
@@ -272,9 +295,11 @@ data class AnchorsResponse(
     val count: Int
 )
 
-// ── /session/lock ─────────────────────────────────────────────────────
 data class LockPayload(
-    val session_id: String
+    val session_id: String,
+    val selected_variant: String? = null,
+    val measurements_json: String? = null,
+    val manual_measurements: List<MeasurementConstraint> = emptyList()
 )
 
 data class LockResponse(
@@ -284,4 +309,86 @@ data class LockResponse(
     val trace_ndjson: String? = null,
     val tsdf_available: Boolean? = null,
     val tsdf_reason: String? = null
+)
+
+data class ReadinessResponse(
+    val session_id: String,
+    val ready: Boolean,
+    val score: Double,
+    val reasons: List<String> = emptyList(),
+    val readiness_metrics: ReadinessMetrics? = null
+)
+
+data class ReadinessMetrics(
+    val observed_ratio: Double = 0.0,
+    val view_diversity: Int = 0,
+    val viewpoints: Int = 0,
+    val min_observed_ratio: Double = 0.0,
+    val min_views_per_anchor: Int = 0,
+    val min_viewpoints: Int = 0,
+    val anchor_count: Int = 0
+)
+
+
+data class CrashErrorItem(
+    val where: String,
+    val message: String,
+    val timestamp_ms: Long,
+    val stack: String? = null,
+    val fatal: Boolean = false
+)
+
+data class CrashDeviceInfo(
+    val model: String? = null,
+    val manufacturer: String? = null,
+    val sdk: Int? = null
+)
+
+data class CrashEnvelope(
+    val session_id: String? = null,
+    val timestamp_ms: Long,
+    val app_version: String? = null,
+    val build: String? = null,
+    val platform: String? = "android",
+    val device: CrashDeviceInfo? = null,
+    val connection_status: String? = null,
+    val server_base_url: String? = null,
+    val last_export_rev: String? = null,
+    val loaded_export_rev: String? = null,
+    val last_revision_id: String? = null,
+    val client_stats: Map<String, @JvmSuppressWildcards Any> = emptyMap(),
+    val errors: List<CrashErrorItem> = emptyList()
+)
+
+
+data class SimpleStatusResponse(
+    val status: String
+)
+
+data class ClientErrorItem(
+    val timestamp_ms: Long,
+    val tag: String,
+    val message: String,
+    val stack: String? = null
+)
+
+data class ClientReproItem(
+    val timestamp_ms: Long,
+    val endpoint: String,
+    val http_code: Int? = null,
+    val body_snippet: String? = null,
+    val error_snippet: String? = null
+)
+
+data class ClientReportEnvelope(
+    val session_id: String? = null,
+    val timestamp_ms: Long,
+    val client_stats: Map<String, @JvmSuppressWildcards Any> = emptyMap(),
+    val last_export_rev: String? = null,
+    val queued_actions: Map<String, @JvmSuppressWildcards Any> = emptyMap(),
+    val last_errors: List<ClientErrorItem> = emptyList(),
+    val device: LogDeviceInfo? = null,
+    val trigger: String? = null,
+    val crash_marker: String? = null,
+    val repro_pack: List<ClientReproItem> = emptyList()
 )
