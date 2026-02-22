@@ -117,7 +117,7 @@ class ARSessionManager(
             val m = sceneView.javaClass.methods.firstOrNull {
                 it.name == "setLightEstimationMode" &&
                     it.parameterTypes.size == 1 &&
-                    it.parameterTypes[0].name == "com.google.ar.core.Config$LightEstimationMode"
+                    it.parameterTypes[0].name == "com.google.ar.core.Config\$LightEstimationMode"
             }
             if (m != null) {
                 m.invoke(sceneView, mode)
