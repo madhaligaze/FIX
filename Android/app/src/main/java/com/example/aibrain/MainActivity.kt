@@ -80,6 +80,8 @@ import com.example.aibrain.diagnostics.ReportSanitizer
 import com.example.aibrain.util.HeavyOps
 import com.example.aibrain.measurement.MeasurementType
 import com.example.aibrain.measurement.Measurement
+import com.example.aibrain.measurement.MeasurementStore
+import com.example.aibrain.measurement.TrackingQuality
 import com.example.aibrain.visualization.VoxelData
 import com.example.aibrain.visualization.VoxelVisualizer
 import kotlinx.coroutines.sync.Mutex
@@ -698,6 +700,21 @@ class MainActivity : AppCompatActivity() {
                 LightingSetup.setupLighting(sceneView, anchor)
                 lightingSetup = true
             }
+
+            if (::arRuler.isInitialized) {
+                val frame = sceneView.arFrame ?: return@addOnUpdateListener
+                val camera = frame.camera
+                val hits = frame.hitTest(sceneView.width / 2f, sceneView.height / 2f)
+                val hit = hits.firstOrNull { hr ->
+                    val t = hr.trackable
+                    when (t) {
+                        is Plane -> t.trackingState == TrackingState.TRACKING && t.isPoseInPolygon(hr.hitPose)
+                        is Point -> t.trackingState == TrackingState.TRACKING
+                        else -> false
+                    }
+                }
+                arRuler.updateCameraState(camera, hit)
+            }
         }
 
         // Обновление координат камеры в реальном времени
@@ -780,7 +797,10 @@ class MainActivity : AppCompatActivity() {
 
         // Callbacks
         arRuler.onMeasurementUpdate = { distance, label ->
-            updateRulerDisplay(distance, label)
+            runOnUiThread { updateRulerDisplay(distance, label) }
+        }
+        arRuler.onTrackingQuality = { quality ->
+            runOnUiThread { applyTrackingQualityToUI(quality) }
         }
 
         arRuler.onMeasurementComplete = { measurement ->
@@ -1540,20 +1560,45 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-            val success = arRuler.addMeasurementPoint(hit)
+            val quality = arRuler.evaluateQuality(camera, hit)
+            applyTrackingQualityToUI(quality)
+            if (!quality.canAddPoint) {
+                vibrate(80)
+                return
+            }
+
+            val success = arRuler.addMeasurementPoint(hit, quality.level)
 
             if (success) {
+                if (currentMeasurementType == MeasurementType.HEIGHT
+                    && arRuler.getPointCount() == 2
+                    && !arRuler.isHeightOrderCorrect()
+                ) {
+                    tvRulerInstruction.text =
+                        "Вторая точка ниже первой. Нажмите «Отмена» и выберите точку выше."
+                    arRuler.undoLastPoint()
+                    vibrate(120)
+                    return
+                }
+
                 vibrate(30)
 
                 val pointCount = arRuler.getPointCount()
                 tvRulerPointCount.text = "$pointCount"
 
                 val needFinish = when (currentMeasurementType) {
-                    MeasurementType.AREA -> pointCount >= 3
+                    MeasurementType.AREA -> false
                     else -> pointCount >= 2
                 }
+                val showAreaClose = currentMeasurementType == MeasurementType.AREA && pointCount >= 3
+
                 if (needFinish) {
                     btnRulerFinish.visibility = View.VISIBLE
+                    btnRulerMeasure.text = "+ ЕЩЁ"
+                }
+                if (showAreaClose) {
+                    btnRulerFinish.visibility = View.VISIBLE
+                    btnRulerFinish.text = "Замкнуть"
                     btnRulerMeasure.text = "+ ЕЩЁ"
                 }
             } else {
@@ -1574,54 +1619,73 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onRulerFinishClick() {
-        val measurement = arRuler.finishMeasurement()
+        val measurement = if (currentMeasurementType == MeasurementType.AREA) {
+            arRuler.closeAreaAndFinish()
+        } else {
+            arRuler.finishMeasurement()
+        }
 
         if (measurement != null) {
             showHint("✅ Измерение сохранено: ${measurement.label}")
 
-            tvDistanceValue.text = "0.00 m"
+            tvDistanceValue.text = "0.00 м"
             tvRulerPointCount.text = "0"
             btnRulerFinish.visibility = View.GONE
+            btnRulerFinish.text = "✓"
             btnRulerMeasure.text = "+ ТОЧКА"
 
             vibrate(50)
+            arRuler.startMeasurement(currentMeasurementType)
         }
     }
 
     private fun onRulerExportClick() {
         if (!::arRuler.isInitialized) return
         val json = arRuler.exportMeasurements()
-        if (json.isBlank()) {
+        if (json.isBlank() || json == "{}") {
             showToast(getString(R.string.toast_ruler_no_measurements))
             return
         }
 
-        val outFile = java.io.File(filesDir, "measurements_export_${System.currentTimeMillis()}.json")
-        var fileSaved = false
-        try {
-            outFile.writeText(json)
-            fileSaved = true
-        } catch (_: Exception) {
-            // ignore
-        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Экспорт измерений")
+            .setItems(arrayOf("Скопировать JSON", "Сохранить в файл", "Поделиться")) { _, which ->
+                when (which) {
+                    0 -> copyJsonToClipboard(json)
+                    1 -> saveJsonToFile(json)
+                    2 -> shareJson()
+                }
+            }
+            .show()
+    }
 
-        var copiedToClipboard = false
+    private fun copyJsonToClipboard(json: String) {
         try {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-            val clip = android.content.ClipData.newPlainText("measurements.json", json)
-            cm.setPrimaryClip(clip)
-            copiedToClipboard = true
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("measurements.json", json))
+            showToast("JSON скопирован в буфер")
         } catch (_: Exception) {
-            // ignore
+            showToast("Ошибка копирования")
         }
+    }
 
-        val message = when {
-            fileSaved && copiedToClipboard -> "JSON сохранен и скопирован в буфер"
-            fileSaved -> "JSON сохранен в файл"
-            copiedToClipboard -> "JSON скопирован в буфер"
-            else -> "Не удалось экспортировать JSON"
+    private fun saveJsonToFile(json: String) {
+        try {
+            val store = MeasurementStore(this)
+            val file = store.exportToFile()
+            showToast("Сохранено: ${file.name}")
+        } catch (_: Exception) {
+            showToast("Ошибка сохранения")
         }
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun shareJson() {
+        try {
+            val intent = arRuler.buildShareIntent() ?: return
+            startActivity(Intent.createChooser(intent, "Поделиться измерениями"))
+        } catch (_: Exception) {
+            showToast("Ошибка — нет приложения для share")
+        }
     }
 
     private fun setMeasurementMode(type: MeasurementType) {
@@ -1648,9 +1712,12 @@ class MainActivity : AppCompatActivity() {
         arRuler.startMeasurement(type)
 
         val instruction = when (type) {
-            MeasurementType.LINEAR -> "Нажмите на 2 точки для измерения расстояния"
-            MeasurementType.HEIGHT -> "Нажмите 2 точки: основание (пол) и высота"
-            MeasurementType.AREA -> "Нажмите точки по периметру для измерения площади"
+            MeasurementType.LINEAR ->
+                "Нажмите на поверхность — точка A. Нажмите снова — точка B. Нажмите ✓ для сохранения."
+            MeasurementType.HEIGHT ->
+                "Шаг 1: нажмите на пол (основание). Шаг 2: нажмите на верхнюю точку. Держите телефон вертикально."
+            MeasurementType.AREA ->
+                "Нажимайте точки по периметру (мин. 3). Когда контур готов — нажмите «Замкнуть»."
         }
 
         tvRulerInstruction.text = instruction
@@ -1671,48 +1738,28 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateRulerDisplay(distance: Float, label: String) {
         tvDistanceValue.text = label
+    }
 
-        val accuracy = getTrackingAccuracy()
-        updateAccuracyIndicator(accuracy)
+    private fun applyTrackingQualityToUI(quality: TrackingQuality.Result) {
+        val (dotColor, label) = when (quality.level) {
+            TrackingQuality.Level.HIGH -> Pair(0xFF00FF88.toInt(), "Точность: высокая")
+            TrackingQuality.Level.MEDIUM -> Pair(0xFFFFD700.toInt(), "Точность: средняя")
+            TrackingQuality.Level.LOW -> Pair(0xFFFF4444.toInt(), quality.hint)
+        }
+        try { accuracyDot.setBackgroundColor(dotColor) } catch (_: Exception) {}
+        try { tvAccuracy.text = label } catch (_: Exception) {}
+
+        if (rulerMode) {
+            btnRulerMeasure.isEnabled = quality.canAddPoint
+            btnRulerMeasure.alpha = if (quality.canAddPoint) 1f else 0.4f
+            if (!quality.canAddPoint) {
+                tvRulerInstruction.text = quality.hint
+            }
+        }
     }
 
     private fun onMeasurementSaved(measurement: Measurement) {
         Toast.makeText(this, "💾 Измерение: ${measurement.label}", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun getTrackingAccuracy(): Float {
-        try {
-            val frame = sceneView.arFrame ?: return 0.5f
-            val camera = frame.camera
-
-            return when (camera.trackingState) {
-                TrackingState.TRACKING -> 0.95f
-                TrackingState.PAUSED -> 0.6f
-                else -> 0.3f
-            }
-        } catch (e: Exception) {
-            return 0.5f
-        }
-    }
-
-    private fun updateAccuracyIndicator(accuracy: Float) {
-        when {
-            accuracy >= 0.9f -> {
-                accuracyDot.setBackgroundResource(R.drawable.ic_dot_green)
-                tvAccuracy.text = "Точность: высокая"
-                tvAccuracy.setTextColor(ContextCompat.getColor(this, R.color.green_primary))
-            }
-            accuracy >= 0.6f -> {
-                accuracyDot.setBackgroundResource(R.drawable.ic_dot_orange)
-                tvAccuracy.text = "Точность: средняя"
-                tvAccuracy.setTextColor(ContextCompat.getColor(this, R.color.orange_primary))
-            }
-            else -> {
-                accuracyDot.setBackgroundResource(R.drawable.ic_dot_red)
-                tvAccuracy.text = "Точность: низкая"
-                tvAccuracy.setTextColor(ContextCompat.getColor(this, R.color.red_primary))
-            }
-        }
     }
 
     private fun formatDistance(meters: Float): String {
