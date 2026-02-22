@@ -6,6 +6,7 @@ import android.util.Log
 import com.google.ar.core.Anchor
 import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
+import com.google.ar.core.LightEstimate
 import com.google.ar.core.Session
 import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.ArSceneView
@@ -80,15 +81,32 @@ class ARSessionManager(
             else -> Config.DepthMode.DISABLED
         }
 
+        // Sceneform 1.23.0 может падать с NoSuchMethodError на ENVIRONMENTAL_HDR из-за
+        // несовпадения сигнатуры LightEstimate.acquireEnvironmentalHdrCubeMap() в разных версиях ARCore.
+        // Самый надежный способ: включать HDR только если в текущем ARCore реально есть ожидаемый метод
+        // (именно с return type = com.google.ar.core.ArImage[]).
+        val canUseEnvironmentalHdr = try {
+            val m = LightEstimate::class.java.getMethod("acquireEnvironmentalHdrCubeMap")
+            val rt = m.returnType
+            rt.isArray && rt.componentType?.name == "com.google.ar.core.ArImage"
+        } catch (t: Throwable) {
+            false
+        }
+
         val config = Config(session).apply {
             focusMode = Config.FocusMode.AUTO
-            lightEstimationMode = selectSafeLightEstimationMode()
+            lightEstimationMode = if (canUseEnvironmentalHdr) {
+                Log.i(TAG, "LightEstimation: ENVIRONMENTAL_HDR enabled (compatible ARCore detected)")
+                Config.LightEstimationMode.ENVIRONMENTAL_HDR
+            } else {
+                // Радикально надежно: исключаем путь, который роняет приложение на старте.
+                Log.w(TAG, "LightEstimation: ENVIRONMENTAL_HDR disabled (incompatible ARCore). Using AMBIENT_INTENSITY")
+                Config.LightEstimationMode.AMBIENT_INTENSITY
+            }
             planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
             updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
             this.depthMode = this@ARSessionManager.depthMode
         }
-
-        Log.i(TAG, "LightEstimationMode=${config.lightEstimationMode} (depthMode=$depthMode)")
 
         try {
             session.configure(config)
