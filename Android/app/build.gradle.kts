@@ -53,14 +53,17 @@ android {
     }
 }
 
-dependencies {
-    val arCoreVersion = "1.52.0"
+// ВАЖНО: com.gorisse.thomas.sceneform вызывает Environmental HDR API
+// (LightEstimate.acquireEnvironmentalHdrCubeMap).
+// Если ARCore занижен/разъезжается по транзитивным зависимостям,
+// получаем NoSuchMethodError и падение на старте камеры.
+// Поэтому фиксируем одну (достаточно новую) версию ARCore для всего приложения.
+val arCoreVersion = "1.39.0"
+configurations.configureEach {
+    resolutionStrategy.force("com.google.ar:core:$arCoreVersion")
+}
 
-    configurations.all {
-        resolutionStrategy {
-            force("com.google.ar:core:$arCoreVersion")
-        }
-    }
+dependencies {
 
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
