@@ -28,10 +28,14 @@ class RuntimeState:
     anchors: dict[str, list[dict]] = field(default_factory=dict)
     traces: dict[str, list[dict]] = field(default_factory=dict)
     last_rev: dict[str, str] = field(default_factory=dict)
+    last_rev_meta: dict[str, dict] = field(default_factory=dict)
     restored_revision_state: dict[str, dict] = field(default_factory=dict)
 
     # STAGE A: monotonic timestamp tracking per session
     last_timestamp: dict[str, float] = field(default_factory=dict)
+
+    # Session-level counters for adaptive readiness heuristics.
+    session_stats: dict[str, dict] = field(default_factory=dict)
 
     perception_unavailable: bool = False
 

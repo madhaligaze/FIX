@@ -5,6 +5,7 @@ import android.animation.ValueAnimator
 import android.app.ActivityManager
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -39,8 +40,9 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.ar.core.ArCoreApk
-import com.google.ar.core.Config
 import com.google.ar.core.Plane
+import com.google.ar.core.Point
+import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
 import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.Node
@@ -62,7 +64,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
-import java.util.ArrayDeque
+import kotlin.collections.ArrayDeque
 import java.util.concurrent.TimeUnit
 import java.io.File
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -77,6 +79,10 @@ import com.example.aibrain.diagnostics.ReportSanitizer
 import com.example.aibrain.util.HeavyOps
 import com.example.aibrain.measurement.MeasurementType
 import com.example.aibrain.measurement.Measurement
+import com.example.aibrain.measurement.MeasurementStore
+import com.example.aibrain.measurement.TrackingQuality
+import com.example.aibrain.depth.DepthPolicy
+import com.example.aibrain.depth.ReadinessProfile
 import com.example.aibrain.visualization.VoxelData
 import com.example.aibrain.visualization.VoxelVisualizer
 import kotlinx.coroutines.sync.Mutex
@@ -130,13 +136,12 @@ class MainActivity : AppCompatActivity() {
         private const val RECONNECT_MAX_MS = 30_000L
         private const val STREAM_INTERVAL_MS = 1_000L
         private const val AUTO_RELOAD_COOLDOWN_MS: Long = 12_000L
-        private const val MIN_POINTS_FOR_MODEL = 2
         private const val MAX_POINTS = 20
+        private const val MAX_SUPPORTS = 3
         private const val PREFS_NAME = "app_settings"
         private const val PREF_SERVER_BASE_URL = "server_base_url"
         private const val KEY_SESSION_HISTORY = "session_history_json"
         private const val PREF_CAMERA_SWAP_UV = "camera_swap_uv"
-        private const val DEPTH_SEND_EVERY = 5
         private const val VOXEL_AUTO_REFRESH_MS = 30_000L
         private const val MIN_RELEASE_API_LEVEL = Build.VERSION_CODES.Q
         private const val MIN_RELEASE_RAM_GB = 6.0
@@ -164,10 +169,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvReadiness: TextView
     private lateinit var tvReadinessDetail: TextView
     private lateinit var tvAiCritique: TextView
+    private lateinit var tvScanCoach: TextView
 
     // Основные кнопки
     private lateinit var btnStart: Button
     private lateinit var btnAddPoint: Button
+    private lateinit var btnAddWaypoint: Button
     private lateinit var btnScan: Button
     private lateinit var btn3DModel: Button
     private lateinit var btnAnalyze: Button
@@ -188,6 +195,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var voxelLegend: LinearLayout
     private var tvFieldDiag: TextView? = null
 
+    private lateinit var viewGridOverlay: View
+    private lateinit var smartReticle: SmartReticleView
+
+    // Scan-mode animation targets
+    private lateinit var llHudMetrics: LinearLayout
+    private lateinit var llCoordsPanel: LinearLayout
+    private lateinit var llStatusPanel: LinearLayout
+    private lateinit var undoRedoPanel: LinearLayout
+
     // Панели
     private lateinit var controlPanel: LinearLayout
     private lateinit var variantPanel: LinearLayout
@@ -204,6 +220,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var switchGrid: SwitchCompat
     private lateinit var switchSnap: SwitchCompat
     private lateinit var btnUnitsToggle: Button
+    private lateinit var btnRulerExport: Button
     private lateinit var tvRulerInstruction: TextView
     private lateinit var accuracyDot: View
     private lateinit var tvAccuracy: TextView
@@ -302,12 +319,16 @@ class MainActivity : AppCompatActivity() {
     private var streamSendJob: Job? = null
     private var isArSceneReady = false
     private var isRulerReady = false
-    private var depthUnavailableStreak = 0
-    private var depthHintShown = false
+    private var arResumed: Boolean = false
+
+    private lateinit var messageCenter: MessageCenter
+
+    // ── Depth ─────────────────────────────────────────────────────────────
+    private var depthPolicy: DepthPolicy? = null
+    private var depthPrevStrategy: DepthPolicy.Strategy? = null
+    private var depthStartHintShown = false
+    private var lastReadinessProfile: String? = null
     private var arcoreHintShown = false
-    private var depthFrameCounter = 0
-    private var depthUnavailableWarned: Boolean = false
-    private var lastDepthWarningMs: Long = 0L
     private var currentScanHints: List<String> = emptyList()
     private var scanHintsVisible = false
     private var autoVoxelRefreshJob: Job? = null
@@ -389,6 +410,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         initViews()
+        messageCenter = MessageCenter(this, tvAiHint, hintQueue, hintHistory)
         setupClickListeners()
 
         // Release-device gate should never hard-block dev/testing.
@@ -414,13 +436,13 @@ class MainActivity : AppCompatActivity() {
                     Log.d("ModelAssets", "✅ Все модели загружены успешно")
                 } else {
                     Log.w("ModelAssets", "⚠️ 3D модели не найдены в assets/. Используется упрощенный режим.")
-                    showError("3D модели не найдены. Используется упрощенный режим.")
+                    messageCenter.post(getString(R.string.hint_assets_missing), MessageCenter.Level.INFO, MessageCenter.Source.ASSETS)
                 }
             }
             result.onFailure { error ->
                 hideLoadingDialog()
                 Log.e("ModelAssets", "❌ Ошибка загрузки моделей: ${error.message}")
-                showError("Не удалось загрузить 3D модели. Используется упрощенный режим.")
+                messageCenter.post(getString(R.string.hint_assets_load_fail), MessageCenter.Level.INFO, MessageCenter.Source.ASSETS)
             }
         }
         viewModel = StructureViewModel(api)
@@ -463,9 +485,9 @@ class MainActivity : AppCompatActivity() {
 
         startHealthLoop()
         viewModel.setConnectionState(ConnectionStatus.UNKNOWN, "")
-        maybeShowTutorial()
-
         transitionTo(AppState.IDLE)
+        tutorialOverlay = TutorialOverlay(this, tutorialPrefs) { tutorialOverlay?.dismiss() }
+        tutorialOverlay?.showIfNeeded()
 
         // Start hint ticker after views are ready
         startHintTicker()
@@ -493,10 +515,12 @@ class MainActivity : AppCompatActivity() {
         tvReadiness = findViewById(R.id.tv_readiness)
         tvReadinessDetail = findViewById(R.id.tv_readiness_detail)
         tvAiCritique = findViewById(R.id.tv_ai_critique)
+        tvScanCoach = findViewById(R.id.tv_scan_coach)
 
         // Основные кнопки
         btnStart = findViewById(R.id.btn_start)
         btnAddPoint = findViewById(R.id.btn_add_point)
+        btnAddWaypoint = findViewById(R.id.btn_add_waypoint)
         btnScan = findViewById(R.id.btn_scan)
         btn3DModel = findViewById(R.id.btn_3d_model)
         btnAnalyze = findViewById(R.id.btn_analyze)
@@ -520,6 +544,12 @@ class MainActivity : AppCompatActivity() {
         if (fieldDiagId != 0) tvFieldDiag = findViewById(fieldDiagId)
         fabEyeOfAI = findViewById(R.id.fab_eye_of_ai)
         voxelLegend = findViewById(R.id.voxel_legend)
+        viewGridOverlay = findViewById(R.id.view_grid_overlay)
+        smartReticle = findViewById(R.id.smart_reticle)
+        llHudMetrics = findViewById(R.id.ll_hud_metrics)
+        llCoordsPanel = findViewById(R.id.ll_coords_panel)
+        llStatusPanel = findViewById(R.id.ll_status_panel)
+        undoRedoPanel = findViewById(R.id.undo_redo_panel)
 
         // Панели
         controlPanel = findViewById(R.id.control_panel)
@@ -540,6 +570,7 @@ class MainActivity : AppCompatActivity() {
         switchGrid = findViewById(R.id.switch_grid)
         switchSnap = findViewById(R.id.switch_snap)
         btnUnitsToggle = findViewById(R.id.btn_units_toggle)
+        btnRulerExport = findViewById(R.id.btn_ruler_export)
         tvRulerInstruction = findViewById(R.id.tv_ruler_instruction)
         accuracyDot = findViewById(R.id.accuracy_dot)
         tvAccuracy = findViewById(R.id.tv_accuracy)
@@ -552,7 +583,7 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
             if (!arcoreHintShown) {
                 arcoreHintShown = true
-                showError("AR требует Android 9 (API 28)+. На этом устройстве AR отключен.")
+                startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, ArNotSupportedActivity.REASON_API_TOO_LOW))
             }
             return false
         }
@@ -564,7 +595,7 @@ class MainActivity : AppCompatActivity() {
             Log.e("MainActivity", "ARCore availability check failed: ${t.message}", t)
             if (!arcoreHintShown) {
                 arcoreHintShown = true
-                showError("ARCore недоступен. Проверьте Google Play Services for AR.")
+                startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, ArNotSupportedActivity.REASON_NOT_INSTALLED))
             }
             return false
         }
@@ -578,7 +609,7 @@ class MainActivity : AppCompatActivity() {
         if (!availability.isSupported) {
             if (!arcoreHintShown) {
                 arcoreHintShown = true
-                showError("ARCore не поддерживается на этом устройстве.")
+                startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, ArNotSupportedActivity.REASON_NOT_SUPPORTED))
             }
             return false
         }
@@ -598,7 +629,7 @@ class MainActivity : AppCompatActivity() {
             Log.e("MainActivity", "ARCore install/request failed: ${t.message}", t)
             if (!arcoreHintShown) {
                 arcoreHintShown = true
-                showError("ARCore не установлен/недоступен. Установите Google Play Services for AR.")
+                startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, ArNotSupportedActivity.REASON_NOT_INSTALLED))
             }
             return false
         }
@@ -626,16 +657,21 @@ class MainActivity : AppCompatActivity() {
         }
         val sessionOk = arManager.setupSession()
         if (!sessionOk) {
-            if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.P) {
-                showError("AR требует Android 9+ (API 28+). На вашем устройстве Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}).")
-            } else {
-                showError("ARCore сессия не запустилась. Убедитесь что ARCore обновлён и камера доступна.")
-            }
+            val reason = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) ArNotSupportedActivity.REASON_API_TOO_LOW else ArNotSupportedActivity.REASON_SESSION_FAIL
+            startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, reason))
             return false
         }
-        if (arManager.depthMode == Config.DepthMode.DISABLED && !depthHintShown) {
-            depthHintShown = true
-            showHint("ℹ️ Устройство не поддерживает Depth API — depth-данные недоступны")
+        depthPolicy = DepthPolicy(arManager.depthMode).also { it.onSessionStart() }
+        depthPrevStrategy = null
+        messageCenter.resetSource(MessageCenter.Source.DEPTH)
+        messageCenter.resetSource(MessageCenter.Source.AR)
+
+        Log.i("Depth", "Session start: ${depthPolicy?.toMap()}")
+
+        val dp = depthPolicy!!
+        if (!dp.supported && !depthStartHintShown) {
+            depthStartHintShown = true
+            messageCenter.post(getString(R.string.hint_depth_not_supported), MessageCenter.Level.INFO, MessageCenter.Source.DEPTH)
         }
 
 
@@ -652,6 +688,62 @@ class MainActivity : AppCompatActivity() {
                 LightingSetup.setupLighting(sceneView, anchor)
                 lightingSetup = true
             }
+
+            val frame = sceneView.arFrame ?: return@addOnUpdateListener
+            val camera = frame.camera
+
+            val centerHits = frame.hitTest(sceneView.width / 2f, sceneView.height / 2f)
+            val planeHit = centerHits.firstOrNull { hr ->
+                val t = hr.trackable
+                t is Plane && t.trackingState == TrackingState.TRACKING && t.isPoseInPolygon(hr.hitPose)
+            }
+            val pointHit = centerHits.firstOrNull { hr ->
+                val t = hr.trackable
+                t is Point && t.trackingState == TrackingState.TRACKING
+            }
+            val bestHit = planeHit ?: pointHit
+
+            if (::smartReticle.isInitialized) {
+                val reticleState: SmartReticleView.State
+                val label: String
+                val planeType: SmartReticleView.PlaneType
+
+                if (camera.trackingState != TrackingState.TRACKING) {
+                    reticleState = SmartReticleView.State.SEARCHING
+                    label = "ПОИСК..."
+                    planeType = SmartReticleView.PlaneType.UNKNOWN
+                } else if (planeHit != null) {
+                    val plane = planeHit.trackable as Plane
+                    planeType = when (plane.type) {
+                        Plane.Type.HORIZONTAL_UPWARD_FACING,
+                        Plane.Type.HORIZONTAL_DOWNWARD_FACING -> SmartReticleView.PlaneType.FLOOR
+                        Plane.Type.VERTICAL -> SmartReticleView.PlaneType.WALL
+                        else -> SmartReticleView.PlaneType.UNKNOWN
+                    }
+                    label = when (planeType) {
+                        SmartReticleView.PlaneType.FLOOR -> "ПОЛ"
+                        SmartReticleView.PlaneType.WALL -> "СТЕНА"
+                        else -> "ПЛОСКОСТЬ"
+                    }
+                    reticleState = SmartReticleView.State.READY_PLANE
+                } else if (pointHit != null) {
+                    reticleState = SmartReticleView.State.READY_POINT
+                    label = "FEATURE"
+                    planeType = SmartReticleView.PlaneType.UNKNOWN
+                } else {
+                    reticleState = SmartReticleView.State.NO_SURFACE
+                    label = "НЕТ ПОВЕРХНОСТИ"
+                    planeType = SmartReticleView.PlaneType.UNKNOWN
+                }
+
+                runOnUiThread {
+                    smartReticle.updateState(reticleState, label, planeType)
+                }
+            }
+
+            if (::arRuler.isInitialized) {
+                arRuler.updateCameraState(camera, bestHit)
+            }
         }
 
         // Обновление координат камеры в реальном времени
@@ -665,9 +757,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupClickListeners() {
+        btnStart.contentDescription = getString(R.string.btn_start_desc)
+        btnAddPoint.contentDescription = getString(R.string.btn_support_desc)
+        btnAddWaypoint.contentDescription = getString(R.string.btn_waypoint_desc)
+        btnScan.contentDescription = getString(R.string.btn_scan_desc)
+        btn3DModel.contentDescription = getString(R.string.btn_model_desc)
+        btnAnalyze.contentDescription = getString(R.string.btn_analyze_desc)
+        btnRulerMode.contentDescription = getString(R.string.btn_ruler_desc)
+
         // Основные действия
         btnStart.setOnClickListener { onStartClicked() }
-        btnAddPoint.setOnClickListener { onAddPointClicked() }
+        smartReticle.setOnClickListener { onReticleTapped() }
+        btnAddPoint.setOnClickListener { onAddSupportClicked() }
+        btnAddWaypoint.setOnClickListener { onAddWaypointClicked() }
         btnAddPoint.setOnLongClickListener {
             if (originAnchorNode == null) {
                 showHint("ℹ️ Origin ещё не задан. Долгое нажатие работает после установки первой опоры")
@@ -698,6 +800,14 @@ class MainActivity : AppCompatActivity() {
         btnRulerUndo.setOnClickListener { onRulerUndoClick() }
         btnRulerFinish.setOnClickListener { onRulerFinishClick() }
         btnUnitsToggle.setOnClickListener { toggleUnits() }
+        btnRulerExport.setOnClickListener { onRulerExportClick() }
+        switchGrid.setOnCheckedChangeListener { _, isChecked ->
+            viewGridOverlay.visibility = if (isChecked) View.VISIBLE else View.GONE
+            if (::arRuler.isInitialized) arRuler.setGridEnabled(isChecked)
+        }
+        switchSnap.setOnCheckedChangeListener { _, isChecked ->
+            if (::arRuler.isInitialized) arRuler.setSnapEnabled(isChecked)
+        }
 
         // Ruler mode buttons
         findViewById<Button>(R.id.btn_mode_linear).setOnClickListener {
@@ -717,7 +827,10 @@ class MainActivity : AppCompatActivity() {
 
         // Callbacks
         arRuler.onMeasurementUpdate = { distance, label ->
-            updateRulerDisplay(distance, label)
+            runOnUiThread { updateRulerDisplay(distance, label) }
+        }
+        arRuler.onTrackingQuality = { quality ->
+            runOnUiThread { applyTrackingQualityToUI(quality) }
         }
 
         arRuler.onMeasurementComplete = { measurement ->
@@ -726,6 +839,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        stopReadinessPolling()
         super.onDestroy()
         stopStreaming()
         stopHealthLoop()
@@ -778,7 +892,36 @@ class MainActivity : AppCompatActivity() {
         scope.launch { doStartSession() }
     }
 
-    private fun onAddPointClicked() {
+
+    /**
+     * Умное размещение якоря по нажатию на прицел.
+     * Если опор ещё нет — ставит опору (support), иначе — точку (point).
+     * Работает только в состоянии SCANNING.
+     */
+    private fun onReticleTapped() {
+        if (appState != AppState.SCANNING) {
+            if (appState == AppState.IDLE) {
+                showHint("ℹ️ Нажмите СТАРТ чтобы начать сканирование")
+            }
+            return
+        }
+        val currentState = smartReticle.state
+        if (currentState == SmartReticleView.State.SEARCHING) {
+            showHint("⏳ Подождите — AR ищет поверхности")
+            return
+        }
+        if (currentState == SmartReticleView.State.NO_SURFACE) {
+            showHint("⚠️ Наведите прицел на поверхность (пол, стену)")
+            vibrate(80)
+            return
+        }
+
+        val supportCount = userMarkers.count { it.kind == "support" }
+        val kind = if (supportCount < MAX_SUPPORTS) "support" else "point"
+        placeAnchor(kind = kind)
+    }
+
+    private fun onAddSupportClicked() {
         if (appState != AppState.SCANNING) return
 
         if (userMarkers.size >= MAX_POINTS) {
@@ -786,7 +929,36 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        placeAnchor()
+        val supportCount = userMarkers.count { it.kind == "support" }
+        if (supportCount >= MAX_SUPPORTS) {
+            showHint("⚠️ Достигнут максимум опор: $MAX_SUPPORTS — используй ТОЧКА для доп. меток")
+            return
+        }
+
+        if (supportCount == 0) {
+            showHint(
+                "📍 Опора поставлена. Теперь обойди её полукругом (~180°) с камерой, " +
+                        "держа на расстоянии 0.5-2 м. Это даст OBS и VDIV для AI."
+            )
+        }
+
+        placeAnchor(kind = "support")
+    }
+
+    private fun onAddWaypointClicked() {
+        if (appState != AppState.SCANNING) return
+
+        if (userMarkers.size >= MAX_POINTS) {
+            showHint("⚠️ Достигнут максимум точек: $MAX_POINTS")
+            return
+        }
+
+        if (userMarkers.none { it.kind == "support" }) {
+            showHint("ℹ️ Сначала поставь хотя бы 1 ОПОРУ — точки без опоры не дают AI якоря")
+            return
+        }
+
+        placeAnchor(kind = "point")
     }
 
     private fun onScanClicked() {
@@ -820,8 +992,9 @@ class MainActivity : AppCompatActivity() {
     private fun onAnalyzeClicked() {
         if (appState != AppState.SCANNING) return
 
-        if (userMarkers.size < MIN_POINTS_FOR_MODEL) {
-            showHint("📍 Требуется минимум $MIN_POINTS_FOR_MODEL точки. Сейчас: ${userMarkers.size}")
+        val supportCount = userMarkers.count { it.kind == "support" }
+        if (supportCount < 1) {
+            showHint("📍 Сначала добавьте хотя бы одну опору")
             vibrate()
             return
         }
@@ -860,8 +1033,8 @@ class MainActivity : AppCompatActivity() {
 
         visualizeScaffoldVariant(selectedVariantIndex)
 
-        val option = current3DModel?.options?.get(index)
-        if (option != null) {
+        val option = current3DModel?.options?.getOrNull(index) ?: return
+        run {
             showHint("✓ Вариант ${index + 1}: ${option.variant_name} | Надёжность: ${option.safety_score}%")
             val critique = option.ai_critique?.joinToString("\n")?.trim().orEmpty()
             if (critique.isNotBlank()) {
@@ -889,9 +1062,10 @@ class MainActivity : AppCompatActivity() {
     private fun onAcceptClicked() {
         if (appState != AppState.SELECTING) return
 
-        val option = current3DModel?.options?.get(selectedVariantIndex)
+        val option = current3DModel?.options?.getOrNull(selectedVariantIndex)
         if (option == null) {
-            showHint("⚠️ Не выбран вариант")
+            showHint("⚠️ Вариант не выбран или список пуст")
+            transitionTo(AppState.SCANNING)
             return
         }
 
@@ -1351,7 +1525,7 @@ class MainActivity : AppCompatActivity() {
         val anchors = userMarkers.map { marker ->
             AnchorPointRequest(
                 id = marker.id,
-                kind = "support",
+                kind = marker.kind,
                 position = listOf(marker.x, marker.y, marker.z),
                 confidence = 1.0f
             )
@@ -1388,6 +1562,8 @@ class MainActivity : AppCompatActivity() {
             rulerOverlay.visibility = View.VISIBLE
             controlPanel.visibility = View.GONE
 
+            viewGridOverlay.visibility = if (switchGrid.isChecked) View.VISIBLE else View.GONE
+
             arRuler.startMeasurement(currentMeasurementType)
 
             showHint("📏 Режим измерения активен")
@@ -1396,6 +1572,7 @@ class MainActivity : AppCompatActivity() {
             // Выключение режима рулетки
             rulerOverlay.visibility = View.GONE
             controlPanel.visibility = View.VISIBLE
+            viewGridOverlay.visibility = View.VISIBLE
 
             showHint("📡 Режим сканирования")
             updateModeStatus("СКАНИРОВАНИЕ")
@@ -1406,56 +1583,167 @@ class MainActivity : AppCompatActivity() {
         if (!rulerMode) return
 
         try {
-            val frame = sceneView.arFrame ?: return
+            val frame = sceneView.arFrame ?: run {
+            messageCenter.post(getString(R.string.hint_ar_frame_unavailable), MessageCenter.Level.WARN, MessageCenter.Source.AR)
+            return
+        }
+            val camera = frame.camera
+            if (camera.trackingState != TrackingState.TRACKING) {
+                val reason = try { camera.trackingFailureReason } catch (_: Exception) { null }
+                val msg = when (reason) {
+                    TrackingFailureReason.BAD_STATE -> "Трекинг: сбой состояния (перезапустите AR)"
+                    TrackingFailureReason.INSUFFICIENT_LIGHT -> "Трекинг: мало света"
+                    TrackingFailureReason.EXCESSIVE_MOTION -> "Трекинг: слишком быстрое движение"
+                    TrackingFailureReason.INSUFFICIENT_FEATURES -> "Трекинг: мало деталей (наведите на текстуры)"
+                    TrackingFailureReason.CAMERA_UNAVAILABLE -> "Трекинг: камера недоступна"
+                    else -> "Трекинг не готов - подождите"
+                }
+                tvRulerInstruction.text = msg
+                vibrate(60)
+                return
+            }
 
-            val hits = frame.hitTest(
-                sceneView.width / 2f,
-                sceneView.height / 2f
-            )
+            val hits = frame.hitTest(sceneView.width / 2f, sceneView.height / 2f)
+            val hit = hits.firstOrNull { hr ->
+                val t = hr.trackable
+                when (t) {
+                    is Plane -> t.trackingState == TrackingState.TRACKING && t.isPoseInPolygon(hr.hitPose)
+                    is Point -> t.trackingState == TrackingState.TRACKING
+                    else -> false
+                }
+            }
 
-            val hit = hits.firstOrNull { it.trackable is Plane } ?: return
+            if (hit == null) {
+                tvRulerInstruction.text = "Не найдено место - наведите на поверхность/детали"
+                vibrate(60)
+                return
+            }
 
-            val success = arRuler.addMeasurementPoint(hit)
+            val quality = arRuler.evaluateQuality(camera, hit)
+            applyTrackingQualityToUI(quality)
+            if (!quality.canAddPoint) {
+                vibrate(80)
+                return
+            }
+
+            val success = arRuler.addMeasurementPoint(hit, quality.level)
 
             if (success) {
+                if (currentMeasurementType == MeasurementType.HEIGHT
+                    && arRuler.getPointCount() == 2
+                    && !arRuler.isHeightOrderCorrect()
+                ) {
+                    tvRulerInstruction.text =
+                        "Вторая точка ниже первой. Нажмите «Отмена» и выберите точку выше."
+                    arRuler.undoLastPoint()
+                    vibrate(120)
+                    return
+                }
+
                 vibrate(30)
 
                 val pointCount = arRuler.getPointCount()
                 tvRulerPointCount.text = "$pointCount"
 
-                if (pointCount >= 2) {
+                val needFinish = when (currentMeasurementType) {
+                    MeasurementType.AREA -> false
+                    else -> pointCount >= 2
+                }
+                val showAreaClose = currentMeasurementType == MeasurementType.AREA && pointCount >= 3
+
+                if (needFinish) {
                     btnRulerFinish.visibility = View.VISIBLE
                     btnRulerMeasure.text = "+ ЕЩЁ"
                 }
+                if (showAreaClose) {
+                    btnRulerFinish.visibility = View.VISIBLE
+                    btnRulerFinish.text = "Замкнуть"
+                    btnRulerMeasure.text = "+ ЕЩЁ"
+                }
             } else {
-                Toast.makeText(this, "❌ Не удалось установить точку", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Не удалось установить точку", Toast.LENGTH_SHORT).show()
                 vibrate(100)
             }
 
         } catch (e: Exception) {
-            showHint("⚠️ Ошибка: ${e.message}")
+            showHint("Ошибка: ${e.message}")
         }
     }
 
     private fun onRulerUndoClick() {
         arRuler.undoLastPoint()
 
-        val distance = arRuler.getCurrentDistance()
-        updateRulerDisplay(distance, formatDistance(distance))
+        val value = arRuler.getCurrentValue()
+        updateRulerDisplay(value, arRuler.getCurrentLabel())
     }
 
     private fun onRulerFinishClick() {
-        val measurement = arRuler.finishMeasurement()
+        val measurement = if (currentMeasurementType == MeasurementType.AREA) {
+            arRuler.closeAreaAndFinish()
+        } else {
+            arRuler.finishMeasurement()
+        }
 
         if (measurement != null) {
             showHint("✅ Измерение сохранено: ${measurement.label}")
 
-            tvDistanceValue.text = "0.00 m"
+            tvDistanceValue.text = "0.00 м"
             tvRulerPointCount.text = "0"
             btnRulerFinish.visibility = View.GONE
+            btnRulerFinish.text = "✓"
             btnRulerMeasure.text = "+ ТОЧКА"
 
             vibrate(50)
+            arRuler.startMeasurement(currentMeasurementType)
+        }
+    }
+
+    private fun onRulerExportClick() {
+        if (!::arRuler.isInitialized) return
+        val json = arRuler.exportMeasurements()
+        if (json.isBlank() || json == "{}") {
+            showToast(getString(R.string.toast_ruler_no_measurements))
+            return
+        }
+
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Экспорт измерений")
+            .setItems(arrayOf("Скопировать JSON", "Сохранить в файл", "Поделиться")) { _, which ->
+                when (which) {
+                    0 -> copyJsonToClipboard(json)
+                    1 -> saveJsonToFile(json)
+                    2 -> shareJson()
+                }
+            }
+            .show()
+    }
+
+    private fun copyJsonToClipboard(json: String) {
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("measurements.json", json))
+            showToast("JSON скопирован в буфер")
+        } catch (_: Exception) {
+            showToast("Ошибка копирования")
+        }
+    }
+
+    private fun saveJsonToFile(json: String) {
+        try {
+            val store = MeasurementStore(this)
+            val file = store.exportToFile()
+            showToast("Сохранено: ${file.name}")
+        } catch (_: Exception) {
+            showToast("Ошибка сохранения")
+        }
+    }
+
+    private fun shareJson() {
+        try {
+            val intent = arRuler.buildShareIntent() ?: return
+            startActivity(Intent.createChooser(intent, "Поделиться измерениями"))
+        } catch (_: Exception) {
+            showToast("Ошибка — нет приложения для share")
         }
     }
 
@@ -1475,7 +1763,6 @@ class MainActivity : AppCompatActivity() {
             MeasurementType.LINEAR -> btnLinear
             MeasurementType.HEIGHT -> btnHeight
             MeasurementType.AREA -> btnArea
-            else -> btnLinear
         }
 
         activeBtn.setBackgroundResource(R.drawable.btn_mode_active)
@@ -1484,10 +1771,12 @@ class MainActivity : AppCompatActivity() {
         arRuler.startMeasurement(type)
 
         val instruction = when (type) {
-            MeasurementType.LINEAR -> "Нажмите на 2 точки для измерения расстояния"
-            MeasurementType.HEIGHT -> "Нажмите на точку для измерения высоты от пола"
-            MeasurementType.AREA -> "Нажмите точки по периметру для измерения площади"
-            else -> "Выберите режим измерения"
+            MeasurementType.LINEAR ->
+                "Нажмите на поверхность — точка A. Нажмите снова — точка B. Нажмите ✓ для сохранения."
+            MeasurementType.HEIGHT ->
+                "Шаг 1: нажмите на пол (основание). Шаг 2: нажмите на верхнюю точку. Держите телефон вертикально."
+            MeasurementType.AREA ->
+                "Нажимайте точки по периметру (мин. 3). Когда контур готов — нажмите «Замкнуть»."
         }
 
         tvRulerInstruction.text = instruction
@@ -1502,54 +1791,34 @@ class MainActivity : AppCompatActivity() {
 
         btnUnitsToggle.text = if (arRuler.units == ARRuler.Units.METRIC) "м" else "ft"
 
-        val distance = arRuler.getCurrentDistance()
-        updateRulerDisplay(distance, formatDistance(distance))
+        val value = arRuler.getCurrentValue()
+        updateRulerDisplay(value, arRuler.getCurrentLabel())
     }
 
     private fun updateRulerDisplay(distance: Float, label: String) {
         tvDistanceValue.text = label
+    }
 
-        val accuracy = getTrackingAccuracy()
-        updateAccuracyIndicator(accuracy)
+    private fun applyTrackingQualityToUI(quality: TrackingQuality.Result) {
+        val (dotColor, label) = when (quality.level) {
+            TrackingQuality.Level.HIGH -> Pair(0xFF00FF88.toInt(), "Точность: высокая")
+            TrackingQuality.Level.MEDIUM -> Pair(0xFFFFD700.toInt(), "Точность: средняя")
+            TrackingQuality.Level.LOW -> Pair(0xFFFF4444.toInt(), quality.hint)
+        }
+        try { accuracyDot.setBackgroundColor(dotColor) } catch (_: Exception) {}
+        try { tvAccuracy.text = label } catch (_: Exception) {}
+
+        if (rulerMode) {
+            btnRulerMeasure.isEnabled = quality.canAddPoint
+            btnRulerMeasure.alpha = if (quality.canAddPoint) 1f else 0.4f
+            if (!quality.canAddPoint) {
+                tvRulerInstruction.text = quality.hint
+            }
+        }
     }
 
     private fun onMeasurementSaved(measurement: Measurement) {
         Toast.makeText(this, "💾 Измерение: ${measurement.label}", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun getTrackingAccuracy(): Float {
-        try {
-            val frame = sceneView.arFrame ?: return 0.5f
-            val camera = frame.camera
-
-            return when (camera.trackingState) {
-                TrackingState.TRACKING -> 0.95f
-                TrackingState.PAUSED -> 0.6f
-                else -> 0.3f
-            }
-        } catch (e: Exception) {
-            return 0.5f
-        }
-    }
-
-    private fun updateAccuracyIndicator(accuracy: Float) {
-        when {
-            accuracy >= 0.9f -> {
-                accuracyDot.setBackgroundResource(R.drawable.ic_dot_green)
-                tvAccuracy.text = "Точность: высокая"
-                tvAccuracy.setTextColor(ContextCompat.getColor(this, R.color.green_primary))
-            }
-            accuracy >= 0.6f -> {
-                accuracyDot.setBackgroundResource(R.drawable.ic_dot_orange)
-                tvAccuracy.text = "Точность: средняя"
-                tvAccuracy.setTextColor(ContextCompat.getColor(this, R.color.orange_primary))
-            }
-            else -> {
-                accuracyDot.setBackgroundResource(R.drawable.ic_dot_red)
-                tvAccuracy.text = "Точность: низкая"
-                tvAccuracy.setTextColor(ContextCompat.getColor(this, R.color.red_primary))
-            }
-        }
     }
 
     private fun formatDistance(meters: Float): String {
@@ -1580,48 +1849,57 @@ class MainActivity : AppCompatActivity() {
         when (state) {
             AppState.IDLE -> {
                 showControls(btnStart)
-                hideControls(btnAddPoint, btnScan, btn3DModel, btnAnalyze)
+                hideControls(btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
                 variantPanel.visibility = View.GONE
                 btnRulerMode.visibility = View.GONE
+                undoRedoPanel.visibility = View.GONE
+                setHudScanMode(false)
 
-                showHint("👁️ Наведите камеру на конструкцию")
-                updateModeStatus("ОЖИДАНИЕ")
+                messageCenter.setHud(getString(R.string.state_idle))
+                updateModeStatus(getString(R.string.state_idle).uppercase())
                 stopBlinkAnimation(tvAiHint)
             }
 
             AppState.CONNECTING -> {
                 hideAllControls()
-                showHint("⏳ Подключение к AI Brain...")
+                undoRedoPanel.visibility = View.GONE
+                setHudScanMode(false)
+                messageCenter.setHud(getString(R.string.state_connecting))
                 updateModeStatus("ПОДКЛЮЧЕНИЕ")
                 startBlinkAnimation(tvAiHint)
             }
 
             AppState.SCANNING -> {
                 hideControls(btnStart)
-                showControls(btnAddPoint, btnScan, btn3DModel, btnAnalyze)
+                showControls(btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
                 btnRulerMode.visibility = View.VISIBLE
                 variantPanel.visibility = View.GONE
+                undoRedoPanel.visibility = View.VISIBLE
+                setHudScanMode(true)
 
-                btnAnalyze.isEnabled = userMarkers.size >= MIN_POINTS_FOR_MODEL
+                btnAnalyze.isEnabled = userMarkers.count { it.kind == "support" } >= 1
 
-                showHint("📡 Система активна | Точек: ${userMarkers.size}")
+                messageCenter.setHud(getString(R.string.state_scanning, userMarkers.count { it.kind == "support" }))
                 updateModeStatus("СКАНИРОВАНИЕ")
                 stopBlinkAnimation(tvAiHint)
             }
 
             AppState.MODELING -> {
                 hideAllControls()
-                showHint("🧠 AI анализирует структуру...")
+                undoRedoPanel.visibility = View.GONE
+                setHudScanMode(false)
+                messageCenter.setHud(getString(R.string.state_modeling))
                 updateModeStatus("МОДЕЛИРОВАНИЕ")
                 startBlinkAnimation(tvAiHint)
             }
 
             AppState.PREVIEW_3D -> {
-                showControls(btnAddPoint, btnAnalyze)
+                showControls(btnAddPoint, btnAddWaypoint, btnAnalyze)
                 hideControls(btnStart, btnScan)
                 variantPanel.visibility = View.GONE
+                if (::smartReticle.isInitialized) smartReticle.visibility = View.VISIBLE
 
-                showHint("🌐 3D модель отображена")
+                messageCenter.setHud(getString(R.string.state_preview))
                 updateModeStatus("ПРЕВЬЮ")
             }
 
@@ -1629,16 +1907,18 @@ class MainActivity : AppCompatActivity() {
                 hideAllControls()
                 variantPanel.visibility = View.VISIBLE
 
-                showHint("🎯 Выберите вариант лесов")
-                updateModeStatus("ВЫБОР ВАРИАНТА")
+                messageCenter.setHud(getString(R.string.state_selecting))
+                updateModeStatus("ВЫБОР")
                 stopBlinkAnimation(tvAiHint)
             }
 
             AppState.RESULTS -> {
                 showControls(btnStart)
                 btnStart.text = "ЗАНОВО"
-                hideControls(btnAddPoint, btnScan, btn3DModel, btnAnalyze)
+                hideControls(btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
                 variantPanel.visibility = View.GONE
+                undoRedoPanel.visibility = View.GONE
+                setHudScanMode(false)
 
                 updateModeStatus("ЗАВЕРШЕНО")
                 stopBlinkAnimation(tvAiHint)
@@ -1650,6 +1930,64 @@ class MainActivity : AppCompatActivity() {
     // ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (остальной код аналогично предыдущей версии)
     // ══════════════════════════════════════════════════════════════════════
 
+    // ══════════════════════════════════════════════════════════════════════
+    // UI SCAN MODE ANIMATION
+    // При сканировании сдвигаем боковые панели к краям и тускним метрики,
+    // освобождая максимальную площадь камеры. При выходе — возвращаем.
+    // ══════════════════════════════════════════════════════════════════════
+    private fun setHudScanMode(scanning: Boolean) {
+        val dur = 380L
+        val density = resources.displayMetrics.density
+        if (scanning) {
+            // Боковые панели: сдвиг к краям + opacity 30%
+            llCoordsPanel.animate()
+                .alpha(0.28f)
+                .translationX(-20f * density)
+                .setDuration(dur)
+                .start()
+            llStatusPanel.animate()
+                .alpha(0.28f)
+                .translationX(20f * density)
+                .setDuration(dur)
+                .start()
+            // HUD метрики: чуть тускнеем (сдвиг не нужен — они уже вверху)
+            llHudMetrics.animate()
+                .alpha(0.45f)
+                .setDuration(dur)
+                .start()
+            // Индикатор режима — прячем, не нужен во время скана
+            modeIndicator.animate()
+                .alpha(0f)
+                .setDuration(dur / 2)
+                .withEndAction { modeIndicator.visibility = View.GONE }
+                .start()
+        } else {
+            // Восстанавливаем все
+            llCoordsPanel.animate()
+                .alpha(0.85f)
+                .translationX(0f)
+                .setDuration(dur)
+                .start()
+            llStatusPanel.animate()
+                .alpha(0.85f)
+                .translationX(0f)
+                .setDuration(dur)
+                .start()
+            llHudMetrics.animate()
+                .alpha(1f)
+                .setDuration(dur)
+                .start()
+            modeIndicator.visibility = View.VISIBLE
+            modeIndicator.animate()
+                .alpha(1f)
+                .setDuration(dur / 2)
+                .start()
+        }
+        if (::smartReticle.isInitialized) {
+            smartReticle.visibility = if (scanning) View.VISIBLE else View.INVISIBLE
+        }
+    }
+
     private fun showControls(vararg buttons: Button) {
         buttons.forEach { it.visibility = View.VISIBLE }
     }
@@ -1659,7 +1997,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun hideAllControls() {
-        hideControls(btnStart, btnAddPoint, btnScan, btn3DModel, btnAnalyze)
+        hideControls(btnStart, btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
         btnRulerMode.visibility = View.GONE
     }
 
@@ -1689,10 +2027,15 @@ class MainActivity : AppCompatActivity() {
         score: Double?,
         metrics: ReadinessMetrics?
     ) {
+        val profileResult = ReadinessProfile.evaluate(
+            profileName = lastReadinessProfile ?: depthPolicy?.readinessProfileName(),
+            metrics = metrics,
+            ready = ready ?: false
+        )
         if (originAnchorNode == null) {
             pbReadiness.progress = 0
             tvReadiness.text = "0%"
-            tvReadinessDetail.text = "Place origin anchor"
+            tvReadinessDetail.text = "Поставьте опору (кнопка ОПОРА)"
             pbReadiness.progressTintList = android.content.res.ColorStateList.valueOf(
                 ContextCompat.getColor(this, android.R.color.holo_orange_light)
             )
@@ -1708,6 +2051,35 @@ class MainActivity : AppCompatActivity() {
         val minViews = metrics?.min_views_per_anchor ?: 0
         val vp = metrics?.viewpoints ?: 0
         val minVp = metrics?.min_viewpoints ?: 0
+        val minObsPct = ((metrics?.min_observed_ratio ?: 0.0) * 100.0).toInt()
+
+        val metricLine =
+            "OBS ${obsPct}%/${minObsPct}% | VDIV ${vdiv}/${minViews} | VP ${vp}/${minVp}" +
+                    (if (ready == true) " ✅ READY" else "")
+
+        val coachLine: String = when {
+            ready == true -> ""
+            obsPct < minObsPct -> buildString {
+                append("👣 Обойди опору полукругом 180° (~20-30 сек)")
+                val gap = minObsPct - obsPct
+                if (gap > 20) append(" — нужно ещё ${gap}% покрытия")
+            }
+
+            vdiv < minViews -> buildString {
+                val missing = minViews - vdiv
+                append("🔄 Обойди с ${missing + 1} стороны (разные углы, шаг 60°)")
+            }
+
+            vp < minVp -> buildString {
+                val missing = minVp - vp
+                append(
+                    "📸 Сделай ещё ${missing} позици${if (missing == 1) "ю" else "и"}" +
+                            " — шагни влево/вправо или наклони камеру"
+                )
+            }
+
+            else -> "✅ Данных достаточно — нажми АНАЛИЗ"
+        }
 
         val netSuffix = when (currentConnStatus) {
             ConnectionStatus.OFFLINE -> " | NET OFFLINE"
@@ -1720,16 +2092,29 @@ class MainActivity : AppCompatActivity() {
             if (readinessPollFailures > 0) append(" | RDY RETRY")
         }
 
-        tvReadinessDetail.text =
-            "OBS ${obsPct}% | VDIV ${vdiv}/${minViews} | VP ${vp}/${minVp}" +
-                    (if (ready == true) " | READY" else "") +
-                    netSuffix +
-                    pollSuffix
+        tvReadinessDetail.text = buildString {
+            append(metricLine)
+            if (netSuffix.isNotEmpty()) append(netSuffix)
+            if (pollSuffix.isNotEmpty()) append(pollSuffix)
+            append("\n").append(profileResult.explanation)
+            if (coachLine.isNotEmpty()) append("\n").append(coachLine)
+        }
 
         val colorRes =
             if (ready == true) android.R.color.holo_green_light else android.R.color.holo_orange_light
         pbReadiness.progressTintList =
             android.content.res.ColorStateList.valueOf(ContextCompat.getColor(this, colorRes))
+
+        if (ready != true && appState == AppState.SCANNING && coachLine.isNotEmpty()) {
+            tvScanCoach.visibility = View.VISIBLE
+            tvScanCoach.text = coachLine
+        } else if (ready == true) {
+            tvScanCoach.visibility = View.GONE
+        }
+
+        if (ready != true && s0 >= 0.5 && s0 < 0.9 && coachLine.isNotEmpty()) {
+            showHint(coachLine)
+        }
     }
 
     private fun maybeEmitReadinessHints(
@@ -1739,37 +2124,23 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (ready == true) return
         if (metrics == null) return
-        val r = reasons.orEmpty()
 
-        // Cooldown to avoid HUD spam on polling.
         val now = System.currentTimeMillis()
         if (now - lastReadinessHintsAtMs < 15000L) return
 
-        val hints = mutableListOf<String>()
+        val profileResult = ReadinessProfile.evaluate(
+            profileName = lastReadinessProfile ?: depthPolicy?.readinessProfileName(),
+            metrics = metrics,
+            ready = false
+        )
+        val hints = profileResult.humanReasons.toMutableList()
 
-        for (rs in r) {
+        for (rs in reasons.orEmpty()) {
             when {
-                rs.startsWith("LOW_VIEWPOINTS") -> {
-                    val vp = metrics.viewpoints
-                    val minVp = metrics.min_viewpoints
-                    hints.add("📍 Нужно больше ракурсов: VP ${vp}/${minVp}")
-                }
-                rs.startsWith("LOW_VIEW_DIVERSITY") -> {
-                    val vd = metrics.view_diversity
-                    val minVd = metrics.min_views_per_anchor
-                    hints.add("📍 Обойди опоры по кругу: VDIV ${vd}/${minVd}")
-                }
-                rs.startsWith("LOW_OBSERVED_RATIO") -> {
-                    val obs = ((metrics.observed_ratio) * 100.0).toInt()
-                    val minObs = ((metrics.min_observed_ratio) * 100.0).toInt()
-                    hints.add("📍 Мало покрытия: OBS ${obs}% (min ${minObs}%)")
-                }
-                rs == "EMPTY_WORLD" || rs == "EMPTY_AABB" -> {
-                    hints.add("📍 Нет данных скана: подвигайся и досканируй область")
-                }
-                rs == "NO_FRAMES" -> {
-                    hints.add("📍 Нет кадров: включи стрим и подержи камеру на сцене")
-                }
+                rs == "EMPTY_WORLD" || rs == "EMPTY_AABB" ->
+                    hints += "Подойдите к опоре на 0.5–1.5 м и медленно пройдите рядом."
+                rs == "NO_FRAMES" ->
+                    hints += "Стрим не активен. Нажмите СТАРТ."
             }
         }
 
@@ -1778,9 +2149,7 @@ class MainActivity : AppCompatActivity() {
         if (hash == lastReadinessHintsHash && now - lastReadinessHintsAtMs < 45000L) return
         lastReadinessHintsHash = hash
         lastReadinessHintsAtMs = now
-
-        // Only show up to 2 hints at once.
-        hints.take(2).forEach { showHint(it) }
+        hints.take(2).forEach { messageCenter.post(it, MessageCenter.Level.INFO, MessageCenter.Source.READINESS) }
     }
 
     private suspend fun maybeFetchCompatWarnings(sessionId: String) {
@@ -1844,17 +2213,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun maybeShowTutorial() {
-        val done = tutorialPrefs.getBoolean(tutorialDoneKey, false)
-        if (done) return
-
         tutorialOverlay = TutorialOverlay(
             activity = this,
+            prefs = tutorialPrefs,
             onDone = {
-                tutorialPrefs.edit().putBoolean(tutorialDoneKey, true).apply()
                 tutorialOverlay?.dismiss()
                 tutorialOverlay = null
             }
-        ).also { it.show() }
+        ).also { it.showIfNeeded() }
     }
 
     private fun confirmDeleteAnchor(anchorId: String) {
@@ -1898,7 +2264,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         updatePointsCount()
-        btnAnalyze.isEnabled = userMarkers.size >= MIN_POINTS_FOR_MODEL
+        btnAnalyze.isEnabled = userMarkers.count { it.kind == "support" } >= 1
         showHint("🗑 Маркер удалён")
 
         scope.launch {
@@ -1921,6 +2287,14 @@ class MainActivity : AppCompatActivity() {
         hintQueue.addLast(text)
         hintHistory.addLast(text)
         while (hintHistory.size > 10) hintHistory.removeFirst()
+    }
+
+    private fun setHudHint(text: String) {
+        try {
+            tvAiHint.text = text
+        } catch (_: Exception) {
+            // ignore
+        }
     }
 
     private fun startHintTicker() {
@@ -1981,7 +2355,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePointsCount() {
-        tvPointsCount.text = "PTS:${userMarkers.size}"
+        val sup = userMarkers.count { it.kind == "support" }
+        val pts = userMarkers.size
+        val supLeft = MAX_SUPPORTS - sup
+        tvPointsCount.text = buildString {
+            append("ОПОР:$sup/$MAX_SUPPORTS")
+            if (supLeft > 0) append(" (ещё ${supLeft} можно)")
+            append(" | ТОЧЕК:${pts - sup}")
+        }
     }
 
     private fun updateCameraCoordinates() {
@@ -2067,7 +2448,6 @@ class MainActivity : AppCompatActivity() {
                 if (response.isSuccessful && response.body() != null) {
                     val sessionId = response.body()!!.session_id
                     currentSessionId = sessionId
-                    viewModel.setSessionId(sessionId)
                     rememberSessionInHistory(sessionId)
 
                     // Reset export/layer state for new session.
@@ -2084,6 +2464,9 @@ class MainActivity : AppCompatActivity() {
 
                     viewModel.setConnectionState(ConnectionStatus.ONLINE, base)
                     showHint("✓ Сессия создана")
+                    startReadinessPolling(sessionId)
+                    viewModel.setSessionId(sessionId)
+                    syncAnchorsToServer(allowEmpty = true)
                     transitionTo(AppState.SCANNING)
                     startStreamingLoop()
                     return
@@ -2111,7 +2494,6 @@ class MainActivity : AppCompatActivity() {
         netState.setStreaming(true)
         streamJob?.cancel()
         streamSendJob?.cancel()
-        ensureReleasePollingRunning(sid)
         streamJob = scope.launch {
             while (isActive && isStreaming && currentSessionId == sid) {
                 val nowMs = System.currentTimeMillis()
@@ -2393,6 +2775,7 @@ class MainActivity : AppCompatActivity() {
                     lastReadinessReady = body.ready
                     lastReadinessScore = body.score
                     lastReadinessMetrics = body.readiness_metrics
+                    lastReadinessProfile = body.readiness_profile
                     lastReadinessReasons = body.reasons
                     updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
                     maybeEmitReadinessHints(body.ready, body.reasons, body.readiness_metrics)
@@ -2415,6 +2798,11 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun stopReadinessPolling() {
+        readinessPollJob?.cancel()
+        readinessPollJob = null
     }
 
     private fun stopReleasePolling() {
@@ -2466,9 +2854,11 @@ class MainActivity : AppCompatActivity() {
             val payload: HashMap<String, Any>,
             val yuv: ImageUtils.Yuv420Copy,
             val swapUv: Boolean,
-            val depth: DepthUtils.DepthFrame?
+            val depthRequested: Boolean,
+            val depth: DepthUtils.AcquiredDepthImage?
         )
 
+        // ── ФАЗА 1: capture на Main thread (ARCore требует Main для frame API) ──────────
         val packet = withContext(Dispatchers.Main) {
             val manualMeasurements = runCatching {
                 arRuler.getSavedMeasurements().map { m ->
@@ -2483,6 +2873,7 @@ class MainActivity : AppCompatActivity() {
             }.getOrDefault(emptyList())
 
             val frame = sceneView.arFrame ?: return@withContext null
+            var acquiredDepth: DepthUtils.AcquiredDepthImage? = null
             try {
                 val cam = frame.camera
                 if (cam.trackingState != TrackingState.TRACKING) return@withContext null
@@ -2493,31 +2884,14 @@ class MainActivity : AppCompatActivity() {
                     null
                 } ?: return@withContext null
 
+                // YUV copy — единственная тяжёлая операция здесь.
+                // Минимизируем время: копируем planes сразу пока Image жив, затем close().
                 val swapUv = settingsPrefs.getBoolean(PREF_CAMERA_SWAP_UV, false)
                 val yuvCopy = try {
                     // Copy planes quickly on main thread while Image is valid.
                     ImageUtils.copyYuv420(image)
                 } finally {
                     runCatching { image.close() }
-                }
-
-                val shouldSendDepth = (depthFrameCounter % DEPTH_SEND_EVERY == 0)
-                depthFrameCounter++
-                val acquiredDepth = if (shouldSendDepth) DepthUtils.tryAcquireDepth16(frame) else null
-                val depthFrame = acquiredDepth?.let { acquired ->
-                    try {
-                        DepthUtils.copyDepth16(acquired.image, acquired.isRaw)
-                    } finally {
-                        runCatching { acquired.image.close() }
-                    }
-                }
-                if (shouldSendDepth && acquiredDepth == null) {
-                    val now = System.currentTimeMillis()
-                    if (!depthUnavailableWarned || (now - lastDepthWarningMs) > 10_000L) {
-                        depthUnavailableWarned = true
-                        lastDepthWarningMs = now
-                        showHint("ℹ️ Depth недоступен на устройстве - отправляем только point cloud")
-                    }
                 }
 
                 val intr = cam.imageIntrinsics
@@ -2593,12 +2967,22 @@ class MainActivity : AppCompatActivity() {
                     basePayload["manual_measurements"] = manualMeasurements
                 }
 
-                if (shouldSendDepth && depthFrame == null) {
-                    basePayload["depth_unavailable"] = true
+                val dp = depthPolicy
+                val shouldSendDepth = dp?.shouldAttemptDepth() == true
+                if (shouldSendDepth) {
+                    acquiredDepth = DepthUtils.tryAcquireDepth16(frame)
                 }
+                val depthReceived = acquiredDepth != null
+                dp?.onFrame(depthReceived)
 
-                FramePacket(basePayload, yuvCopy, swapUv, depthFrame)
+                basePayload["depth_supported"] = dp?.supported == true
+                basePayload["depth_strategy"] = dp?.currentStrategy()?.name ?: "UNKNOWN"
+                if (!depthReceived && shouldSendDepth) basePayload["depth_unavailable"] = true
+                basePayload["readiness_profile_hint"] = dp?.readinessProfileName() ?: "NoDepth"
+
+                FramePacket(basePayload, yuvCopy, swapUv, shouldSendDepth, acquiredDepth)
             } catch (_: Exception) {
+                runCatching { acquiredDepth?.image?.close() }
                 null
             }
         }
@@ -2606,17 +2990,20 @@ class MainActivity : AppCompatActivity() {
         if (packet == null) return true
 
         withContext(Dispatchers.Main) {
-            if (packet.depth == null) {
-                depthUnavailableStreak += 1
-                if (!depthHintShown && depthUnavailableStreak >= 5) {
-                    depthHintShown = true
-                    showHint("⚠️ Depth недоступен на устройстве или отключён в ARCore")
+            val dp = depthPolicy ?: return@withContext
+            val newStrategy = dp.currentStrategy()
+            val hint = dp.uiHint(depthPrevStrategy)
+            if (hint != null) {
+                messageCenter.post(hint, MessageCenter.Level.INFO, MessageCenter.Source.DEPTH)
+                if (newStrategy == DepthPolicy.Strategy.NO_DEPTH) {
+                    messageCenter.setHud("Без depth — нужно больше ракурсов")
                 }
-            } else {
-                depthUnavailableStreak = 0
+                Log.i("Depth", "Strategy changed: ${depthPrevStrategy} -> $newStrategy (rate=${dp.availableRate()})")
             }
+            depthPrevStrategy = newStrategy
         }
 
+        // ── ФАЗА 2: encode на Default (уже верно через HeavyOps) ─────────────────────
         val payload = withContext(Dispatchers.Default) {
             packet.payload.apply {
                 this["client_stats"] = mapOf(
@@ -2625,20 +3012,39 @@ class MainActivity : AppCompatActivity() {
                     "send_interval_ms" to streamIntervalMs,
                     "last_send_ms" to lastSendMs,
                     "conn" to currentConnStatus.name,
-                )
+                ) + (depthPolicy?.toMap() ?: emptyMap())
                 HeavyOps.withPermit {
                     val nv21 = ImageUtils.yuvCopyToNv21(packet.yuv, swapUv = packet.swapUv)
                     this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, jpegQuality)
-                    val depth = packet.depth
-                    if (depth != null) {
-                        this["depth_base64"] = DepthUtils.depthBytesToBase64(depth.bytes)
-                        this["depth_width"] = depth.width
-                        this["depth_height"] = depth.height
-                        this["depth_scale_m_per_unit"] = depth.scaleMPerUnit
-                        this["depth_scale"] = depth.scaleMPerUnit
-                        this["depth_is_raw"] = depth.isRaw
-                        this["depth_format"] = depth.format
-                        this["depth_invalid_value"] = depth.invalidValue
+                    val acquired = packet.depth
+                    if (acquired != null) {
+                        try {
+                            val depthFrame = DepthUtils.copyDepth16(acquired.image, acquired.isRaw)
+                            val rawBytes = depthFrame.bytes
+                            val safeBytes = if (rawBytes.size > DepthPolicy.MAX_DEPTH_PAYLOAD_BYTES) {
+                                Log.w("Depth", "Depth payload too large: ${rawBytes.size} bytes, truncating to ${DepthPolicy.MAX_DEPTH_PAYLOAD_BYTES}")
+                                val w = depthFrame.width
+                                val h = depthFrame.height / 2
+                                val ds = ByteArray(w * h * 2)
+                                for (row in 0 until h) {
+                                    System.arraycopy(rawBytes, row * 2 * w * 2, ds, row * w * 2, w * 2)
+                                }
+                                this["depth_width"] = w
+                                this["depth_height"] = h
+                                this["depth_downsampled"] = true
+                                ds
+                            } else rawBytes
+                            this["depth_base64"] = DepthUtils.depthBytesToBase64(safeBytes)
+                            if (!this.containsKey("depth_width")) this["depth_width"] = depthFrame.width
+                            if (!this.containsKey("depth_height")) this["depth_height"] = depthFrame.height
+                            this["depth_scale_m_per_unit"] = depthFrame.scaleMPerUnit
+                            this["depth_scale"] = depthFrame.scaleMPerUnit
+                            this["depth_is_raw"] = depthFrame.isRaw
+                            this["depth_format"] = depthFrame.format
+                            this["depth_invalid_value"] = depthFrame.invalidValue
+                        } finally {
+                            runCatching { acquired.image.close() }
+                        }
                     }
                 }
             }
@@ -2681,7 +3087,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 "READY" -> {
                     hideScanHintsBar()
-                    if (userMarkers.size >= MIN_POINTS_FOR_MODEL && !hasRedZones) startPlayButtonPulse()
+                    if (userMarkers.count { it.kind == "support" } >= 1 && !hasRedZones) startPlayButtonPulse()
                 }
                 else -> if (hints?.is_scan_complete == true) hideScanHintsBar()
             }
@@ -2694,7 +3100,7 @@ class MainActivity : AppCompatActivity() {
                     else -> null
                 }
                 if (!msg.isNullOrBlank()) showHint(msg)
-                if (userMarkers.size >= MIN_POINTS_FOR_MODEL) btnAnalyze.isEnabled = true
+                if (userMarkers.count { it.kind == "support" } >= 1) btnAnalyze.isEnabled = true
                 if (hints.is_ready == true && !hasRedZones) startPlayButtonPulse()
             }
         }
@@ -2796,37 +3202,129 @@ class MainActivity : AppCompatActivity() {
 
         val model = response.body()!!
         withContext(Dispatchers.Main) {
+            val opts = model.options.orEmpty()
+
+            if (model.status == "NEEDS_SCAN" || opts.isEmpty()) {
+                current3DModel = null
+                val coachMsg = buildNeedsScanHint(model.reasons.orEmpty(), lastReadinessMetrics)
+                showHint(coachMsg)
+                updateReadinessUI(false, lastReadinessScore, lastReadinessMetrics)
+                transitionTo(AppState.SCANNING)
+                startStreamingLoop()
+                return@withContext
+            }
+
             current3DModel = model
             selectedVariantIndex = 0
             transitionTo(AppState.SELECTING)
-
-            val opts = model.options.orEmpty()
+            ensureReleasePollingRunning(sid)
             variantAdapter.submit(opts, selected = 0)
-
-            if (opts.isNotEmpty()) onVariantSelected(0)
-            if (measurementConstraints.isNotEmpty()) showHint("📐 ${measurementConstraints.size} измерений использовано как ограничения")
+            onVariantSelected(0)
+            if (measurementConstraints.isNotEmpty()) showHint("📐 ${measurementConstraints.size} измерений использовано")
         }
     }
 
-    private fun placeAnchor() {
+
+    /**
+     * Формирует конструктивное сообщение "что делать руками" при NEEDS_SCAN.
+     * Избегает красных toast-ошибок; работает как обучающая подсказка.
+     */
+    private fun buildNeedsScanHint(
+        reasons: List<String>,
+        metrics: ReadinessMetrics?
+    ): String {
+        if (reasons.isEmpty()) return "📡 Продолжай сканировать — держи камеру на опоре 20-30 сек"
+
+        val steps = reasons.mapNotNull { reason ->
+            when {
+                reason.startsWith("LOW_OBSERVED_RATIO") -> {
+                    val obs = ((metrics?.observed_ratio ?: 0.0) * 100.0).toInt()
+                    val minObs = ((metrics?.min_observed_ratio ?: 0.0) * 100.0).toInt()
+                    "👣 Обойди опору полукругом 180° (OBS ${obs}%→${minObs}% нужно)"
+                }
+
+                reason.startsWith("LOW_VIEW_DIVERSITY") -> {
+                    val vd = metrics?.view_diversity ?: 0
+                    val minVd = metrics?.min_views_per_anchor ?: 0
+                    "🔄 Обойди с разных углов (60°+ шаг) — ${vd}/${minVd} ракурсов"
+                }
+
+                reason.startsWith("LOW_VIEWPOINTS") -> {
+                    val vp = metrics?.viewpoints ?: 0
+                    val minVp = metrics?.min_viewpoints ?: 0
+                    "📸 Ещё ${(minVp - vp).coerceAtLeast(1)} позици${if ((minVp - vp) == 1) "я" else "и"}" +
+                            " — шагни в сторону или наклони камеру вверх/вниз"
+                }
+
+                reason == "EMPTY_WORLD" || reason == "EMPTY_AABB" ->
+                    "🚶 Подойди на 0.5-1.5 м к опоре и пройди вокруг"
+
+                reason == "NO_FRAMES" ->
+                    "📡 Стрим прерывался — нажми START и снова начни скан"
+
+                else -> null
+            }
+        }
+
+        return if (steps.isEmpty()) {
+            "📡 Сканируй ещё 20-30 сек, держи камеру стабильно"
+        } else {
+            steps.take(2).joinToString("\n")
+        }
+    }
+
+    private fun placeAnchor(kind: String) {
         if (userMarkers.size >= MAX_POINTS) {
             showHint("⚠️ Достигнут лимит точек")
             return
         }
 
-        val frame = sceneView.arFrame ?: return
+        val frame = sceneView.arFrame ?: run {
+            messageCenter.post(getString(R.string.hint_ar_frame_unavailable), MessageCenter.Level.WARN, MessageCenter.Source.AR)
+            return
+        }
+        val camera = frame.camera
+
+        if (camera.trackingState != TrackingState.TRACKING) {
+            messageCenter.post(getString(R.string.hint_tracking_unstable), MessageCenter.Level.WARN, MessageCenter.Source.AR)
+            vibrate(150)
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val reason = camera.trackingFailureReason
+            if (reason != com.google.ar.core.TrackingFailureReason.NONE) {
+                val msg = when (reason) {
+                    com.google.ar.core.TrackingFailureReason.INSUFFICIENT_FEATURES ->
+                        "Мало контрастных точек. Направьте камеру на текстурную поверхность."
+                    com.google.ar.core.TrackingFailureReason.EXCESSIVE_MOTION ->
+                        "Слишком быстрое движение. Двигайтесь медленнее."
+                    com.google.ar.core.TrackingFailureReason.INSUFFICIENT_LIGHT ->
+                        "Недостаточно освещения."
+                    else -> "Трекинг нестабилен: $reason"
+                }
+                showHint("⚠️ $msg")
+                return
+            }
+        }
 
         val x = sceneView.width / 2f
         val y = sceneView.height / 2f
 
-        val hit = frame.hitTest(x, y).firstOrNull { hitResult ->
-            val trackable = hitResult.trackable
-            (trackable is Plane) && trackable.isPoseInPolygon(hitResult.hitPose)
+        val hits = frame.hitTest(x, y)
+        val planeHit = hits.firstOrNull { hr ->
+            val t = hr.trackable
+            (t is Plane) && t.isPoseInPolygon(hr.hitPose)
         }
+        val pointHit = hits.firstOrNull { hr -> hr.trackable is Point }
+        val hit = planeHit ?: pointHit
 
         if (hit == null) {
-            showHint("⚠️ Не найдено место для точки")
+            showHint("⚠️ Не найдено место для ${if (kind == "support") "опоры" else "точки"}")
             return
+        }
+        if (kind == "support" && planeHit == null) {
+            showHint("ℹ️ Плоскость не найдена. Опора поставлена по feature points (лучше наведитесь на пол/стену).")
         }
 
         val anchor = hit.createAnchor()
@@ -2842,7 +3340,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         anchorNodes.add(anchorNode)
-        if (originAnchorNode == null) {
+        if (kind == "support" && originAnchorNode == null) {
             originAnchorNode = anchorNode
             layerGlbManager?.setLayersRoot(originAnchorNode)
             voxelVisualizer.setRootParent(originAnchorNode)
@@ -2861,6 +3359,7 @@ class MainActivity : AppCompatActivity() {
         userMarkers.add(
             PlacedAnchor(
                 id = markerId,
+                kind = kind,
                 x = p.tx(),
                 y = p.ty(),
                 z = p.tz()
@@ -2871,8 +3370,9 @@ class MainActivity : AppCompatActivity() {
         marker.setOnTapListener { _, _ -> confirmDeleteAnchor(markerId) }
 
         updatePointsCount()
-        btnAnalyze.isEnabled = userMarkers.size >= MIN_POINTS_FOR_MODEL
+        btnAnalyze.isEnabled = userMarkers.count { it.kind == "support" } >= 1
         vibrate(35)
+        if (::smartReticle.isInitialized) smartReticle.flashPlacement()
 
         // Синхронизируем anchors фоном
         scope.launch {
@@ -2883,7 +3383,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        showHint("✓ Точка добавлена: ${userMarkers.size}")
+        showHint("✓ " + (if (kind == "support") "Опора" else "Точка") + " добавлена: ${userMarkers.size}")
     }
 
     private fun confirmResetOrigin() {
@@ -3130,16 +3630,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showError(message: String) {
-        showHint("❌ $message")
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        messageCenter.post(message, MessageCenter.Level.BLOCKER, MessageCenter.Source.UI, setAsHud = true)
     }
 
     private fun showWarning(message: String) {
-        Snackbar.make(findViewById(android.R.id.content), message, Snackbar.LENGTH_LONG)
-            .setBackgroundTint(getColor(android.R.color.holo_orange_dark))
-            .setTextColor(getColor(android.R.color.white))
-            .show()
-        showHint(message)
+        messageCenter.post(message, MessageCenter.Level.WARN, MessageCenter.Source.UI)
     }
 
     private fun highlightWouldCollapse(elementIds: List<String>) {
@@ -3294,14 +3789,14 @@ class MainActivity : AppCompatActivity() {
     private fun performUndo() {
         viewModel.undo { snapshot ->
             sceneBuilder.buildScene(snapshot.elements)
-            showToast("↶ Отменено: ${snapshot.description}")
+            showToast(getString(R.string.toast_undo, snapshot.description))
         }
     }
 
     private fun performRedo() {
         viewModel.redo { snapshot ->
             sceneBuilder.buildScene(snapshot.elements)
-            showToast("↷ Повторено: ${snapshot.description}")
+            showToast(getString(R.string.toast_redo, snapshot.description))
         }
     }
 
@@ -3424,6 +3919,13 @@ class MainActivity : AppCompatActivity() {
         }
         super.onResume()
 
+        // Если arResumed уже true — значит AR не был запаузен (например, пришёл повторный onResume
+        // без onPause, что теоретически возможно при configuration change). Не дёргаем resume повторно.
+        if (arResumed) {
+            Log.w("Lifecycle", "onResume called while arResumed=true — skipping AR resume to avoid double-resume crash")
+            return
+        }
+
         if (!hasCameraPermission()) {
             requestCameraPermission()
             return
@@ -3441,9 +3943,12 @@ class MainActivity : AppCompatActivity() {
         if (isArSceneReady) {
             try {
                 sceneView.resume()
+                arResumed = true
             } catch (e: CameraNotAvailableException) {
+                arResumed = false
                 Log.e("MainActivity", "Camera not available on resume", e)
-                showError("Камера недоступна. Закройте другие приложения, использующие камеру.")
+                // Не "ошибка" — пользователь просто переключился из другого приложения с камерой.
+                showWarning("Камера занята. Закройте другое приложение с камерой и вернитесь.")
             }
         }
 
@@ -3456,10 +3961,21 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         isUiActive = false
         stopReleasePolling()
-        super.onPause()
+        stopReadinessPolling()
         stopStreaming()
         stopAutoVoxelRefresh()
-        runCatching { sceneView.pause() }
+        super.onPause()
+        if (arResumed) {
+            // sceneView.pause() только если AR реально был в resumed-состоянии.
+            // Двойной pause() → "RET_CHECK failure in scheduler.cc" в ARCore.
+            runCatching {
+                sceneView.pause()
+                Log.d("Lifecycle", "sceneView.pause() OK")
+            }.onFailure { e ->
+                Log.e("Lifecycle", "sceneView.pause() failed: ${e.message}", e)
+            }
+            arResumed = false
+        }
     }
 
 
