@@ -10,11 +10,7 @@ import com.google.ar.core.LightEstimate
 import com.google.ar.core.Session
 import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.ArSceneView
-// [FIXED] Добавлен прямой import Sceneform LightEstimationMode.
-// Старый код искал setLightEstimationMode(Config$LightEstimationMode) — такого метода в ArSceneView НЕТ.
-// ArSceneView использует собственный тип com.gorisse.thomas.sceneform.light.LightEstimationMode.
-// Из-за этого reflection молча возвращал null, ENVIRONMENTAL_HDR не отключался → NoSuchMethodError краш.
-import com.gorisse.thomas.sceneform.light.LightEstimationMode as SceneformLightMode
+import com.gorisse.thomas.sceneform.light.LightEstimationConfig
 
 class ARSessionManager(
     private val context: Context,
@@ -144,26 +140,21 @@ class ARSessionManager(
      * с fallback на reflection с правильным типом параметра.
      */
     private fun applySceneViewLightEstimationMode(mode: Config.LightEstimationMode) {
-        // Маппим ARCore-режим → Sceneform-режим
-        val sceneformMode: SceneformLightMode = when (mode) {
-            Config.LightEstimationMode.AMBIENT_INTENSITY -> SceneformLightMode.AMBIENT_INTENSITY
-            // Для ENVIRONMENTAL_HDR тоже проверяем: если ARCore его поддерживает,
-            // можно оставить; иначе — DISABLED для полной безопасности.
-            Config.LightEstimationMode.ENVIRONMENTAL_HDR -> SceneformLightMode.AMBIENT_INTENSITY // Консервативно
-            else -> SceneformLightMode.DISABLED
+        val lightConfig = when (mode) {
+            Config.LightEstimationMode.AMBIENT_INTENSITY -> LightEstimationConfig.AMBIENT_INTENSITY
+            Config.LightEstimationMode.ENVIRONMENTAL_HDR -> LightEstimationConfig.AMBIENT_INTENSITY
+            else -> LightEstimationConfig.DISABLED
         }
 
         try {
-            // [FIXED] Прямой вызов — работает если Sceneform API доступен напрямую
-            sceneView.lightEstimationMode = sceneformMode
-            Log.i(TAG, "sceneView.lightEstimationMode = $sceneformMode ✅")
+            sceneView._lightEstimationConfig = lightConfig
+            Log.i(TAG, "sceneView._lightEstimationConfig = $lightConfig ✅")
             return
         } catch (t: Throwable) {
-            Log.w(TAG, "Direct lightEstimationMode set failed (${t.message}), trying reflection fallback")
+            Log.w(TAG, "Direct _lightEstimationConfig set failed (${t.message}), trying reflection fallback")
         }
 
-        // Fallback: reflection с правильным типом (SceneformLightMode)
-        applyViaReflectionFallback(sceneformMode)
+        applyViaReflectionFallback(lightConfig)
     }
 
     /**
@@ -171,27 +162,26 @@ class ARSessionManager(
      * Старый код: parameterTypes[0].name == "com.google.ar.core.Config$LightEstimationMode" — НЕВЕРНО
      * Новый код: isAssignableFrom(SceneformLightMode::class.java) — ВЕРНО
      */
-    private fun applyViaReflectionFallback(sceneformMode: SceneformLightMode) {
+    private fun applyViaReflectionFallback(lightConfig: LightEstimationConfig) {
         try {
             val setter = sceneView.javaClass.methods.firstOrNull {
-                it.name == "setLightEstimationMode" &&
+                it.name == "setLightEstimationConfig" &&
                 it.parameterCount == 1 &&
-                it.parameterTypes[0].isAssignableFrom(SceneformLightMode::class.java)
+                it.parameterTypes[0].isAssignableFrom(LightEstimationConfig::class.java)
             }
             if (setter == null) {
-                Log.e(TAG, "setLightEstimationMode(SceneformLightMode) not found in ArSceneView! " +
+                Log.e(TAG, "setLightEstimationConfig(LightEstimationConfig) not found in ArSceneView! " +
                            "HDR crash risk if Sceneform defaults to ENVIRONMENTAL_HDR.")
-                // Последняя попытка: поиск по имени без типа
                 val anyGetter = sceneView.javaClass.methods
-                    .firstOrNull { it.name == "setLightEstimationMode" && it.parameterCount == 1 }
+                    .firstOrNull { it.name == "setLightEstimationConfig" && it.parameterCount == 1 }
                 if (anyGetter != null) {
-                    anyGetter.invoke(sceneView, sceneformMode)
-                    Log.d(TAG, "setLightEstimationMode via any-type reflection OK")
+                    anyGetter.invoke(sceneView, lightConfig)
+                    Log.d(TAG, "setLightEstimationConfig via any-type reflection OK")
                 }
                 return
             }
-            setter.invoke(sceneView, sceneformMode)
-            Log.d(TAG, "setLightEstimationMode($sceneformMode) via typed reflection OK ✅")
+            setter.invoke(sceneView, lightConfig)
+            Log.d(TAG, "setLightEstimationConfig($lightConfig) via typed reflection OK ✅")
         } catch (t: Throwable) {
             Log.e(TAG, "Reflection fallback FAILED: ${t.message}. App may crash on first AR frame!", t)
         }
