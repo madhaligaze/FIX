@@ -1379,6 +1379,8 @@ class MainActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════════════════════════════
 
     private fun toggleRulerMode() {
+        if (!::arRuler.isInitialized) return
+
         rulerMode = !rulerMode
 
         if (rulerMode) {
