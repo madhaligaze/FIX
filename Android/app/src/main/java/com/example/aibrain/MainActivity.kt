@@ -307,12 +307,18 @@ class MainActivity : AppCompatActivity() {
     private var streamSendJob: Job? = null
     private var isArSceneReady = false
     private var isRulerReady = false
+    private var arResumed: Boolean = false
+    private var depthSupported: Boolean? = null
+    private var depthAttemptsDisabled: Boolean = false
+    private var depthEverReceived: Boolean = false
+    private var depthSessionStartMs: Long = 0L
     private var depthUnavailableStreak = 0
+    private var depthSoftHintShown = false
+    private var noDepthLongerScanHintShown: Boolean = false
+    private var lastDepthSoftHintMs: Long = 0L
     private var depthHintShown = false
     private var arcoreHintShown = false
     private var depthFrameCounter = 0
-    private var depthUnavailableWarned: Boolean = false
-    private var lastDepthWarningMs: Long = 0L
     private var currentScanHints: List<String> = emptyList()
     private var scanHintsVisible = false
     private var autoVoxelRefreshJob: Job? = null
@@ -419,14 +425,14 @@ class MainActivity : AppCompatActivity() {
                     Log.d("ModelAssets", "✅ Все модели загружены успешно")
                 } else {
                     Log.w("ModelAssets", "⚠️ 3D модели не найдены в assets/. Используется упрощенный режим.")
-                    showError("3D модели не найдены. Используется упрощенный режим.")
+                    showHint("ℹ️ Локальные 3D ассеты не найдены - используется упрощенный режим")
                     setHudHint("Локальная библиотека деталей не загружена (это не мешает скану/AI)")
                 }
             }
             result.onFailure { error ->
                 hideLoadingDialog()
                 Log.e("ModelAssets", "❌ Ошибка загрузки моделей: ${error.message}")
-                showError("Не удалось загрузить 3D модели. Используется упрощенный режим.")
+                showHint("ℹ️ Не удалось загрузить локальные 3D ассеты - используется упрощенный режим")
                 setHudHint("Локальная библиотека деталей не загружена (это не мешает скану/AI)")
             }
         }
@@ -643,9 +649,19 @@ class MainActivity : AppCompatActivity() {
             }
             return false
         }
-        if (arManager.depthMode == Config.DepthMode.DISABLED && !depthHintShown) {
+        // Cache depth capability once per ARCore session and keep it stable.
+        depthSupported = (arManager.depthMode != Config.DepthMode.DISABLED)
+        depthAttemptsDisabled = (depthSupported == false)
+        depthEverReceived = false
+        depthUnavailableStreak = 0
+        depthSoftHintShown = false
+        noDepthLongerScanHintShown = false
+        lastDepthSoftHintMs = 0L
+        depthSessionStartMs = System.currentTimeMillis()
+
+        if (depthSupported == false && !depthHintShown) {
             depthHintShown = true
-            showHint("ℹ️ Устройство не поддерживает Depth API — depth-данные недоступны")
+            showHint("ℹ️ Depth не поддерживается на этом устройстве. Сканирование возможно, но без depth потребуется дольше.")
         }
 
 
@@ -2600,7 +2616,8 @@ class MainActivity : AppCompatActivity() {
             val payload: HashMap<String, Any>,
             val yuv: ImageUtils.Yuv420Copy,
             val swapUv: Boolean,
-            val depth: DepthUtils.DepthFrame?
+            val depthRequested: Boolean,
+            val depth: DepthUtils.AcquiredDepthImage?
         )
 
         val packet = withContext(Dispatchers.Main) {
@@ -2617,6 +2634,7 @@ class MainActivity : AppCompatActivity() {
             }.getOrDefault(emptyList())
 
             val frame = sceneView.arFrame ?: return@withContext null
+            var acquiredDepth: DepthUtils.AcquiredDepthImage? = null
             try {
                 val cam = frame.camera
                 if (cam.trackingState != TrackingState.TRACKING) return@withContext null
@@ -2633,25 +2651,6 @@ class MainActivity : AppCompatActivity() {
                     ImageUtils.copyYuv420(image)
                 } finally {
                     runCatching { image.close() }
-                }
-
-                val shouldSendDepth = (depthFrameCounter % DEPTH_SEND_EVERY == 0)
-                depthFrameCounter++
-                val acquiredDepth = if (shouldSendDepth) DepthUtils.tryAcquireDepth16(frame) else null
-                val depthFrame = acquiredDepth?.let { acquired ->
-                    try {
-                        DepthUtils.copyDepth16(acquired.image, acquired.isRaw)
-                    } finally {
-                        runCatching { acquired.image.close() }
-                    }
-                }
-                if (shouldSendDepth && acquiredDepth == null) {
-                    val now = System.currentTimeMillis()
-                    if (!depthUnavailableWarned || (now - lastDepthWarningMs) > 10_000L) {
-                        depthUnavailableWarned = true
-                        lastDepthWarningMs = now
-                        showHint("ℹ️ Depth недоступен на устройстве - отправляем только point cloud")
-                    }
                 }
 
                 val intr = cam.imageIntrinsics
@@ -2727,12 +2726,26 @@ class MainActivity : AppCompatActivity() {
                     basePayload["manual_measurements"] = manualMeasurements
                 }
 
-                if (shouldSendDepth && depthFrame == null) {
-                    basePayload["depth_unavailable"] = true
+                val depthOk = (depthSupported == true) && !depthAttemptsDisabled
+                val shouldSendDepth = depthOk && (depthFrameCounter % DEPTH_SEND_EVERY == 0)
+                depthFrameCounter++
+                if (shouldSendDepth) {
+                    acquiredDepth = DepthUtils.tryAcquireDepth16(frame)
+                    if (acquiredDepth == null) {
+                        basePayload["depth_unavailable"] = true
+                        val now = System.currentTimeMillis()
+                        if (!depthSoftHintShown || (now - lastDepthSoftHintMs) > 20_000L) {
+                            depthSoftHintShown = true
+                            lastDepthSoftHintMs = now
+                            showHint("ℹ️ Depth пока недоступен (обычно первые секунды/плохой свет). Продолжаем без depth.")
+                        }
+                    }
                 }
+                basePayload["depth_supported"] = (depthSupported == true)
 
-                FramePacket(basePayload, yuvCopy, swapUv, depthFrame)
+                FramePacket(basePayload, yuvCopy, swapUv, shouldSendDepth, acquiredDepth)
             } catch (_: Exception) {
+                runCatching { acquiredDepth?.image?.close() }
                 null
             }
         }
@@ -2740,14 +2753,18 @@ class MainActivity : AppCompatActivity() {
         if (packet == null) return true
 
         withContext(Dispatchers.Main) {
-            if (packet.depth == null) {
-                depthUnavailableStreak += 1
-                if (!depthHintShown && depthUnavailableStreak >= 5) {
-                    depthHintShown = true
-                    showHint("⚠️ Depth недоступен на устройстве или отключён в ARCore")
+            if (packet.depthRequested) {
+                if (packet.depth == null) {
+                    depthUnavailableStreak += 1
+                    val now = System.currentTimeMillis()
+                    if (!noDepthLongerScanHintShown && !depthEverReceived && depthUnavailableStreak >= 5 && (now - depthSessionStartMs) > 5_000L) {
+                        noDepthLongerScanHintShown = true
+                        showHint("ℹ️ Без depth потребуется дольше сканировать. Продолжайте вести камеру вокруг опоры.")
+                    }
+                } else {
+                    depthUnavailableStreak = 0
+                    depthEverReceived = true
                 }
-            } else {
-                depthUnavailableStreak = 0
             }
         }
 
@@ -2763,16 +2780,21 @@ class MainActivity : AppCompatActivity() {
                 HeavyOps.withPermit {
                     val nv21 = ImageUtils.yuvCopyToNv21(packet.yuv, swapUv = packet.swapUv)
                     this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, jpegQuality)
-                    val depth = packet.depth
-                    if (depth != null) {
-                        this["depth_base64"] = DepthUtils.depthBytesToBase64(depth.bytes)
-                        this["depth_width"] = depth.width
-                        this["depth_height"] = depth.height
-                        this["depth_scale_m_per_unit"] = depth.scaleMPerUnit
-                        this["depth_scale"] = depth.scaleMPerUnit
-                        this["depth_is_raw"] = depth.isRaw
-                        this["depth_format"] = depth.format
-                        this["depth_invalid_value"] = depth.invalidValue
+                    val acquired = packet.depth
+                    if (acquired != null) {
+                        try {
+                            val depthFrame = DepthUtils.copyDepth16(acquired.image, acquired.isRaw)
+                            this["depth_base64"] = DepthUtils.depthBytesToBase64(depthFrame.bytes)
+                            this["depth_width"] = depthFrame.width
+                            this["depth_height"] = depthFrame.height
+                            this["depth_scale_m_per_unit"] = depthFrame.scaleMPerUnit
+                            this["depth_scale"] = depthFrame.scaleMPerUnit
+                            this["depth_is_raw"] = depthFrame.isRaw
+                            this["depth_format"] = depthFrame.format
+                            this["depth_invalid_value"] = depthFrame.invalidValue
+                        } finally {
+                            runCatching { acquired.image.close() }
+                        }
                     }
                 }
             }
@@ -3611,11 +3633,15 @@ class MainActivity : AppCompatActivity() {
 
         startArIfReady()
 
+        arResumed = false
+
         // Не дергаем resume(), если AR так и не смог стартовать (например, setupSession() вернул false).
         if (isArSceneReady) {
             try {
                 sceneView.resume()
+                arResumed = true
             } catch (e: CameraNotAvailableException) {
+                arResumed = false
                 Log.e("MainActivity", "Camera not available on resume", e)
                 showError("Камера недоступна. Закройте другие приложения, использующие камеру.")
             }
@@ -3633,8 +3659,9 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         stopStreaming()
         stopAutoVoxelRefresh()
-        if (isArSceneReady) {
+        if (arResumed) {
             runCatching { sceneView.pause() }
+            arResumed = false
         }
     }
 

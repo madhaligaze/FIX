@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 
+from dataclasses import replace
+
 import numpy as np
 import time
 from typing import Any
@@ -197,7 +199,21 @@ def _legacy_stream_ingest(request: Request, session_id: str, payload: LegacyStre
     )
     world = state.get_world(session_id)
     anchors = state.anchors.get(session_id, [])
-    ready, score, reasons = compute_readiness(world, anchors, state.policy)
+    extra = getattr(payload, "__pydantic_extra__", None) or {}
+    depth_supported = extra.get("depth_supported")
+    depth_unavailable = bool(extra.get("depth_unavailable")) if "depth_unavailable" in extra else False
+    no_depth_mode = (depth_bytes is None) and (depth_unavailable or (depth_supported is False))
+
+    policy_for_readiness = state.policy
+    if no_depth_mode:
+        try:
+            min_obs = float(getattr(state.policy, "readiness_observed_ratio_min", 0.1))
+            lowered = max(0.05, min_obs * 0.65)
+            policy_for_readiness = replace(state.policy, readiness_observed_ratio_min=lowered)
+        except Exception:
+            policy_for_readiness = state.policy
+
+    ready, score, reasons = compute_readiness(world, anchors, policy_for_readiness)
     if not ready and not anchors:
         try:
             occ = world.occupancy.stats()
@@ -218,6 +234,8 @@ def _legacy_stream_ingest(request: Request, session_id: str, payload: LegacyStre
     else:
         scan_plan = generate_scan_plan(world, anchors)
         instructions = []
+        if no_depth_mode:
+            instructions.append("Без Depth потребуется дольше сканировать (без depth occupancy прогревается из point cloud).")
         for item in scan_plan[:3]:
             note = item.get("note")
             instructions.append(f"Досканируйте: {note}" if note else "Сделайте обзор вокруг точки опоры")
@@ -228,6 +246,7 @@ def _legacy_stream_ingest(request: Request, session_id: str, payload: LegacyStre
             "ai_hints": {
                 "instructions": instructions,
                 "warnings": [str(reason) for reason in reasons],
+                "no_depth_mode": bool(no_depth_mode),
                 "quality_score": quality_score,
                 "is_ready": bool(ready),
             },
