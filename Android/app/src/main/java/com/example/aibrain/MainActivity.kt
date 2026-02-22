@@ -133,6 +133,7 @@ class MainActivity : AppCompatActivity() {
         private const val AUTO_RELOAD_COOLDOWN_MS: Long = 12_000L
         private const val MIN_POINTS_FOR_MODEL = 2
         private const val MAX_POINTS = 20
+        private const val MAX_SUPPORTS = 3
         private const val PREFS_NAME = "app_settings"
         private const val PREF_SERVER_BASE_URL = "server_base_url"
         private const val KEY_SESSION_HISTORY = "session_history_json"
@@ -169,6 +170,7 @@ class MainActivity : AppCompatActivity() {
     // Основные кнопки
     private lateinit var btnStart: Button
     private lateinit var btnAddPoint: Button
+    private lateinit var btnAddWaypoint: Button
     private lateinit var btnScan: Button
     private lateinit var btn3DModel: Button
     private lateinit var btnAnalyze: Button
@@ -503,6 +505,7 @@ class MainActivity : AppCompatActivity() {
         // Основные кнопки
         btnStart = findViewById(R.id.btn_start)
         btnAddPoint = findViewById(R.id.btn_add_point)
+        btnAddWaypoint = findViewById(R.id.btn_add_waypoint)
         btnScan = findViewById(R.id.btn_scan)
         btn3DModel = findViewById(R.id.btn_3d_model)
         btnAnalyze = findViewById(R.id.btn_analyze)
@@ -675,7 +678,8 @@ class MainActivity : AppCompatActivity() {
     private fun setupClickListeners() {
         // Основные действия
         btnStart.setOnClickListener { onStartClicked() }
-        btnAddPoint.setOnClickListener { onAddPointClicked() }
+        btnAddPoint.setOnClickListener { onAddSupportClicked() }
+        btnAddWaypoint.setOnClickListener { onAddWaypointClicked() }
         btnAddPoint.setOnLongClickListener {
             if (originAnchorNode == null) {
                 showHint("ℹ️ Origin ещё не задан. Долгое нажатие работает после установки первой опоры")
@@ -742,6 +746,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        stopReadinessPolling()
         super.onDestroy()
         stopStreaming()
         stopHealthLoop()
@@ -794,7 +799,7 @@ class MainActivity : AppCompatActivity() {
         scope.launch { doStartSession() }
     }
 
-    private fun onAddPointClicked() {
+    private fun onAddSupportClicked() {
         if (appState != AppState.SCANNING) return
 
         if (userMarkers.size >= MAX_POINTS) {
@@ -802,7 +807,24 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        placeAnchor()
+        val supportCount = userMarkers.count { it.kind == "support" }
+        if (supportCount >= MAX_SUPPORTS) {
+            showHint("⚠️ Достигнут максимум опор: $MAX_SUPPORTS")
+            return
+        }
+
+        placeAnchor(kind = "support")
+    }
+
+    private fun onAddWaypointClicked() {
+        if (appState != AppState.SCANNING) return
+
+        if (userMarkers.size >= MAX_POINTS) {
+            showHint("⚠️ Достигнут максимум точек: $MAX_POINTS")
+            return
+        }
+
+        placeAnchor(kind = "point")
     }
 
     private fun onScanClicked() {
@@ -1368,7 +1390,7 @@ class MainActivity : AppCompatActivity() {
         val anchors = userMarkers.map { marker ->
             AnchorPointRequest(
                 id = marker.id,
-                kind = if (marker == userMarkers.firstOrNull()) "support" else "waypoint",
+                kind = marker.kind,
                 position = listOf(marker.x, marker.y, marker.z),
                 confidence = 1.0f
             )
@@ -1663,7 +1685,7 @@ class MainActivity : AppCompatActivity() {
         when (state) {
             AppState.IDLE -> {
                 showControls(btnStart)
-                hideControls(btnAddPoint, btnScan, btn3DModel, btnAnalyze)
+                hideControls(btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
                 variantPanel.visibility = View.GONE
                 btnRulerMode.visibility = View.GONE
 
@@ -1681,11 +1703,11 @@ class MainActivity : AppCompatActivity() {
 
             AppState.SCANNING -> {
                 hideControls(btnStart)
-                showControls(btnAddPoint, btnScan, btn3DModel, btnAnalyze)
+                showControls(btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
                 btnRulerMode.visibility = View.VISIBLE
                 variantPanel.visibility = View.GONE
 
-                btnAnalyze.isEnabled = userMarkers.size >= MIN_POINTS_FOR_MODEL
+                btnAnalyze.isEnabled = userMarkers.count { it.kind == "support" } >= 1
 
                 showHint("📡 Система активна | Точек: ${userMarkers.size}")
                 updateModeStatus("СКАНИРОВАНИЕ")
@@ -1700,7 +1722,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             AppState.PREVIEW_3D -> {
-                showControls(btnAddPoint, btnAnalyze)
+                showControls(btnAddPoint, btnAddWaypoint, btnAnalyze)
                 hideControls(btnStart, btnScan)
                 variantPanel.visibility = View.GONE
 
@@ -1720,7 +1742,7 @@ class MainActivity : AppCompatActivity() {
             AppState.RESULTS -> {
                 showControls(btnStart)
                 btnStart.text = "ЗАНОВО"
-                hideControls(btnAddPoint, btnScan, btn3DModel, btnAnalyze)
+                hideControls(btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
                 variantPanel.visibility = View.GONE
 
                 updateModeStatus("ЗАВЕРШЕНО")
@@ -1742,7 +1764,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun hideAllControls() {
-        hideControls(btnStart, btnAddPoint, btnScan, btn3DModel, btnAnalyze)
+        hideControls(btnStart, btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
         btnRulerMode.visibility = View.GONE
     }
 
@@ -1775,7 +1797,7 @@ class MainActivity : AppCompatActivity() {
         if (originAnchorNode == null) {
             pbReadiness.progress = 0
             tvReadiness.text = "0%"
-            tvReadinessDetail.text = "Place origin anchor"
+            tvReadinessDetail.text = "Поставьте опору (кнопка ОПОРА)"
             pbReadiness.progressTintList = android.content.res.ColorStateList.valueOf(
                 ContextCompat.getColor(this, android.R.color.holo_orange_light)
             )
@@ -1791,6 +1813,18 @@ class MainActivity : AppCompatActivity() {
         val minViews = metrics?.min_views_per_anchor ?: 0
         val vp = metrics?.viewpoints ?: 0
         val minVp = metrics?.min_viewpoints ?: 0
+        val minObsPct = ((metrics?.min_observed_ratio ?: 0.0) * 100.0).toInt()
+        val nextAction = if (ready == true) {
+            ""
+        } else if (obsPct < minObsPct) {
+            "\nСканируйте 20-30 сек вокруг опоры (полукруг 180°)"
+        } else if (vdiv < minViews) {
+            "\nОбойдите опору с 3 сторон (разные углы обзора)"
+        } else if (vp < minVp) {
+            "\nСделайте 3-5 разных позиций (шагните влево/вправо)"
+        } else {
+            "\nПродолжайте скан и держите камеру стабильно"
+        }
 
         val netSuffix = when (currentConnStatus) {
             ConnectionStatus.OFFLINE -> " | NET OFFLINE"
@@ -1804,10 +1838,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         tvReadinessDetail.text =
-            "OBS ${obsPct}% | VDIV ${vdiv}/${minViews} | VP ${vp}/${minVp}" +
+            "OBS ${obsPct}%/${minObsPct}% | VDIV ${vdiv}/${minViews} | VP ${vp}/${minVp}" +
                     (if (ready == true) " | READY" else "") +
                     netSuffix +
-                    pollSuffix
+                    pollSuffix +
+                    nextAction
 
         val colorRes =
             if (ready == true) android.R.color.holo_green_light else android.R.color.holo_orange_light
@@ -1981,7 +2016,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         updatePointsCount()
-        btnAnalyze.isEnabled = userMarkers.size >= MIN_POINTS_FOR_MODEL
+        btnAnalyze.isEnabled = userMarkers.count { it.kind == "support" } >= 1
         showHint("🗑 Маркер удалён")
 
         scope.launch {
@@ -2072,7 +2107,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePointsCount() {
-        tvPointsCount.text = "PTS:${userMarkers.size}"
+        val sup = userMarkers.count { it.kind == "support" }
+        val pts = userMarkers.size
+        tvPointsCount.text = "SUP:$sup | PTS:$pts"
     }
 
     private fun updateCameraCoordinates() {
@@ -2158,7 +2195,6 @@ class MainActivity : AppCompatActivity() {
                 if (response.isSuccessful && response.body() != null) {
                     val sessionId = response.body()!!.session_id
                     currentSessionId = sessionId
-                    viewModel.setSessionId(sessionId)
                     rememberSessionInHistory(sessionId)
 
                     // Reset export/layer state for new session.
@@ -2175,6 +2211,9 @@ class MainActivity : AppCompatActivity() {
 
                     viewModel.setConnectionState(ConnectionStatus.ONLINE, base)
                     showHint("✓ Сессия создана")
+                    startReadinessPolling(sessionId)
+                    viewModel.setSessionId(sessionId)
+                    syncAnchorsToServer(allowEmpty = true)
                     transitionTo(AppState.SCANNING)
                     startStreamingLoop()
                     return
@@ -2505,6 +2544,11 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun stopReadinessPolling() {
+        readinessPollJob?.cancel()
+        readinessPollJob = null
     }
 
     private fun stopReleasePolling() {
@@ -2907,7 +2951,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun placeAnchor() {
+    private fun placeAnchor(kind: String) {
         if (userMarkers.size >= MAX_POINTS) {
             showHint("⚠️ Достигнут лимит точек")
             return
@@ -2942,18 +2986,20 @@ class MainActivity : AppCompatActivity() {
         val x = sceneView.width / 2f
         val y = sceneView.height / 2f
 
-        val hit = frame.hitTest(x, y).firstOrNull { hr ->
+        val hits = frame.hitTest(x, y)
+        val planeHit = hits.firstOrNull { hr ->
             val t = hr.trackable
-            when (t) {
-                is Plane -> t.isPoseInPolygon(hr.hitPose)
-                is Point -> (t.trackingState == TrackingState.TRACKING)
-                else -> false
-            }
+            (t is Plane) && t.isPoseInPolygon(hr.hitPose)
         }
+        val pointHit = hits.firstOrNull { hr -> hr.trackable is Point }
+        val hit = planeHit ?: pointHit
 
         if (hit == null) {
-            showHint("⚠️ Не найдено место для точки")
+            showHint("⚠️ Не найдено место для ${if (kind == "support") "опоры" else "точки"}")
             return
+        }
+        if (kind == "support" && planeHit == null) {
+            showHint("ℹ️ Плоскость не найдена. Опора поставлена по feature points (лучше наведитесь на пол/стену).")
         }
 
         val anchor = hit.createAnchor()
@@ -2969,7 +3015,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         anchorNodes.add(anchorNode)
-        if (originAnchorNode == null) {
+        if (kind == "support" && originAnchorNode == null) {
             originAnchorNode = anchorNode
             layerGlbManager?.setLayersRoot(originAnchorNode)
             voxelVisualizer.setRootParent(originAnchorNode)
@@ -2988,6 +3034,7 @@ class MainActivity : AppCompatActivity() {
         userMarkers.add(
             PlacedAnchor(
                 id = markerId,
+                kind = kind,
                 x = p.tx(),
                 y = p.ty(),
                 z = p.tz()
@@ -2998,7 +3045,7 @@ class MainActivity : AppCompatActivity() {
         marker.setOnTapListener { _, _ -> confirmDeleteAnchor(markerId) }
 
         updatePointsCount()
-        btnAnalyze.isEnabled = userMarkers.size >= MIN_POINTS_FOR_MODEL
+        btnAnalyze.isEnabled = userMarkers.count { it.kind == "support" } >= 1
         vibrate(35)
 
         // Синхронизируем anchors фоном
@@ -3010,7 +3057,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        showHint("✓ Точка добавлена: ${userMarkers.size}")
+        showHint("✓ " + (if (kind == "support") "Опора" else "Точка") + " добавлена: ${userMarkers.size}")
     }
 
     private fun confirmResetOrigin() {
