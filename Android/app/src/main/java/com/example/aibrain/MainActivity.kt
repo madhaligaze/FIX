@@ -1515,21 +1515,31 @@ class MainActivity : AppCompatActivity() {
         }
 
         val outFile = java.io.File(filesDir, "measurements_export_${System.currentTimeMillis()}.json")
+        var fileSaved = false
         try {
             outFile.writeText(json)
+            fileSaved = true
         } catch (_: Exception) {
             // ignore
         }
 
+        var copiedToClipboard = false
         try {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
             val clip = android.content.ClipData.newPlainText("measurements.json", json)
             cm.setPrimaryClip(clip)
+            copiedToClipboard = true
         } catch (_: Exception) {
             // ignore
         }
 
-        Toast.makeText(this, "JSON сохранен и скопирован в буфер", Toast.LENGTH_SHORT).show()
+        val message = when {
+            fileSaved && copiedToClipboard -> "JSON сохранен и скопирован в буфер"
+            fileSaved -> "JSON сохранен в файл"
+            copiedToClipboard -> "JSON скопирован в буфер"
+            else -> "Не удалось экспортировать JSON"
+        }
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     private fun setMeasurementMode(type: MeasurementType) {
