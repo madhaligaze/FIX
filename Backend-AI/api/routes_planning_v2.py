@@ -270,10 +270,8 @@ def request_scaffold_compat(request: Request, session_id: str) -> dict[str, Any]
     """Compatibility endpoint expected by tests and Android client.
 
     Contract:
-      - /planning/request_scaffold stays STRICT (returns 409 when not ready).
-      - This compat endpoint is STABLE for e2e smoke: returns 200 whenever at least one frame was ingested.
-        If readiness is not satisfied, it still runs the non-strict pipeline and returns warnings/metrics.
-      - If no frames were ingested yet, return 409 (NO_FRAMES) because planning has no signal.
+      - Keep readiness semantics explicit for clients: return 409 on missing frames or insufficient scan quality.
+      - Return 200 + scaffold bundle only after readiness is satisfied.
     """
     state = request.app.state.runtime
     world = state.get_world(session_id)
@@ -297,16 +295,17 @@ def request_scaffold_compat(request: Request, session_id: str) -> dict[str, Any]
         )
 
 
-    # Compat relaxation: do NOT fail with 409 for typical scan-coverage issues.
-    # We still return diagnostics so client can show "needs more scan" hints.
-    relaxed = False
     if not ready:
-        relaxed = True
-        trace = state.traces.setdefault(session_id, [])
-        add_trace_event(
-            trace,
-            "compat_readiness_relaxed",
-            {"score": float(score), "reasons": list(reasons), "metrics": readiness_metrics},
+        scan_plan = _make_scan_plan(world, anchors)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status": "NEEDS_SCAN",
+                "score": float(score),
+                "reasons": reasons,
+                "scan_plan": scan_plan,
+                "readiness_metrics": readiness_metrics,
+            },
         )
 
     elements, rev_id, scene_bundle = _run_scaffold_pipeline(state, session_id, strict=False)
@@ -322,16 +321,9 @@ def request_scaffold_compat(request: Request, session_id: str) -> dict[str, Any]
             "score": float(score),
             "reasons": reasons,
             "readiness_metrics": readiness_metrics,
-            "relaxed": bool(relaxed),
+            "relaxed": False,
         },
     }
-    if relaxed:
-        resp["compat_warnings"] = {
-            "status": "NEEDS_SCAN",
-            "score": float(score),
-            "reasons": reasons,
-            "scan_plan": _make_scan_plan(world, anchors),
-        }
     return resp
 
 
