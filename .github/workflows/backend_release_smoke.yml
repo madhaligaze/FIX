@@ -36,3 +36,7 @@ jobs:
       - name: Release smoke (pytest)
         run: |
           pytest -q tests/test_release_smoke_e2e.py
+
+      - name: Chaos smoke (220x)
+        run: |
+          python scripts/ci_smoke_chaos.py --loops 220 --frames 8 --fail-rate 0.05 --max-retries 3 --jitter-ms 50
