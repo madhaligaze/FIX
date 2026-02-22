@@ -5,6 +5,7 @@ import android.animation.ValueAnimator
 import android.app.ActivityManager
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -317,6 +318,8 @@ class MainActivity : AppCompatActivity() {
     private var isRulerReady = false
     private var arResumed: Boolean = false
 
+    private lateinit var messageCenter: MessageCenter
+
     // Depth session state (cached once per ARCore session)
     private var depthSupported: Boolean? = null
     private var depthAttemptsDisabled: Boolean = false
@@ -410,6 +413,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         initViews()
+        messageCenter = MessageCenter(this, tvAiHint, hintQueue, hintHistory)
         setupClickListeners()
 
         // Release-device gate should never hard-block dev/testing.
@@ -435,15 +439,13 @@ class MainActivity : AppCompatActivity() {
                     Log.d("ModelAssets", "✅ Все модели загружены успешно")
                 } else {
                     Log.w("ModelAssets", "⚠️ 3D модели не найдены в assets/. Используется упрощенный режим.")
-                    showHint("ℹ️ Локальные 3D ассеты не найдены - используется упрощенный режим")
-                    setHudHint("Локальная библиотека деталей не загружена (это не мешает скану/AI)")
+                    messageCenter.post(getString(R.string.hint_assets_missing), MessageCenter.Level.INFO, MessageCenter.Source.ASSETS)
                 }
             }
             result.onFailure { error ->
                 hideLoadingDialog()
                 Log.e("ModelAssets", "❌ Ошибка загрузки моделей: ${error.message}")
-                showHint("ℹ️ Не удалось загрузить локальные 3D ассеты - используется упрощенный режим")
-                setHudHint("Локальная библиотека деталей не загружена (это не мешает скану/AI)")
+                messageCenter.post(getString(R.string.hint_assets_load_fail), MessageCenter.Level.INFO, MessageCenter.Source.ASSETS)
             }
         }
         viewModel = StructureViewModel(api)
@@ -486,9 +488,9 @@ class MainActivity : AppCompatActivity() {
 
         startHealthLoop()
         viewModel.setConnectionState(ConnectionStatus.UNKNOWN, "")
-        maybeShowTutorial()
-
         transitionTo(AppState.IDLE)
+        tutorialOverlay = TutorialOverlay(this, tutorialPrefs) { tutorialOverlay?.dismiss() }
+        tutorialOverlay?.showIfNeeded()
 
         // Start hint ticker after views are ready
         startHintTicker()
@@ -579,7 +581,7 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
             if (!arcoreHintShown) {
                 arcoreHintShown = true
-                showError("AR требует Android 9 (API 28)+. На этом устройстве AR отключен.")
+                startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, ArNotSupportedActivity.REASON_API_TOO_LOW))
             }
             return false
         }
@@ -591,7 +593,7 @@ class MainActivity : AppCompatActivity() {
             Log.e("MainActivity", "ARCore availability check failed: ${t.message}", t)
             if (!arcoreHintShown) {
                 arcoreHintShown = true
-                showError("ARCore недоступен. Проверьте Google Play Services for AR.")
+                startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, ArNotSupportedActivity.REASON_NOT_INSTALLED))
             }
             return false
         }
@@ -605,7 +607,7 @@ class MainActivity : AppCompatActivity() {
         if (!availability.isSupported) {
             if (!arcoreHintShown) {
                 arcoreHintShown = true
-                showError("ARCore не поддерживается на этом устройстве.")
+                startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, ArNotSupportedActivity.REASON_NOT_SUPPORTED))
             }
             return false
         }
@@ -625,7 +627,7 @@ class MainActivity : AppCompatActivity() {
             Log.e("MainActivity", "ARCore install/request failed: ${t.message}", t)
             if (!arcoreHintShown) {
                 arcoreHintShown = true
-                showError("ARCore не установлен/недоступен. Установите Google Play Services for AR.")
+                startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, ArNotSupportedActivity.REASON_NOT_INSTALLED))
             }
             return false
         }
@@ -653,11 +655,8 @@ class MainActivity : AppCompatActivity() {
         }
         val sessionOk = arManager.setupSession()
         if (!sessionOk) {
-            if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.P) {
-                showError("AR требует Android 9+ (API 28+). На вашем устройстве Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}).")
-            } else {
-                showError("ARCore сессия не запустилась. Убедитесь что ARCore обновлён и камера доступна.")
-            }
+            val reason = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) ArNotSupportedActivity.REASON_API_TOO_LOW else ArNotSupportedActivity.REASON_SESSION_FAIL
+            startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, reason))
             return false
         }
         // Cache depth capability once per ARCore session and keep it stable.
@@ -668,6 +667,8 @@ class MainActivity : AppCompatActivity() {
         depthSoftHintShown = false
         noDepthLongerScanHintShown = false
         lastDepthSoftHintMs = 0L
+        messageCenter.resetSource(MessageCenter.Source.DEPTH)
+        messageCenter.resetSource(MessageCenter.Source.AR)
         depthSessionStartMs = System.currentTimeMillis()
 
         Log.i(
@@ -679,8 +680,8 @@ class MainActivity : AppCompatActivity() {
         if (depthSupported == false && !depthHintShown) {
             depthHintShown = true
             // Только один раз за всё время жизни Activity — не per-session.
-            showHint("ℹ️ Depth не поддерживается. Скан работает, но потребуется больше ракурсов.")
-            setHudHint("Без depth — нужно больше обходов (нет датчика глубины)")
+            messageCenter.post(getString(R.string.hint_depth_not_supported), MessageCenter.Level.INFO, MessageCenter.Source.DEPTH)
+            messageCenter.setHud(getString(R.string.hint_depth_not_supported))
         }
 
 
@@ -710,6 +711,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupClickListeners() {
+        btnStart.contentDescription = getString(R.string.btn_start_desc)
+        btnAddPoint.contentDescription = getString(R.string.btn_support_desc)
+        btnAddWaypoint.contentDescription = getString(R.string.btn_waypoint_desc)
+        btnScan.contentDescription = getString(R.string.btn_scan_desc)
+        btn3DModel.contentDescription = getString(R.string.btn_model_desc)
+        btnAnalyze.contentDescription = getString(R.string.btn_analyze_desc)
+        btnRulerMode.contentDescription = getString(R.string.btn_ruler_desc)
+
         // Основные действия
         btnStart.setOnClickListener { onStartClicked() }
         btnAddPoint.setOnClickListener { onAddSupportClicked() }
@@ -1496,7 +1505,7 @@ class MainActivity : AppCompatActivity() {
 
         try {
             val frame = sceneView.arFrame ?: run {
-            showHint("⚠️ AR кадр недоступен — подождите секунду и попробуйте снова")
+            messageCenter.post(getString(R.string.hint_ar_frame_unavailable), MessageCenter.Level.WARN, MessageCenter.Source.AR)
             return
         }
             val camera = frame.camera
@@ -1583,7 +1592,7 @@ class MainActivity : AppCompatActivity() {
         if (!::arRuler.isInitialized) return
         val json = arRuler.exportMeasurements()
         if (json.isBlank()) {
-            Toast.makeText(this, "Нет сохраненных измерений", Toast.LENGTH_SHORT).show()
+            showToast(getString(R.string.toast_ruler_no_measurements))
             return
         }
 
@@ -1738,14 +1747,14 @@ class MainActivity : AppCompatActivity() {
                 variantPanel.visibility = View.GONE
                 btnRulerMode.visibility = View.GONE
 
-                showHint("👁️ Наведите камеру на конструкцию")
-                updateModeStatus("ОЖИДАНИЕ")
+                messageCenter.setHud(getString(R.string.state_idle))
+                updateModeStatus(getString(R.string.state_idle).uppercase())
                 stopBlinkAnimation(tvAiHint)
             }
 
             AppState.CONNECTING -> {
                 hideAllControls()
-                showHint("⏳ Подключение к AI Brain...")
+                messageCenter.setHud(getString(R.string.state_connecting))
                 updateModeStatus("ПОДКЛЮЧЕНИЕ")
                 startBlinkAnimation(tvAiHint)
             }
@@ -1758,14 +1767,14 @@ class MainActivity : AppCompatActivity() {
 
                 btnAnalyze.isEnabled = userMarkers.count { it.kind == "support" } >= 1
 
-                showHint("📡 Система активна | Точек: ${userMarkers.size}")
+                messageCenter.setHud(getString(R.string.state_scanning, userMarkers.count { it.kind == "support" }))
                 updateModeStatus("СКАНИРОВАНИЕ")
                 stopBlinkAnimation(tvAiHint)
             }
 
             AppState.MODELING -> {
                 hideAllControls()
-                showHint("🧠 AI анализирует структуру...")
+                messageCenter.setHud(getString(R.string.state_modeling))
                 updateModeStatus("МОДЕЛИРОВАНИЕ")
                 startBlinkAnimation(tvAiHint)
             }
@@ -1775,7 +1784,7 @@ class MainActivity : AppCompatActivity() {
                 hideControls(btnStart, btnScan)
                 variantPanel.visibility = View.GONE
 
-                showHint("🌐 3D модель отображена")
+                messageCenter.setHud(getString(R.string.state_preview))
                 updateModeStatus("ПРЕВЬЮ")
             }
 
@@ -1783,8 +1792,8 @@ class MainActivity : AppCompatActivity() {
                 hideAllControls()
                 variantPanel.visibility = View.VISIBLE
 
-                showHint("🎯 Выберите вариант лесов")
-                updateModeStatus("ВЫБОР ВАРИАНТА")
+                messageCenter.setHud(getString(R.string.state_selecting))
+                updateModeStatus("ВЫБОР")
                 stopBlinkAnimation(tvAiHint)
             }
 
@@ -2053,17 +2062,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun maybeShowTutorial() {
-        val done = tutorialPrefs.getBoolean(tutorialDoneKey, false)
-        if (done) return
-
         tutorialOverlay = TutorialOverlay(
             activity = this,
+            prefs = tutorialPrefs,
             onDone = {
-                tutorialPrefs.edit().putBoolean(tutorialDoneKey, true).apply()
                 tutorialOverlay?.dismiss()
                 tutorialOverlay = null
             }
-        ).also { it.show() }
+        ).also { it.showIfNeeded() }
     }
 
     private fun confirmDeleteAnchor(anchorId: String) {
@@ -3138,13 +3144,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         val frame = sceneView.arFrame ?: run {
-            showHint("⚠️ AR кадр недоступен — подождите секунду и попробуйте снова")
+            messageCenter.post(getString(R.string.hint_ar_frame_unavailable), MessageCenter.Level.WARN, MessageCenter.Source.AR)
             return
         }
         val camera = frame.camera
 
         if (camera.trackingState != TrackingState.TRACKING) {
-            showHint("⚠️ AR трекинг нестабилен. Подержите камеру спокойно и попробуйте снова.")
+            messageCenter.post(getString(R.string.hint_tracking_unstable), MessageCenter.Level.WARN, MessageCenter.Source.AR)
             vibrate(150)
             return
         }
@@ -3487,16 +3493,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showError(message: String) {
-        showHint("❌ $message")
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        messageCenter.post(message, MessageCenter.Level.BLOCKER, MessageCenter.Source.UI, setAsHud = true)
     }
 
     private fun showWarning(message: String) {
-        Snackbar.make(findViewById(android.R.id.content), message, Snackbar.LENGTH_LONG)
-            .setBackgroundTint(getColor(android.R.color.holo_orange_dark))
-            .setTextColor(getColor(android.R.color.white))
-            .show()
-        showHint(message)
+        messageCenter.post(message, MessageCenter.Level.WARN, MessageCenter.Source.UI)
     }
 
     private fun highlightWouldCollapse(elementIds: List<String>) {
@@ -3651,14 +3652,14 @@ class MainActivity : AppCompatActivity() {
     private fun performUndo() {
         viewModel.undo { snapshot ->
             sceneBuilder.buildScene(snapshot.elements)
-            showToast("↶ Отменено: ${snapshot.description}")
+            showToast(getString(R.string.toast_undo, snapshot.description))
         }
     }
 
     private fun performRedo() {
         viewModel.redo { snapshot ->
             sceneBuilder.buildScene(snapshot.elements)
-            showToast("↷ Повторено: ${snapshot.description}")
+            showToast(getString(R.string.toast_redo, snapshot.description))
         }
     }
 

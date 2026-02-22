@@ -47,6 +47,13 @@
             android:name=".MainActivity"
             android:exported="false" />
 
+        <activity
+            android:name=".ArNotSupportedActivity"
+            android:theme="@style/Theme.AIBrain"
+            android:exported="false"
+            android:label="AR недоступен" />
+
+
     </application>
 
 </manifest>
