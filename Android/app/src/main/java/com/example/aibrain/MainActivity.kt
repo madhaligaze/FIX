@@ -197,6 +197,12 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var viewGridOverlay: View
 
+    // Scan-mode animation targets
+    private lateinit var llHudMetrics: LinearLayout
+    private lateinit var llCoordsPanel: LinearLayout
+    private lateinit var llStatusPanel: LinearLayout
+    private lateinit var undoRedoPanel: LinearLayout
+
     // Панели
     private lateinit var controlPanel: LinearLayout
     private lateinit var variantPanel: LinearLayout
@@ -538,6 +544,10 @@ class MainActivity : AppCompatActivity() {
         fabEyeOfAI = findViewById(R.id.fab_eye_of_ai)
         voxelLegend = findViewById(R.id.voxel_legend)
         viewGridOverlay = findViewById(R.id.view_grid_overlay)
+        llHudMetrics = findViewById(R.id.ll_hud_metrics)
+        llCoordsPanel = findViewById(R.id.ll_coords_panel)
+        llStatusPanel = findViewById(R.id.ll_status_panel)
+        undoRedoPanel = findViewById(R.id.undo_redo_panel)
 
         // Панели
         controlPanel = findViewById(R.id.control_panel)
@@ -1769,6 +1779,8 @@ class MainActivity : AppCompatActivity() {
                 hideControls(btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
                 variantPanel.visibility = View.GONE
                 btnRulerMode.visibility = View.GONE
+                undoRedoPanel.visibility = View.GONE
+                setHudScanMode(false)
 
                 messageCenter.setHud(getString(R.string.state_idle))
                 updateModeStatus(getString(R.string.state_idle).uppercase())
@@ -1777,6 +1789,8 @@ class MainActivity : AppCompatActivity() {
 
             AppState.CONNECTING -> {
                 hideAllControls()
+                undoRedoPanel.visibility = View.GONE
+                setHudScanMode(false)
                 messageCenter.setHud(getString(R.string.state_connecting))
                 updateModeStatus("ПОДКЛЮЧЕНИЕ")
                 startBlinkAnimation(tvAiHint)
@@ -1787,6 +1801,8 @@ class MainActivity : AppCompatActivity() {
                 showControls(btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
                 btnRulerMode.visibility = View.VISIBLE
                 variantPanel.visibility = View.GONE
+                undoRedoPanel.visibility = View.VISIBLE
+                setHudScanMode(true)
 
                 btnAnalyze.isEnabled = userMarkers.count { it.kind == "support" } >= 1
 
@@ -1797,6 +1813,8 @@ class MainActivity : AppCompatActivity() {
 
             AppState.MODELING -> {
                 hideAllControls()
+                undoRedoPanel.visibility = View.GONE
+                setHudScanMode(false)
                 messageCenter.setHud(getString(R.string.state_modeling))
                 updateModeStatus("МОДЕЛИРОВАНИЕ")
                 startBlinkAnimation(tvAiHint)
@@ -1825,6 +1843,8 @@ class MainActivity : AppCompatActivity() {
                 btnStart.text = "ЗАНОВО"
                 hideControls(btnAddPoint, btnAddWaypoint, btnScan, btn3DModel, btnAnalyze)
                 variantPanel.visibility = View.GONE
+                undoRedoPanel.visibility = View.GONE
+                setHudScanMode(false)
 
                 updateModeStatus("ЗАВЕРШЕНО")
                 stopBlinkAnimation(tvAiHint)
@@ -1835,6 +1855,61 @@ class MainActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════════════════════════════
     // ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (остальной код аналогично предыдущей версии)
     // ══════════════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════════════
+    // UI SCAN MODE ANIMATION
+    // При сканировании сдвигаем боковые панели к краям и тускним метрики,
+    // освобождая максимальную площадь камеры. При выходе — возвращаем.
+    // ══════════════════════════════════════════════════════════════════════
+    private fun setHudScanMode(scanning: Boolean) {
+        val dur = 380L
+        val density = resources.displayMetrics.density
+        if (scanning) {
+            // Боковые панели: сдвиг к краям + opacity 30%
+            llCoordsPanel.animate()
+                .alpha(0.28f)
+                .translationX(-20f * density)
+                .setDuration(dur)
+                .start()
+            llStatusPanel.animate()
+                .alpha(0.28f)
+                .translationX(20f * density)
+                .setDuration(dur)
+                .start()
+            // HUD метрики: чуть тускнеем (сдвиг не нужен — они уже вверху)
+            llHudMetrics.animate()
+                .alpha(0.45f)
+                .setDuration(dur)
+                .start()
+            // Индикатор режима — прячем, не нужен во время скана
+            modeIndicator.animate()
+                .alpha(0f)
+                .setDuration(dur / 2)
+                .withEndAction { modeIndicator.visibility = View.GONE }
+                .start()
+        } else {
+            // Восстанавливаем все
+            llCoordsPanel.animate()
+                .alpha(0.85f)
+                .translationX(0f)
+                .setDuration(dur)
+                .start()
+            llStatusPanel.animate()
+                .alpha(0.85f)
+                .translationX(0f)
+                .setDuration(dur)
+                .start()
+            llHudMetrics.animate()
+                .alpha(1f)
+                .setDuration(dur)
+                .start()
+            modeIndicator.visibility = View.VISIBLE
+            modeIndicator.animate()
+                .alpha(1f)
+                .setDuration(dur / 2)
+                .start()
+        }
+    }
 
     private fun showControls(vararg buttons: Button) {
         buttons.forEach { it.visibility = View.VISIBLE }
