@@ -318,7 +318,9 @@ data class ReadinessResponse(
     val ready: Boolean,
     val score: Double,
     val reasons: List<String> = emptyList(),
-    val readiness_metrics: ReadinessMetrics? = null
+    val readiness_metrics: ReadinessMetrics? = null,
+    val readiness_profile: String? = null,
+    val readiness_profile_reason: String? = null
 )
 
 data class ReadinessMetrics(
@@ -328,7 +330,8 @@ data class ReadinessMetrics(
     val min_observed_ratio: Double = 0.0,
     val min_views_per_anchor: Int = 0,
     val min_viewpoints: Int = 0,
-    val anchor_count: Int = 0
+    val anchor_count: Int = 0,
+    val profile: String? = null
 )
 
 

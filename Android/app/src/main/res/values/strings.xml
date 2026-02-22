@@ -45,6 +45,12 @@
     <string name="hint_scan_low_coverage">Низкое покрытие. Сканируйте 20–30 с, поднимая и опуская камеру.</string>
     <string name="hint_depth_not_supported">Датчик глубины не поддерживается. Сканирование работает, но потребуется больше ракурсов.</string>
     <string name="hint_depth_no_data">Глубина временно недоступна (плохой свет?). Продолжайте — данные накапливаются.</string>
+    <string name="hint_depth_unstable">Данные глубины нестабильны. Улучшите освещение или замедлите движение.</string>
+    <string name="hint_depth_no_data_session">Depth недоступен на этой сессии. Система переключилась на RGB и облако точек.</string>
+    <string name="hint_depth_strategy_full">Датчик глубины работает. Покрытие ускорено.</string>
+    <string name="readiness_profile_with_depth">Режим с глубиной — стандартные пороги</string>
+    <string name="readiness_profile_no_depth">Без датчика глубины — нужно больше ракурсов</string>
+    <string name="readiness_profile_unstable">Глубина нестабильна — требования к охвату повышены</string>
     <string name="hint_scan_complete">Сканирование завершено. Качество: %1$d%%</string>
     <string name="hint_quality_too_low">Качество %1$d%% — нужно не менее %2$d%%. Добавьте ракурсов.</string>
 

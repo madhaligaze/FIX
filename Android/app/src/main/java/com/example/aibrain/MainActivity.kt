@@ -40,7 +40,6 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.ar.core.ArCoreApk
-import com.google.ar.core.Config
 import com.google.ar.core.Plane
 import com.google.ar.core.Point
 import com.google.ar.core.TrackingFailureReason
@@ -82,6 +81,8 @@ import com.example.aibrain.measurement.MeasurementType
 import com.example.aibrain.measurement.Measurement
 import com.example.aibrain.measurement.MeasurementStore
 import com.example.aibrain.measurement.TrackingQuality
+import com.example.aibrain.depth.DepthPolicy
+import com.example.aibrain.depth.ReadinessProfile
 import com.example.aibrain.visualization.VoxelData
 import com.example.aibrain.visualization.VoxelVisualizer
 import kotlinx.coroutines.sync.Mutex
@@ -141,13 +142,6 @@ class MainActivity : AppCompatActivity() {
         private const val PREF_SERVER_BASE_URL = "server_base_url"
         private const val KEY_SESSION_HISTORY = "session_history_json"
         private const val PREF_CAMERA_SWAP_UV = "camera_swap_uv"
-        private const val DEPTH_SEND_EVERY = 5
-        // Depth warmup: ARCore обычно не даёт depth первые ~3 сек — не спамим в этот период.
-        private const val DEPTH_WARMUP_MS = 3_500L
-        // После N последовательных неудач (вне warmup) — отключаем depth на сессию.
-        private const val DEPTH_DISABLE_AFTER_STREAK = 20
-        // Минимальный интервал между "мягкими" depth-подсказками (не спамим).
-        private const val DEPTH_SOFT_HINT_COOLDOWN_MS = 30_000L
         private const val VOXEL_AUTO_REFRESH_MS = 30_000L
         private const val MIN_RELEASE_API_LEVEL = Build.VERSION_CODES.Q
         private const val MIN_RELEASE_RAM_GB = 6.0
@@ -322,18 +316,12 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var messageCenter: MessageCenter
 
-    // Depth session state (cached once per ARCore session)
-    private var depthSupported: Boolean? = null
-    private var depthAttemptsDisabled: Boolean = false
-    private var depthEverReceived: Boolean = false
-    private var depthSessionStartMs: Long = 0L
-    private var depthUnavailableStreak = 0
-    private var depthSoftHintShown = false
-    private var noDepthLongerScanHintShown: Boolean = false
-    private var lastDepthSoftHintMs: Long = 0L
-    private var depthHintShown = false
+    // ── Depth ─────────────────────────────────────────────────────────────
+    private var depthPolicy: DepthPolicy? = null
+    private var depthPrevStrategy: DepthPolicy.Strategy? = null
+    private var depthStartHintShown = false
+    private var lastReadinessProfile: String? = null
     private var arcoreHintShown = false
-    private var depthFrameCounter = 0
     private var currentScanHints: List<String> = emptyList()
     private var scanHintsVisible = false
     private var autoVoxelRefreshJob: Job? = null
@@ -661,29 +649,17 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, ArNotSupportedActivity::class.java).putExtra(ArNotSupportedActivity.AR_REASON_KEY, reason))
             return false
         }
-        // Cache depth capability once per ARCore session and keep it stable.
-        depthSupported = (arManager.depthMode != Config.DepthMode.DISABLED)
-        depthAttemptsDisabled = (depthSupported == false)
-        depthEverReceived = false
-        depthUnavailableStreak = 0
-        depthSoftHintShown = false
-        noDepthLongerScanHintShown = false
-        lastDepthSoftHintMs = 0L
+        depthPolicy = DepthPolicy(arManager.depthMode).also { it.onSessionStart() }
+        depthPrevStrategy = null
         messageCenter.resetSource(MessageCenter.Source.DEPTH)
         messageCenter.resetSource(MessageCenter.Source.AR)
-        depthSessionStartMs = System.currentTimeMillis()
 
-        Log.i(
-            "Depth", "Session start: depthMode=${arManager.depthMode} " +
-                    "depthSupported=$depthSupported warmupMs=$DEPTH_WARMUP_MS " +
-                    "disableAfter=$DEPTH_DISABLE_AFTER_STREAK streak attempts"
-        )
+        Log.i("Depth", "Session start: ${depthPolicy?.toMap()}")
 
-        if (depthSupported == false && !depthHintShown) {
-            depthHintShown = true
-            // Только один раз за всё время жизни Activity — не per-session.
+        val dp = depthPolicy!!
+        if (!dp.supported && !depthStartHintShown) {
+            depthStartHintShown = true
             messageCenter.post(getString(R.string.hint_depth_not_supported), MessageCenter.Level.INFO, MessageCenter.Source.DEPTH)
-            messageCenter.setHud(getString(R.string.hint_depth_not_supported))
         }
 
 
@@ -1899,6 +1875,11 @@ class MainActivity : AppCompatActivity() {
         score: Double?,
         metrics: ReadinessMetrics?
     ) {
+        val profileResult = ReadinessProfile.evaluate(
+            profileName = lastReadinessProfile ?: depthPolicy?.readinessProfileName(),
+            metrics = metrics,
+            ready = ready ?: false
+        )
         if (originAnchorNode == null) {
             pbReadiness.progress = 0
             tvReadiness.text = "0%"
@@ -1963,6 +1944,7 @@ class MainActivity : AppCompatActivity() {
             append(metricLine)
             if (netSuffix.isNotEmpty()) append(netSuffix)
             if (pollSuffix.isNotEmpty()) append(pollSuffix)
+            append("\n").append(profileResult.explanation)
             if (coachLine.isNotEmpty()) append("\n").append(coachLine)
         }
 
@@ -1990,51 +1972,23 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (ready == true) return
         if (metrics == null) return
-        val r = reasons.orEmpty()
 
-        // Cooldown to avoid HUD spam on polling.
         val now = System.currentTimeMillis()
         if (now - lastReadinessHintsAtMs < 15000L) return
 
-        val hints = mutableListOf<String>()
+        val profileResult = ReadinessProfile.evaluate(
+            profileName = lastReadinessProfile ?: depthPolicy?.readinessProfileName(),
+            metrics = metrics,
+            ready = false
+        )
+        val hints = profileResult.humanReasons.toMutableList()
 
-        for (rs in r) {
+        for (rs in reasons.orEmpty()) {
             when {
-                rs.startsWith("LOW_VIEWPOINTS") -> {
-                    val vp = metrics.viewpoints
-                    val minVp = metrics.min_viewpoints
-                    val missing = (minVp - vp).coerceAtLeast(1)
-                    hints.add(
-                        "📸 Сделай ещё $missing позици${if (missing == 1) "ю" else "и"}: " +
-                                "шагни в сторону, наклони камеру вверх/вниз"
-                    )
-                }
-
-                rs.startsWith("LOW_VIEW_DIVERSITY") -> {
-                    val vd = metrics.view_diversity
-                    val minVd = metrics.min_views_per_anchor
-                    hints.add(
-                        "🔄 Обойди опору с разных сторон (угол 60°+) — " +
-                                "сейчас ${vd}/${minVd} ракурсов засчитано"
-                    )
-                }
-
-                rs.startsWith("LOW_OBSERVED_RATIO") -> {
-                    val obs = ((metrics.observed_ratio) * 100.0).toInt()
-                    val minObs = ((metrics.min_observed_ratio) * 100.0).toInt()
-                    hints.add(
-                        "👣 Обойди опору полукругом ~180° и удерживай камеру " +
-                                "2-3 сек на каждой позиции (OBS ${obs}%→${minObs}%)"
-                    )
-                }
-
-                rs == "EMPTY_WORLD" || rs == "EMPTY_AABB" -> {
-                    hints.add("🚶 Подойди к опоре на 0.5-1.5 м и медленно пройди рядом")
-                }
-
-                rs == "NO_FRAMES" -> {
-                    hints.add("📡 Нажми START — стрим не активен (или потерялся сигнал)")
-                }
+                rs == "EMPTY_WORLD" || rs == "EMPTY_AABB" ->
+                    hints += "Подойдите к опоре на 0.5–1.5 м и медленно пройдите рядом."
+                rs == "NO_FRAMES" ->
+                    hints += "Стрим не активен. Нажмите СТАРТ."
             }
         }
 
@@ -2043,9 +1997,7 @@ class MainActivity : AppCompatActivity() {
         if (hash == lastReadinessHintsHash && now - lastReadinessHintsAtMs < 45000L) return
         lastReadinessHintsHash = hash
         lastReadinessHintsAtMs = now
-
-        // Only show up to 2 hints at once.
-        hints.take(2).forEach { showHint(it) }
+        hints.take(2).forEach { messageCenter.post(it, MessageCenter.Level.INFO, MessageCenter.Source.READINESS) }
     }
 
     private suspend fun maybeFetchCompatWarnings(sessionId: String) {
@@ -2671,6 +2623,7 @@ class MainActivity : AppCompatActivity() {
                     lastReadinessReady = body.ready
                     lastReadinessScore = body.score
                     lastReadinessMetrics = body.readiness_metrics
+                    lastReadinessProfile = body.readiness_profile
                     lastReadinessReasons = body.reasons
                     updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
                     maybeEmitReadinessHints(body.ready, body.reasons, body.readiness_metrics)
@@ -2862,23 +2815,18 @@ class MainActivity : AppCompatActivity() {
                     basePayload["manual_measurements"] = manualMeasurements
                 }
 
-                val depthOk = (depthSupported == true) && !depthAttemptsDisabled
-                val shouldSendDepth = depthOk && (depthFrameCounter % DEPTH_SEND_EVERY == 0)
-                depthFrameCounter++
+                val dp = depthPolicy
+                val shouldSendDepth = dp?.shouldAttemptDepth() == true
                 if (shouldSendDepth) {
                     acquiredDepth = DepthUtils.tryAcquireDepth16(frame)
-                    if (acquiredDepth == null) {
-                        basePayload["depth_unavailable"] = true
-                        val now = System.currentTimeMillis()
-                        val inWarmup = (now - depthSessionStartMs) < DEPTH_WARMUP_MS
-                        if (!inWarmup && (!depthSoftHintShown || (now - lastDepthSoftHintMs) > DEPTH_SOFT_HINT_COOLDOWN_MS)) {
-                            depthSoftHintShown = true
-                            lastDepthSoftHintMs = now
-                            showHint("ℹ️ Depth пока недоступен (плохой свет?). Продолжаем без depth.")
-                        }
-                    }
                 }
-                basePayload["depth_supported"] = (depthSupported == true)
+                val depthReceived = acquiredDepth != null
+                dp?.onFrame(depthReceived)
+
+                basePayload["depth_supported"] = dp?.supported == true
+                basePayload["depth_strategy"] = dp?.currentStrategy()?.name ?: "UNKNOWN"
+                if (!depthReceived && shouldSendDepth) basePayload["depth_unavailable"] = true
+                basePayload["readiness_profile_hint"] = dp?.readinessProfileName() ?: "NoDepth"
 
                 FramePacket(basePayload, yuvCopy, swapUv, shouldSendDepth, acquiredDepth)
             } catch (_: Exception) {
@@ -2890,42 +2838,17 @@ class MainActivity : AppCompatActivity() {
         if (packet == null) return true
 
         withContext(Dispatchers.Main) {
-            if (packet.depthRequested) {
-                if (packet.depth == null) {
-                    depthUnavailableStreak += 1
-                    val now = System.currentTimeMillis()
-                    val pastWarmup = (now - depthSessionStartMs) > DEPTH_WARMUP_MS
-
-                    // После DEPTH_DISABLE_AFTER_STREAK неудач вне warmup — отключаем depth
-                    // навсегда на этой сессии, чтобы не тратить CPU на бесполезные попытки.
-                    if (pastWarmup && !depthEverReceived && depthUnavailableStreak >= DEPTH_DISABLE_AFTER_STREAK) {
-                        depthAttemptsDisabled = true
-                        Log.w(
-                            "Depth", "Depth disabled after $DEPTH_DISABLE_AFTER_STREAK consecutive failures. " +
-                                    "depthSupported=$depthSupported — device may not support depth on this camera config."
-                        )
-                        if (!noDepthLongerScanHintShown) {
-                            noDepthLongerScanHintShown = true
-                            showHint(
-                                "ℹ️ Depth недоступен на этой сессии — продолжаем без него. " +
-                                        "Потребуется чуть дольше сканировать."
-                            )
-                            setHudHint("Без depth — сканируй дольше (больше ракурсов)")
-                        }
-                    } else if (
-                        pastWarmup && !noDepthLongerScanHintShown && !depthEverReceived
-                        && depthUnavailableStreak >= 5
-                    ) {
-                        // Мягкая подсказка — depth долго не приходит, но ещё не сдались.
-                        noDepthLongerScanHintShown = true
-                        showHint("ℹ️ Без depth потребуется дольше сканировать. Ведите камеру вокруг опоры.")
-                    }
-                } else {
-                    depthUnavailableStreak = 0
-                    depthEverReceived = true
-                    depthAttemptsDisabled = false   // depth вернулся — разрешаем снова
+            val dp = depthPolicy ?: return@withContext
+            val newStrategy = dp.currentStrategy()
+            val hint = dp.uiHint(depthPrevStrategy)
+            if (hint != null) {
+                messageCenter.post(hint, MessageCenter.Level.INFO, MessageCenter.Source.DEPTH)
+                if (newStrategy == DepthPolicy.Strategy.NO_DEPTH) {
+                    messageCenter.setHud("Без depth — нужно больше ракурсов")
                 }
+                Log.i("Depth", "Strategy changed: ${depthPrevStrategy} -> $newStrategy (rate=${dp.availableRate()})")
             }
+            depthPrevStrategy = newStrategy
         }
 
         // ── ФАЗА 2: encode на Default (уже верно через HeavyOps) ─────────────────────
@@ -2937,7 +2860,7 @@ class MainActivity : AppCompatActivity() {
                     "send_interval_ms" to streamIntervalMs,
                     "last_send_ms" to lastSendMs,
                     "conn" to currentConnStatus.name,
-                )
+                ) + (depthPolicy?.toMap() ?: emptyMap())
                 HeavyOps.withPermit {
                     val nv21 = ImageUtils.yuvCopyToNv21(packet.yuv, swapUv = packet.swapUv)
                     this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, jpegQuality)
@@ -2945,9 +2868,23 @@ class MainActivity : AppCompatActivity() {
                     if (acquired != null) {
                         try {
                             val depthFrame = DepthUtils.copyDepth16(acquired.image, acquired.isRaw)
-                            this["depth_base64"] = DepthUtils.depthBytesToBase64(depthFrame.bytes)
-                            this["depth_width"] = depthFrame.width
-                            this["depth_height"] = depthFrame.height
+                            val rawBytes = depthFrame.bytes
+                            val safeBytes = if (rawBytes.size > DepthPolicy.MAX_DEPTH_PAYLOAD_BYTES) {
+                                Log.w("Depth", "Depth payload too large: ${rawBytes.size} bytes, truncating to ${DepthPolicy.MAX_DEPTH_PAYLOAD_BYTES}")
+                                val w = depthFrame.width
+                                val h = depthFrame.height / 2
+                                val ds = ByteArray(w * h * 2)
+                                for (row in 0 until h) {
+                                    System.arraycopy(rawBytes, row * 2 * w * 2, ds, row * w * 2, w * 2)
+                                }
+                                this["depth_width"] = w
+                                this["depth_height"] = h
+                                this["depth_downsampled"] = true
+                                ds
+                            } else rawBytes
+                            this["depth_base64"] = DepthUtils.depthBytesToBase64(safeBytes)
+                            if (!this.containsKey("depth_width")) this["depth_width"] = depthFrame.width
+                            if (!this.containsKey("depth_height")) this["depth_height"] = depthFrame.height
                             this["depth_scale_m_per_unit"] = depthFrame.scaleMPerUnit
                             this["depth_scale"] = depthFrame.scaleMPerUnit
                             this["depth_is_raw"] = depthFrame.isRaw
