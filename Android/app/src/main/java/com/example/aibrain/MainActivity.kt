@@ -3347,7 +3347,11 @@ class MainActivity : AppCompatActivity() {
         userMarkers.clear()
         originAnchorNode = null
         layerGlbManager?.setLayersRoot(null)
-        if (::voxelVisualizer.isInitialized) voxelVisualizer.setRootParent(null)
+        // Can happen if activity is destroyed before voxelVisualizer init completes
+        // (or if AR crashed during early startup). Never crash in onDestroy().
+        if (::voxelVisualizer.isInitialized) {
+            voxelVisualizer.setRootParent(null)
+        }
         updatePointsCount()
         btnAnalyze.isEnabled = false
         sceneBuilder.clearScene()

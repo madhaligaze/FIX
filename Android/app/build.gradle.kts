@@ -3,6 +3,14 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// IMPORTANT:
+// Sceneform (LightEstimationKt) calls LightEstimate.acquireEnvironmentalHdrCubeMap().
+// If an older ARCore client lib ends up in the APK, you get NoSuchMethodError at runtime.
+// Pin ARCore to a version that definitely contains this API and force it across all configs.
+
+val versionCodeValue = 1
+val versionNameValue = "1.0"
+
 android {
     namespace = "com.example.aibrain"
     compileSdk = 34
@@ -11,8 +19,8 @@ android {
         applicationId = "com.example.aibrain"
         minSdk = 27
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = versionCodeValue
+        versionName = versionNameValue
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         val backendBaseUrl = (project.findProperty("backendBaseUrl") as String?) ?: "http://10.0.2.2:8000/"
@@ -45,14 +53,15 @@ android {
     }
 }
 
-// ВАЖНО: Sceneform и ARCore должны быть совместимы.
-// Форсим одну версию, чтобы не получить рантайм-мисматч и NoSuchMethodError в LightEstimate.
-val arCoreVersion = "1.52.0"
-configurations.configureEach {
-    resolutionStrategy.force("com.google.ar:core:$arCoreVersion")
-}
-
 dependencies {
+    val arCoreVersion = "1.52.0"
+
+    configurations.all {
+        resolutionStrategy {
+            force("com.google.ar:core:$arCoreVersion")
+        }
+    }
+
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
@@ -63,7 +72,6 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.7.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
 
-    // ARCore (зафиксировано под совместимость с Sceneform 1.23.0)
     implementation("com.google.ar:core:$arCoreVersion")
 
     // Sceneform (maintained continuation)
