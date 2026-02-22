@@ -169,6 +169,7 @@ def legacy_start_session(request: Request):
     state.get_world(session_id)
     state.anchors[session_id] = []
     state.traces[session_id] = []
+    state.session_stats[session_id] = {"depth_frames_received": 0}
     return {"session_id": session_id, "status": "ok"}
 
 
@@ -202,13 +203,18 @@ def _legacy_stream_ingest(request: Request, session_id: str, payload: LegacyStre
     extra = getattr(payload, "__pydantic_extra__", None) or {}
     depth_supported = extra.get("depth_supported")
     depth_unavailable = bool(extra.get("depth_unavailable")) if "depth_unavailable" in extra else False
-    no_depth_mode = (depth_bytes is None) and (depth_unavailable or (depth_supported is False))
+
+    stats = state.session_stats.setdefault(session_id, {"depth_frames_received": 0})
+    if depth_bytes is not None:
+        stats["depth_frames_received"] = int(stats.get("depth_frames_received", 0) or 0) + 1
+    has_any_depth = int(stats.get("depth_frames_received", 0) or 0) > 0
+    no_depth_mode = (not has_any_depth) and (depth_bytes is None) and (depth_unavailable or (depth_supported is False))
 
     policy_for_readiness = state.policy
-    if no_depth_mode:
+    if not has_any_depth:
         try:
             min_obs = float(getattr(state.policy, "readiness_observed_ratio_min", 0.1))
-            lowered = max(0.05, min_obs * 0.65)
+            lowered = max(0.05, min_obs * 0.67)
             policy_for_readiness = replace(state.policy, readiness_observed_ratio_min=lowered)
         except Exception:
             policy_for_readiness = state.policy
@@ -249,6 +255,7 @@ def _legacy_stream_ingest(request: Request, session_id: str, payload: LegacyStre
                 "no_depth_mode": bool(no_depth_mode),
                 "quality_score": quality_score,
                 "is_ready": bool(ready),
+                "depth_frames_received": int(stats.get("depth_frames_received", 0) or 0),
             },
             "legacy_stream": True,
             "legacy_mode": "json_adapter",

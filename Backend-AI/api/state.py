@@ -34,6 +34,9 @@ class RuntimeState:
     # STAGE A: monotonic timestamp tracking per session
     last_timestamp: dict[str, float] = field(default_factory=dict)
 
+    # Session-level counters for adaptive readiness heuristics.
+    session_stats: dict[str, dict] = field(default_factory=dict)
+
     perception_unavailable: bool = False
 
     # Telemetry/report rate limiting (in-memory)
