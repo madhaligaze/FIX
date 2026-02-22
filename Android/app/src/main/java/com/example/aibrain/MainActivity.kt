@@ -189,6 +189,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var voxelLegend: LinearLayout
     private var tvFieldDiag: TextView? = null
 
+    private lateinit var viewGridOverlay: View
+
     // Панели
     private lateinit var controlPanel: LinearLayout
     private lateinit var variantPanel: LinearLayout
@@ -205,6 +207,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var switchGrid: SwitchCompat
     private lateinit var switchSnap: SwitchCompat
     private lateinit var btnUnitsToggle: Button
+    private lateinit var btnRulerExport: Button
     private lateinit var tvRulerInstruction: TextView
     private lateinit var accuracyDot: View
     private lateinit var tvAccuracy: TextView
@@ -416,12 +419,14 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     Log.w("ModelAssets", "⚠️ 3D модели не найдены в assets/. Используется упрощенный режим.")
                     showError("3D модели не найдены. Используется упрощенный режим.")
+                    setHudHint("Локальная библиотека деталей не загружена (это не мешает скану/AI)")
                 }
             }
             result.onFailure { error ->
                 hideLoadingDialog()
                 Log.e("ModelAssets", "❌ Ошибка загрузки моделей: ${error.message}")
                 showError("Не удалось загрузить 3D модели. Используется упрощенный режим.")
+                setHudHint("Локальная библиотека деталей не загружена (это не мешает скану/AI)")
             }
         }
         viewModel = StructureViewModel(api)
@@ -521,6 +526,7 @@ class MainActivity : AppCompatActivity() {
         if (fieldDiagId != 0) tvFieldDiag = findViewById(fieldDiagId)
         fabEyeOfAI = findViewById(R.id.fab_eye_of_ai)
         voxelLegend = findViewById(R.id.voxel_legend)
+        viewGridOverlay = findViewById(R.id.view_grid_overlay)
 
         // Панели
         controlPanel = findViewById(R.id.control_panel)
@@ -541,6 +547,7 @@ class MainActivity : AppCompatActivity() {
         switchGrid = findViewById(R.id.switch_grid)
         switchSnap = findViewById(R.id.switch_snap)
         btnUnitsToggle = findViewById(R.id.btn_units_toggle)
+        btnRulerExport = findViewById(R.id.btn_ruler_export)
         tvRulerInstruction = findViewById(R.id.tv_ruler_instruction)
         accuracyDot = findViewById(R.id.accuracy_dot)
         tvAccuracy = findViewById(R.id.tv_accuracy)
@@ -699,6 +706,14 @@ class MainActivity : AppCompatActivity() {
         btnRulerUndo.setOnClickListener { onRulerUndoClick() }
         btnRulerFinish.setOnClickListener { onRulerFinishClick() }
         btnUnitsToggle.setOnClickListener { toggleUnits() }
+        btnRulerExport.setOnClickListener { onRulerExportClick() }
+        switchGrid.setOnCheckedChangeListener { _, isChecked ->
+            viewGridOverlay.visibility = if (isChecked) View.VISIBLE else View.GONE
+            if (::arRuler.isInitialized) arRuler.setGridEnabled(isChecked)
+        }
+        switchSnap.setOnCheckedChangeListener { _, isChecked ->
+            if (::arRuler.isInitialized) arRuler.setSnapEnabled(isChecked)
+        }
 
         // Ruler mode buttons
         findViewById<Button>(R.id.btn_mode_linear).setOnClickListener {
@@ -1390,6 +1405,8 @@ class MainActivity : AppCompatActivity() {
             rulerOverlay.visibility = View.VISIBLE
             controlPanel.visibility = View.GONE
 
+            viewGridOverlay.visibility = if (switchGrid.isChecked) View.VISIBLE else View.GONE
+
             arRuler.startMeasurement(currentMeasurementType)
 
             showHint("📏 Режим измерения активен")
@@ -1398,6 +1415,7 @@ class MainActivity : AppCompatActivity() {
             // Выключение режима рулетки
             rulerOverlay.visibility = View.GONE
             controlPanel.visibility = View.VISIBLE
+            viewGridOverlay.visibility = View.VISIBLE
 
             showHint("📡 Режим сканирования")
             updateModeStatus("СКАНИРОВАНИЕ")
@@ -1409,23 +1427,35 @@ class MainActivity : AppCompatActivity() {
 
         try {
             val frame = sceneView.arFrame ?: return
+            val camera = frame.camera
+            if (camera.trackingState != TrackingState.TRACKING) {
+                val reason = try { camera.trackingFailureReason } catch (_: Exception) { null }
+                val msg = when (reason) {
+                    com.google.ar.core.TrackingFailureReason.BAD_STATE -> "Трекинг: сбой состояния (перезапустите AR)"
+                    com.google.ar.core.TrackingFailureReason.INSUFFICIENT_LIGHT -> "Трекинг: мало света"
+                    com.google.ar.core.TrackingFailureReason.EXCESSIVE_MOTION -> "Трекинг: слишком быстрое движение"
+                    com.google.ar.core.TrackingFailureReason.INSUFFICIENT_FEATURES -> "Трекинг: мало деталей (наведите на текстуры)"
+                    com.google.ar.core.TrackingFailureReason.CAMERA_UNAVAILABLE -> "Трекинг: камера недоступна"
+                    else -> "Трекинг не готов - подождите"
+                }
+                tvRulerInstruction.text = msg
+                vibrate(60)
+                return
+            }
 
-            val hits = frame.hitTest(
-                sceneView.width / 2f,
-                sceneView.height / 2f
-            )
-
+            val hits = frame.hitTest(sceneView.width / 2f, sceneView.height / 2f)
             val hit = hits.firstOrNull { hr ->
                 val t = hr.trackable
                 when (t) {
-                    is Plane -> t.isPoseInPolygon(hr.hitPose)
-                    is Point -> (t.trackingState == TrackingState.TRACKING)
+                    is Plane -> t.trackingState == TrackingState.TRACKING && t.isPoseInPolygon(hr.hitPose)
+                    is Point -> t.trackingState == TrackingState.TRACKING
                     else -> false
                 }
             }
+
             if (hit == null) {
-                showHint("⚠️ Не найдено место для точки (наведи на поверхность/край)")
-                vibrate(80)
+                tvRulerInstruction.text = "Не найдено место - наведите на поверхность/детали"
+                vibrate(60)
                 return
             }
 
@@ -1437,25 +1467,28 @@ class MainActivity : AppCompatActivity() {
                 val pointCount = arRuler.getPointCount()
                 tvRulerPointCount.text = "$pointCount"
 
-                if (pointCount >= 2) {
+                if (pointCount >= 2 && currentMeasurementType != MeasurementType.AREA) {
+                    btnRulerFinish.visibility = View.VISIBLE
+                    btnRulerMeasure.text = "+ ЕЩЁ"
+                } else if (currentMeasurementType == MeasurementType.AREA && pointCount >= 3) {
                     btnRulerFinish.visibility = View.VISIBLE
                     btnRulerMeasure.text = "+ ЕЩЁ"
                 }
             } else {
-                Toast.makeText(this, "❌ Не удалось установить точку", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Не удалось установить точку", Toast.LENGTH_SHORT).show()
                 vibrate(100)
             }
 
         } catch (e: Exception) {
-            showHint("⚠️ Ошибка: ${e.message}")
+            showHint("Ошибка: ${e.message}")
         }
     }
 
     private fun onRulerUndoClick() {
         arRuler.undoLastPoint()
 
-        val distance = arRuler.getCurrentDistance()
-        updateRulerDisplay(distance, formatDistance(distance))
+        val value = arRuler.getCurrentValue()
+        updateRulerDisplay(value, arRuler.getCurrentLabel())
     }
 
     private fun onRulerFinishClick() {
@@ -1471,6 +1504,32 @@ class MainActivity : AppCompatActivity() {
 
             vibrate(50)
         }
+    }
+
+    private fun onRulerExportClick() {
+        if (!::arRuler.isInitialized) return
+        val json = arRuler.exportMeasurements()
+        if (json.isBlank()) {
+            Toast.makeText(this, "Нет сохраненных измерений", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val outFile = java.io.File(filesDir, "measurements_export_${System.currentTimeMillis()}.json")
+        try {
+            outFile.writeText(json)
+        } catch (_: Exception) {
+            // ignore
+        }
+
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            val clip = android.content.ClipData.newPlainText("measurements.json", json)
+            cm.setPrimaryClip(clip)
+        } catch (_: Exception) {
+            // ignore
+        }
+
+        Toast.makeText(this, "JSON сохранен и скопирован в буфер", Toast.LENGTH_SHORT).show()
     }
 
     private fun setMeasurementMode(type: MeasurementType) {
@@ -1499,7 +1558,7 @@ class MainActivity : AppCompatActivity() {
 
         val instruction = when (type) {
             MeasurementType.LINEAR -> "Нажмите на 2 точки для измерения расстояния"
-            MeasurementType.HEIGHT -> "Нажмите на точку для измерения высоты от пола"
+            MeasurementType.HEIGHT -> "Нажмите 2 точки: основание (пол) и высота"
             MeasurementType.AREA -> "Нажмите точки по периметру для измерения площади"
             else -> "Выберите режим измерения"
         }
@@ -1516,8 +1575,8 @@ class MainActivity : AppCompatActivity() {
 
         btnUnitsToggle.text = if (arRuler.units == ARRuler.Units.METRIC) "м" else "ft"
 
-        val distance = arRuler.getCurrentDistance()
-        updateRulerDisplay(distance, formatDistance(distance))
+        val value = arRuler.getCurrentValue()
+        updateRulerDisplay(value, arRuler.getCurrentLabel())
     }
 
     private fun updateRulerDisplay(distance: Float, label: String) {
@@ -1935,6 +1994,14 @@ class MainActivity : AppCompatActivity() {
         hintQueue.addLast(text)
         hintHistory.addLast(text)
         while (hintHistory.size > 10) hintHistory.removeFirst()
+    }
+
+    private fun setHudHint(text: String) {
+        try {
+            tvAiHint.text = text
+        } catch (_: Exception) {
+            // ignore
+        }
     }
 
     private fun startHintTicker() {
