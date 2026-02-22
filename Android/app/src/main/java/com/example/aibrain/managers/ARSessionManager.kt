@@ -6,6 +6,7 @@ import android.util.Log
 import com.google.ar.core.Anchor
 import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
+import com.google.ar.core.LightEstimate
 import com.google.ar.core.Session
 import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.ArSceneView
@@ -77,16 +78,38 @@ class ARSessionManager(
 
         val config = Config(session).apply {
             focusMode = Config.FocusMode.AUTO
-            lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
+            // Sceneform 1.23.0 ожидает LightEstimate.acquireEnvironmentalHdrCubeMap(): ArImage[].
+            // На некоторых версиях ARCore/Play Services for AR сигнатура другая (Image[]) и будет NoSuchMethodError.
+            // Поэтому включаем ENVIRONMENTAL_HDR только если метод есть и возвращает именно ArImage[].
+            lightEstimationMode = if (supportsSceneformEnvironmentalHdr()) {
+                Config.LightEstimationMode.ENVIRONMENTAL_HDR
+            } else {
+                Config.LightEstimationMode.AMBIENT_INTENSITY
+            }
             planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
             updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
             this.depthMode = this@ARSessionManager.depthMode
         }
 
+        Log.i(TAG, "LightEstimationMode=${config.lightEstimationMode} (depthMode=$depthMode)")
+
         try {
             session.configure(config)
         } catch (t: Throwable) {
             Log.e(TAG, "session.configure() failed: ${t.message}", t)
+        }
+    }
+
+    private fun supportsSceneformEnvironmentalHdr(): Boolean {
+        return try {
+            val m = LightEstimate::class.java.methods.firstOrNull {
+                it.name == "acquireEnvironmentalHdrCubeMap" && it.parameterTypes.isEmpty()
+            } ?: return false
+
+            // Важно: проверяем именно тип возврата ArImage[] (а не Image[]), иначе Sceneform упадёт.
+            m.returnType.isArray && m.returnType.componentType?.name == "com.google.ar.core.ArImage"
+        } catch (_: Throwable) {
+            false
         }
     }
 
