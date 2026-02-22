@@ -113,7 +113,9 @@ data class AiHints(
 
 data class ModelingResponse(
     val status: String,
-    val options: List<ScaffoldOption>?
+    val options: List<ScaffoldOption>?,
+    val reasons: List<String>? = null,
+    val score: Double? = null
 )
 
 data class ScaffoldOption(

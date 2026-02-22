@@ -22,7 +22,7 @@ from scaffold.validators import collision_check
 from scanning.next_best_view import generate_scan_plan
 from scanning.readiness import compute_readiness
 from trace.decision_trace import add_trace_event
-from world.mesh_export import env_mesh_glb_bytes, env_mesh_obj_bytes
+from world.mesh_export import env_mesh_glb_bytes, env_mesh_obj_bytes, scaffold_to_glb_bytes
 from world.occupancy import OCCUPIED
 
 router = APIRouter(tags=["legacy"])
@@ -265,11 +265,23 @@ def _legacy_element_to_android(element: dict[str, Any]) -> dict[str, Any]:
             start = [float(pos[0]), float(pos[1]), float(pos[2])]
             end = [float(pos[0]), float(pos[1]), float(pos[2])]
 
+    load_ratio = float(element.get("load_ratio") or element.get("load") or 0.0)
+    stress_color = element.get("stress_color") or element.get("color")
+    if not stress_color:
+        if load_ratio >= 0.8:
+            stress_color = "red"
+        elif load_ratio >= 0.5:
+            stress_color = "orange"
+        else:
+            stress_color = "green"
+
     return {
         "id": str(element.get("id", "")),
         "type": element_type,
         "start": [float(start[0]), float(start[1]), float(start[2])],
         "end": [float(end[0]), float(end[1]), float(end[2])],
+        "stress_color": stress_color,
+        "load_ratio": load_ratio,
         "meta": element.get("meta") or {},
     }
 
@@ -381,12 +393,25 @@ def legacy_model(request: Request, session_id: str):
         bundle["env_mesh"]["obj"] = {"path": f"sessions/{session_id}/world/{rev_id}/env_mesh.obj"}
         bundle["env_mesh"]["glb"] = {"path": env_glb_rel}
         bundle["bom"] = bom_from_elements(elements)
+        android_elements = [_legacy_element_to_android(el) for el in elements]
         state.store.save_export(session_id, rev_id, bundle)
+
+        try:
+            scaffold_glb = scaffold_to_glb_bytes(android_elements)
+            scaffold_rel = f"sessions/{session_id}/world/{rev_id}/scaffold.glb"
+            (world_dir / "scaffold.glb").write_bytes(scaffold_glb)
+            overlay_files["scaffold"] = {"glb": {"path": scaffold_rel}}
+            for layer in bundle.get("ui", {}).get("layers", []):
+                if layer.get("id") == "scaffold":
+                    layer["file"] = {"glb": {"path": scaffold_rel}}
+                    break
+            state.store.save_export(session_id, rev_id, bundle)
+        except Exception as e:
+            print(f"[warn] scaffold.glb generation failed: {e}")
 
         score_norm = float(score) if isinstance(score, (int, float)) else 0.0
         score_norm = score_norm / 100.0 if score_norm > 1.0 else score_norm
         safety_score = max(0, min(100, int(score_norm * 100) - 10 * len(violations)))
-        android_elements = [_legacy_element_to_android(el) for el in elements]
         unique_nodes = {tuple(e["start"]) for e in android_elements} | {tuple(e["end"]) for e in android_elements}
         return {
             "status": "OK",
@@ -419,7 +444,7 @@ def legacy_model(request: Request, session_id: str):
                     "safety_score": 0,
                     "ai_critique": [f"MODEL_ADAPTER_ERROR: {exc}"],
                     "elements": [],
-                    "full_structure": {"elements": []},
+                    "full_structure": [],
                     "stats": {
                         "total_nodes": 0,
                         "total_beams": 0,
