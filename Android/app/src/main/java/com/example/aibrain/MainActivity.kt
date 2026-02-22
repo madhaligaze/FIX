@@ -73,6 +73,7 @@ import kotlin.math.min
 import com.example.aibrain.measurement.ARRuler
 import com.example.aibrain.offline.OfflineQueue
 import com.example.aibrain.diagnostics.CrashReporter
+import com.example.aibrain.diagnostics.ReportSanitizer
 import com.example.aibrain.util.HeavyOps
 import com.example.aibrain.measurement.MeasurementType
 import com.example.aibrain.measurement.Measurement
@@ -273,6 +274,11 @@ class MainActivity : AppCompatActivity() {
     private var lastReadinessReady: Boolean? = null
     private var lastReadinessScore: Double? = null
     private var lastReadinessMetrics: ReadinessMetrics? = null
+    private var lastReadinessReasons: List<String> = emptyList()
+    private var lastReadinessHintsHash: String? = null
+    private var lastReadinessHintsAtMs: Long = 0L
+    private var lastCompatHintsHash: String? = null
+    private var lastCompatHintsAtMs: Long = 0L
     private var nextStreamAttemptAtMs: Long = 0L
     private var exportPollJob: Job? = null
     private var readinessPollJob: Job? = null
@@ -1716,6 +1722,117 @@ class MainActivity : AppCompatActivity() {
             android.content.res.ColorStateList.valueOf(ContextCompat.getColor(this, colorRes))
     }
 
+    private fun maybeEmitReadinessHints(
+        ready: Boolean?,
+        reasons: List<String>?,
+        metrics: ReadinessMetrics?
+    ) {
+        if (ready == true) return
+        if (metrics == null) return
+        val r = reasons.orEmpty()
+
+        // Cooldown to avoid HUD spam on polling.
+        val now = System.currentTimeMillis()
+        if (now - lastReadinessHintsAtMs < 15000L) return
+
+        val hints = mutableListOf<String>()
+
+        for (rs in r) {
+            when {
+                rs.startsWith("LOW_VIEWPOINTS") -> {
+                    val vp = metrics.viewpoints
+                    val minVp = metrics.min_viewpoints
+                    hints.add("📍 Нужно больше ракурсов: VP ${vp}/${minVp}")
+                }
+                rs.startsWith("LOW_VIEW_DIVERSITY") -> {
+                    val vd = metrics.view_diversity
+                    val minVd = metrics.min_views_per_anchor
+                    hints.add("📍 Обойди опоры по кругу: VDIV ${vd}/${minVd}")
+                }
+                rs.startsWith("LOW_OBSERVED_RATIO") -> {
+                    val obs = ((metrics.observed_ratio) * 100.0).toInt()
+                    val minObs = ((metrics.min_observed_ratio) * 100.0).toInt()
+                    hints.add("📍 Мало покрытия: OBS ${obs}% (min ${minObs}%)")
+                }
+                rs == "EMPTY_WORLD" || rs == "EMPTY_AABB" -> {
+                    hints.add("📍 Нет данных скана: подвигайся и досканируй область")
+                }
+                rs == "NO_FRAMES" -> {
+                    hints.add("📍 Нет кадров: включи стрим и подержи камеру на сцене")
+                }
+            }
+        }
+
+        if (hints.isEmpty()) return
+        val hash = hints.joinToString("|")
+        if (hash == lastReadinessHintsHash && now - lastReadinessHintsAtMs < 45000L) return
+        lastReadinessHintsHash = hash
+        lastReadinessHintsAtMs = now
+
+        // Only show up to 2 hints at once.
+        hints.take(2).forEach { showHint(it) }
+    }
+
+    private suspend fun maybeFetchCompatWarnings(sessionId: String) {
+        if (lastReadinessReady != false) return
+        val now = System.currentTimeMillis()
+        if (now - lastCompatHintsAtMs < 20000L) return
+
+        val resp = withTimeoutOrNull(1500L) {
+            api.requestScaffoldCompat(sessionId)
+        } ?: return
+
+        if (!resp.isSuccessful || resp.body() == null) {
+            crashReporter.recordReproError(
+                endpoint = "/session/" + sessionId + "/request_scaffold",
+                httpCode = resp.code(),
+                errorSnippet = "request_scaffold failed: ${resp.code()}"
+            )
+            return
+        }
+
+        val body = resp.body()!!
+
+        crashReporter.recordReproResponse(
+            endpoint = "/session/" + sessionId + "/request_scaffold",
+            httpCode = resp.code(),
+            bodySnippet = ReportSanitizer.sanitizeReproBody("/session/" + sessionId + "/request_scaffold", body)
+        )
+
+        val warnings = runCatching { body.getAsJsonObject("compat_warnings") }.getOrNull()
+        val scanPlan = runCatching { warnings?.getAsJsonArray("scan_plan") }.getOrNull()
+        val reasons = runCatching { warnings?.getAsJsonArray("reasons") }.getOrNull()
+
+        val plan = mutableListOf<String>()
+        if (scanPlan != null) {
+            for (i in 0 until minOf(3, scanPlan.size())) {
+                val s = runCatching { scanPlan[i].asString }.getOrNull().orEmpty()
+                if (s.isNotBlank()) plan.add(ReportSanitizer.sanitizeText(s, maxLen = 160))
+            }
+        }
+        val rs = mutableListOf<String>()
+        if (reasons != null) {
+            for (i in 0 until minOf(3, reasons.size())) {
+                val s = runCatching { reasons[i].asString }.getOrNull().orEmpty()
+                if (s.isNotBlank()) rs.add(ReportSanitizer.sanitizeText(s, maxLen = 64))
+            }
+        }
+
+        val hints = mutableListOf<String>()
+        if (plan.isNotEmpty()) hints.add("📍 Досканируй: " + plan.joinToString(" | "))
+        if (rs.isNotEmpty()) hints.add("⚠️ Readiness: " + rs.joinToString(", "))
+        if (hints.isEmpty()) return
+
+        val hash = hints.joinToString("|")
+        if (hash == lastCompatHintsHash && now - lastCompatHintsAtMs < 60000L) return
+        lastCompatHintsHash = hash
+        lastCompatHintsAtMs = now
+
+        withContext(Dispatchers.Main) {
+            hints.take(2).forEach { showHint(it) }
+        }
+    }
+
     private fun maybeShowTutorial() {
         val done = tutorialPrefs.getBoolean(tutorialDoneKey, false)
         if (done) return
@@ -2149,7 +2266,7 @@ class MainActivity : AppCompatActivity() {
                     crashReporter.recordReproResponse(
                         endpoint = "/session/" + sessionId + "/export/latest",
                         httpCode = resp.code(),
-                        bodySnippet = safeJsonSnippet(bundle)
+                        bodySnippet = ReportSanitizer.sanitizeReproBody("/session/" + sessionId + "/export/latest", bundle)
                     )
 
                     val nextAt = netState.reportResult(tag = "export_latest", success = true, baseMs = 6500L, maxMs = 30_000L)
@@ -2263,13 +2380,15 @@ class MainActivity : AppCompatActivity() {
                     lastReadinessReady = body.ready
                     lastReadinessScore = body.score
                     lastReadinessMetrics = body.readiness_metrics
+                    lastReadinessReasons = body.reasons
                     updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
+                    maybeEmitReadinessHints(body.ready, body.reasons, body.readiness_metrics)
                 }
 
                 crashReporter.recordReproResponse(
                     endpoint = "/session/" + sessionId + "/readiness",
                     httpCode = resp.code(),
-                    bodySnippet = safeJsonSnippet(body)
+                    bodySnippet = ReportSanitizer.sanitizeReproBody("/session/" + sessionId + "/readiness", body)
                 )
 
                 val nextAt = netState.reportResult(tag = "readiness", success = true, baseMs = 1500L, maxMs = 12_000L)
@@ -2279,9 +2398,6 @@ class MainActivity : AppCompatActivity() {
                     val st = netState.getStatus()
                     currentConnStatus = st
                     viewModel.setConnectionState(st, getCurrentServerUrl().trimEnd('/'))
-                    lastReadinessReady = body.ready
-                    lastReadinessScore = body.score
-                    lastReadinessMetrics = body.readiness_metrics
                     updateReadinessUI(lastReadinessReady, lastReadinessScore, lastReadinessMetrics)
                 }
             }
@@ -2519,14 +2635,21 @@ class MainActivity : AppCompatActivity() {
             api.streamData(sid, payload)
         } catch (e: Exception) {
             crashReporter.recordException("streamData", e)
-            crashReporter.recordReproError(endpoint = "/session/" + sid + "/stream", errorSnippet = (e.message ?: "exception").take(2048))
+            crashReporter.recordReproError(
+                endpoint = "/session/" + sid + "/stream",
+                errorSnippet = ReportSanitizer.sanitizeText(e.message ?: "exception", maxLen = 2048)
+            )
             return false
         }
 
         if (!resp.isSuccessful) {
             val errSnippet = runCatching { resp.errorBody()?.string() }.getOrNull()?.take(2048)
             crashReporter.recordError("streamData", "HTTP ${resp.code()}")
-            crashReporter.recordReproError(endpoint = "/session/" + sid + "/stream", httpCode = resp.code(), errorSnippet = (errSnippet ?: ("HTTP " + resp.code())).take(2048))
+            crashReporter.recordReproError(
+                endpoint = "/session/" + sid + "/stream",
+                httpCode = resp.code(),
+                errorSnippet = ReportSanitizer.sanitizeText(errSnippet ?: ("HTTP " + resp.code()), maxLen = 2048)
+            )
             return false
         }
 
@@ -2636,6 +2759,9 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {
             // Ignore
         }
+
+        // Optional: ask compat endpoint for scan_plan hints when readiness isn't met.
+        runCatching { maybeFetchCompatWarnings(sid) }
 
         val response = try {
             if (measurementsJson.isNotBlank() || measurementConstraints.isNotEmpty()) api.startModelingWithMeasurements(sid, ModelingWithMeasurementsPayload(measurementsJson, measurementConstraints)) else api.startModeling(sid)
@@ -3316,12 +3442,6 @@ class MainActivity : AppCompatActivity() {
         runCatching { sceneView.pause() }
     }
 
-    private fun safeJsonSnippet(obj: Any): String {
-        return try {
-            gson.toJson(obj).take(2048)
-        } catch (e: Exception) {
-            ("<json_error:" + (e.message ?: "unknown") + ">").take(256)
-        }
-    }
+
 
 }
