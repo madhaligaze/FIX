@@ -42,6 +42,7 @@ import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
 import com.google.ar.core.Plane
 import com.google.ar.core.Point
+import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
 import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.Node
@@ -1471,11 +1472,11 @@ class MainActivity : AppCompatActivity() {
             if (camera.trackingState != TrackingState.TRACKING) {
                 val reason = try { camera.trackingFailureReason } catch (_: Exception) { null }
                 val msg = when (reason) {
-                    com.google.ar.core.TrackingFailureReason.BAD_STATE -> "Трекинг: сбой состояния (перезапустите AR)"
-                    com.google.ar.core.TrackingFailureReason.INSUFFICIENT_LIGHT -> "Трекинг: мало света"
-                    com.google.ar.core.TrackingFailureReason.EXCESSIVE_MOTION -> "Трекинг: слишком быстрое движение"
-                    com.google.ar.core.TrackingFailureReason.INSUFFICIENT_FEATURES -> "Трекинг: мало деталей (наведите на текстуры)"
-                    com.google.ar.core.TrackingFailureReason.CAMERA_UNAVAILABLE -> "Трекинг: камера недоступна"
+                    TrackingFailureReason.BAD_STATE -> "Трекинг: сбой состояния (перезапустите AR)"
+                    TrackingFailureReason.INSUFFICIENT_LIGHT -> "Трекинг: мало света"
+                    TrackingFailureReason.EXCESSIVE_MOTION -> "Трекинг: слишком быстрое движение"
+                    TrackingFailureReason.INSUFFICIENT_FEATURES -> "Трекинг: мало деталей (наведите на текстуры)"
+                    TrackingFailureReason.CAMERA_UNAVAILABLE -> "Трекинг: камера недоступна"
                     else -> "Трекинг не готов - подождите"
                 }
                 tvRulerInstruction.text = msg
@@ -1507,10 +1508,11 @@ class MainActivity : AppCompatActivity() {
                 val pointCount = arRuler.getPointCount()
                 tvRulerPointCount.text = "$pointCount"
 
-                if (pointCount >= 2 && currentMeasurementType != MeasurementType.AREA) {
-                    btnRulerFinish.visibility = View.VISIBLE
-                    btnRulerMeasure.text = "+ ЕЩЁ"
-                } else if (currentMeasurementType == MeasurementType.AREA && pointCount >= 3) {
+                val needFinish = when (currentMeasurementType) {
+                    MeasurementType.AREA -> pointCount >= 3
+                    else -> pointCount >= 2
+                }
+                if (needFinish) {
                     btnRulerFinish.visibility = View.VISIBLE
                     btnRulerMeasure.text = "+ ЕЩЁ"
                 }
@@ -1598,7 +1600,6 @@ class MainActivity : AppCompatActivity() {
             MeasurementType.LINEAR -> btnLinear
             MeasurementType.HEIGHT -> btnHeight
             MeasurementType.AREA -> btnArea
-            else -> btnLinear
         }
 
         activeBtn.setBackgroundResource(R.drawable.btn_mode_active)
@@ -1610,7 +1611,6 @@ class MainActivity : AppCompatActivity() {
             MeasurementType.LINEAR -> "Нажмите на 2 точки для измерения расстояния"
             MeasurementType.HEIGHT -> "Нажмите 2 точки: основание (пол) и высота"
             MeasurementType.AREA -> "Нажмите точки по периметру для измерения площади"
-            else -> "Выберите режим измерения"
         }
 
         tvRulerInstruction.text = instruction
