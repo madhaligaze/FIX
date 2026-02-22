@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from api.rate_limit import RateLimiter
 from config.load_config import AppConfig, find_default_config, load_app_config
 from perception.scene_graph import SceneGraph
 from policy.load_policy import find_policy_file, load_policy_from_yaml
@@ -33,6 +34,9 @@ class RuntimeState:
     last_timestamp: dict[str, float] = field(default_factory=dict)
 
     perception_unavailable: bool = False
+
+    # Telemetry/report rate limiting (in-memory)
+    rate_limiter: RateLimiter = field(default_factory=RateLimiter)
 
     @classmethod
     def build(cls) -> "RuntimeState":
