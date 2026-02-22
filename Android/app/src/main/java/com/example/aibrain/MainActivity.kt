@@ -1886,7 +1886,7 @@ class MainActivity : AppCompatActivity() {
             originAnchorNode = null
             layerGlbManager?.setLayersRoot(null)
             layerGlbManager?.clearAll()
-            voxelVisualizer.setRootParent(null)
+            if (::voxelVisualizer.isInitialized) voxelVisualizer.setRootParent(null)
             currentVoxelData = null
             showHint("⚠️ Origin anchor удалён. Поставь новую опору, чтобы закрепить слои")
         }
@@ -2719,8 +2719,8 @@ class MainActivity : AppCompatActivity() {
                             currentVoxelData = voxelResponse.voxels.map { v ->
                                 VoxelData(v.position, v.type, v.color, v.alpha.toFloat(), voxelResponse.resolution.toFloat(), v.radius)
                             }
-                            voxelVisualizer.setRootParent(originAnchorNode)
-                            voxelVisualizer.showVoxels(currentVoxelData!!)
+                            if (::voxelVisualizer.isInitialized) voxelVisualizer.setRootParent(originAnchorNode)
+                            if (::voxelVisualizer.isInitialized) voxelVisualizer.showVoxels(currentVoxelData!!)
                         }
                     }
                 }
@@ -3347,7 +3347,7 @@ class MainActivity : AppCompatActivity() {
         userMarkers.clear()
         originAnchorNode = null
         layerGlbManager?.setLayersRoot(null)
-        voxelVisualizer.setRootParent(null)
+        if (::voxelVisualizer.isInitialized) voxelVisualizer.setRootParent(null)
         updatePointsCount()
         btnAnalyze.isEnabled = false
         sceneBuilder.clearScene()
