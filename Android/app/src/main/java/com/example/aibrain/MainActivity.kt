@@ -391,9 +391,10 @@ class MainActivity : AppCompatActivity() {
         initViews()
         setupClickListeners()
 
-        if (!passesReleaseDeviceGate()) {
+        // Release-device gate should never hard-block dev/testing.
+        // In release builds we show a warning, but keep the app alive.
+        if (!BuildConfig.DEBUG && !passesReleaseDeviceGate()) {
             showReleaseDeviceUnsupportedDialog()
-            return
         }
 
         // Камера нужна для ARCore / рулетки.
@@ -1886,7 +1887,10 @@ class MainActivity : AppCompatActivity() {
             originAnchorNode = null
             layerGlbManager?.setLayersRoot(null)
             layerGlbManager?.clearAll()
-            if (::voxelVisualizer.isInitialized) voxelVisualizer.setRootParent(null)
+            if (::voxelVisualizer.isInitialized) {
+                voxelVisualizer.setRootParent(null)
+                voxelVisualizer.clear()
+            }
             currentVoxelData = null
             showHint("⚠️ Origin anchor удалён. Поставь новую опору, чтобы закрепить слои")
         }
@@ -3351,6 +3355,7 @@ class MainActivity : AppCompatActivity() {
         // (or if AR crashed during early startup). Never crash in onDestroy().
         if (::voxelVisualizer.isInitialized) {
             voxelVisualizer.setRootParent(null)
+            voxelVisualizer.clear()
         }
         updatePointsCount()
         btnAnalyze.isEnabled = false
@@ -3390,13 +3395,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun showReleaseDeviceUnsupportedDialog() {
         AlertDialog.Builder(this)
-            .setTitle("Устройство не подходит для AR релиза")
+            .setTitle("Предупреждение")
             .setMessage(
-                "Для стабильной AR-работы нужен совместимый ARCore смартфон уровня флагмана: " +
-                    "Android 10+, минимум 6 ГБ RAM и современный GPU/камера."
+                "Этот билд рассчитан на ARCore-совместимые устройства (обычно Android 10+ и >=6ГБ RAM). " +
+                    "Если ARCore на устройстве работает (другие AR-приложения запускаются) - можно продолжать; " +
+                    "это предупреждение не должно блокировать тестирование."
             )
             .setCancelable(false)
-            .setPositiveButton("Закрыть") { _, _ -> finish() }
+            .setPositiveButton("Продолжить") { _, _ -> /* no-op */ }
+            .setNegativeButton("Закрыть") { _, _ -> finish() }
             .show()
     }
 
