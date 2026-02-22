@@ -41,6 +41,7 @@ import androidx.lifecycle.lifecycleScope
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
 import com.google.ar.core.Plane
+import com.google.ar.core.Point
 import com.google.ar.core.TrackingState
 import com.google.ar.sceneform.AnchorNode
 import com.google.ar.sceneform.Node
@@ -1352,7 +1353,7 @@ class MainActivity : AppCompatActivity() {
         val anchors = userMarkers.map { marker ->
             AnchorPointRequest(
                 id = marker.id,
-                kind = "support",
+                kind = if (marker == userMarkers.firstOrNull()) "support" else "waypoint",
                 position = listOf(marker.x, marker.y, marker.z),
                 confidence = 1.0f
             )
@@ -1414,7 +1415,19 @@ class MainActivity : AppCompatActivity() {
                 sceneView.height / 2f
             )
 
-            val hit = hits.firstOrNull { it.trackable is Plane } ?: return
+            val hit = hits.firstOrNull { hr ->
+                val t = hr.trackable
+                when (t) {
+                    is Plane -> t.isPoseInPolygon(hr.hitPose)
+                    is Point -> (t.trackingState == TrackingState.TRACKING)
+                    else -> false
+                }
+            }
+            if (hit == null) {
+                showHint("⚠️ Не найдено место для точки (наведи на поверхность/край)")
+                vibrate(80)
+                return
+            }
 
             val success = arRuler.addMeasurementPoint(hit)
 
@@ -2852,9 +2865,13 @@ class MainActivity : AppCompatActivity() {
         val x = sceneView.width / 2f
         val y = sceneView.height / 2f
 
-        val hit = frame.hitTest(x, y).firstOrNull { hitResult ->
-            val trackable = hitResult.trackable
-            (trackable is Plane) && trackable.isPoseInPolygon(hitResult.hitPose)
+        val hit = frame.hitTest(x, y).firstOrNull { hr ->
+            val t = hr.trackable
+            when (t) {
+                is Plane -> t.isPoseInPolygon(hr.hitPose)
+                is Point -> (t.trackingState == TrackingState.TRACKING)
+                else -> false
+            }
         }
 
         if (hit == null) {
@@ -3492,7 +3509,9 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         stopStreaming()
         stopAutoVoxelRefresh()
-        runCatching { sceneView.pause() }
+        if (isArSceneReady) {
+            runCatching { sceneView.pause() }
+        }
     }
 
 
