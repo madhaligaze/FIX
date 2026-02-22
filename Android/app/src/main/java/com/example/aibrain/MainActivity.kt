@@ -139,6 +139,12 @@ class MainActivity : AppCompatActivity() {
         private const val KEY_SESSION_HISTORY = "session_history_json"
         private const val PREF_CAMERA_SWAP_UV = "camera_swap_uv"
         private const val DEPTH_SEND_EVERY = 5
+        // Depth warmup: ARCore обычно не даёт depth первые ~3 сек — не спамим в этот период.
+        private const val DEPTH_WARMUP_MS = 3_500L
+        // После N последовательных неудач (вне warmup) — отключаем depth на сессию.
+        private const val DEPTH_DISABLE_AFTER_STREAK = 20
+        // Минимальный интервал между "мягкими" depth-подсказками (не спамим).
+        private const val DEPTH_SOFT_HINT_COOLDOWN_MS = 30_000L
         private const val VOXEL_AUTO_REFRESH_MS = 30_000L
         private const val MIN_RELEASE_API_LEVEL = Build.VERSION_CODES.Q
         private const val MIN_RELEASE_RAM_GB = 6.0
@@ -664,9 +670,17 @@ class MainActivity : AppCompatActivity() {
         lastDepthSoftHintMs = 0L
         depthSessionStartMs = System.currentTimeMillis()
 
+        Log.i(
+            "Depth", "Session start: depthMode=${arManager.depthMode} " +
+                    "depthSupported=$depthSupported warmupMs=$DEPTH_WARMUP_MS " +
+                    "disableAfter=$DEPTH_DISABLE_AFTER_STREAK streak attempts"
+        )
+
         if (depthSupported == false && !depthHintShown) {
             depthHintShown = true
-            showHint("ℹ️ Depth не поддерживается на этом устройстве. Сканирование возможно, но без depth потребуется дольше.")
+            // Только один раз за всё время жизни Activity — не per-session.
+            showHint("ℹ️ Depth не поддерживается. Скан работает, но потребуется больше ракурсов.")
+            setHudHint("Без depth — нужно больше обходов (нет датчика глубины)")
         }
 
 
@@ -1481,7 +1495,10 @@ class MainActivity : AppCompatActivity() {
         if (!rulerMode) return
 
         try {
-            val frame = sceneView.arFrame ?: return
+            val frame = sceneView.arFrame ?: run {
+            showHint("⚠️ AR кадр недоступен — подождите секунду и попробуйте снова")
+            return
+        }
             val camera = frame.camera
             if (camera.trackingState != TrackingState.TRACKING) {
                 val reason = try { camera.trackingFailureReason } catch (_: Exception) { null }
@@ -2683,6 +2700,7 @@ class MainActivity : AppCompatActivity() {
             val depth: DepthUtils.AcquiredDepthImage?
         )
 
+        // ── ФАЗА 1: capture на Main thread (ARCore требует Main для frame API) ──────────
         val packet = withContext(Dispatchers.Main) {
             val manualMeasurements = runCatching {
                 arRuler.getSavedMeasurements().map { m ->
@@ -2708,6 +2726,8 @@ class MainActivity : AppCompatActivity() {
                     null
                 } ?: return@withContext null
 
+                // YUV copy — единственная тяжёлая операция здесь.
+                // Минимизируем время: копируем planes сразу пока Image жив, затем close().
                 val swapUv = settingsPrefs.getBoolean(PREF_CAMERA_SWAP_UV, false)
                 val yuvCopy = try {
                     // Copy planes quickly on main thread while Image is valid.
@@ -2797,10 +2817,11 @@ class MainActivity : AppCompatActivity() {
                     if (acquiredDepth == null) {
                         basePayload["depth_unavailable"] = true
                         val now = System.currentTimeMillis()
-                        if (!depthSoftHintShown || (now - lastDepthSoftHintMs) > 20_000L) {
+                        val inWarmup = (now - depthSessionStartMs) < DEPTH_WARMUP_MS
+                        if (!inWarmup && (!depthSoftHintShown || (now - lastDepthSoftHintMs) > DEPTH_SOFT_HINT_COOLDOWN_MS)) {
                             depthSoftHintShown = true
                             lastDepthSoftHintMs = now
-                            showHint("ℹ️ Depth пока недоступен (обычно первые секунды/плохой свет). Продолжаем без depth.")
+                            showHint("ℹ️ Depth пока недоступен (плохой свет?). Продолжаем без depth.")
                         }
                     }
                 }
@@ -2820,17 +2841,41 @@ class MainActivity : AppCompatActivity() {
                 if (packet.depth == null) {
                     depthUnavailableStreak += 1
                     val now = System.currentTimeMillis()
-                    if (!noDepthLongerScanHintShown && !depthEverReceived && depthUnavailableStreak >= 5 && (now - depthSessionStartMs) > 5_000L) {
+                    val pastWarmup = (now - depthSessionStartMs) > DEPTH_WARMUP_MS
+
+                    // После DEPTH_DISABLE_AFTER_STREAK неудач вне warmup — отключаем depth
+                    // навсегда на этой сессии, чтобы не тратить CPU на бесполезные попытки.
+                    if (pastWarmup && !depthEverReceived && depthUnavailableStreak >= DEPTH_DISABLE_AFTER_STREAK) {
+                        depthAttemptsDisabled = true
+                        Log.w(
+                            "Depth", "Depth disabled after $DEPTH_DISABLE_AFTER_STREAK consecutive failures. " +
+                                    "depthSupported=$depthSupported — device may not support depth on this camera config."
+                        )
+                        if (!noDepthLongerScanHintShown) {
+                            noDepthLongerScanHintShown = true
+                            showHint(
+                                "ℹ️ Depth недоступен на этой сессии — продолжаем без него. " +
+                                        "Потребуется чуть дольше сканировать."
+                            )
+                            setHudHint("Без depth — сканируй дольше (больше ракурсов)")
+                        }
+                    } else if (
+                        pastWarmup && !noDepthLongerScanHintShown && !depthEverReceived
+                        && depthUnavailableStreak >= 5
+                    ) {
+                        // Мягкая подсказка — depth долго не приходит, но ещё не сдались.
                         noDepthLongerScanHintShown = true
-                        showHint("ℹ️ Без depth потребуется дольше сканировать. Продолжайте вести камеру вокруг опоры.")
+                        showHint("ℹ️ Без depth потребуется дольше сканировать. Ведите камеру вокруг опоры.")
                     }
                 } else {
                     depthUnavailableStreak = 0
                     depthEverReceived = true
+                    depthAttemptsDisabled = false   // depth вернулся — разрешаем снова
                 }
             }
         }
 
+        // ── ФАЗА 2: encode на Default (уже верно через HeavyOps) ─────────────────────
         val payload = withContext(Dispatchers.Default) {
             packet.payload.apply {
                 this["client_stats"] = mapOf(
@@ -3092,7 +3137,10 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val frame = sceneView.arFrame ?: return
+        val frame = sceneView.arFrame ?: run {
+            showHint("⚠️ AR кадр недоступен — подождите секунду и попробуйте снова")
+            return
+        }
         val camera = frame.camera
 
         if (camera.trackingState != TrackingState.TRACKING) {
@@ -3733,6 +3781,13 @@ class MainActivity : AppCompatActivity() {
         }
         super.onResume()
 
+        // Если arResumed уже true — значит AR не был запаузен (например, пришёл повторный onResume
+        // без onPause, что теоретически возможно при configuration change). Не дёргаем resume повторно.
+        if (arResumed) {
+            Log.w("Lifecycle", "onResume called while arResumed=true — skipping AR resume to avoid double-resume crash")
+            return
+        }
+
         if (!hasCameraPermission()) {
             requestCameraPermission()
             return
@@ -3746,8 +3801,6 @@ class MainActivity : AppCompatActivity() {
 
         startArIfReady()
 
-        arResumed = false
-
         // Не дергаем resume(), если AR так и не смог стартовать (например, setupSession() вернул false).
         if (isArSceneReady) {
             try {
@@ -3756,7 +3809,8 @@ class MainActivity : AppCompatActivity() {
             } catch (e: CameraNotAvailableException) {
                 arResumed = false
                 Log.e("MainActivity", "Camera not available on resume", e)
-                showError("Камера недоступна. Закройте другие приложения, использующие камеру.")
+                // Не "ошибка" — пользователь просто переключился из другого приложения с камерой.
+                showWarning("Камера занята. Закройте другое приложение с камерой и вернитесь.")
             }
         }
 
@@ -3769,11 +3823,19 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         isUiActive = false
         stopReleasePolling()
-        super.onPause()
+        stopReadinessPolling()
         stopStreaming()
         stopAutoVoxelRefresh()
+        super.onPause()
         if (arResumed) {
-            runCatching { sceneView.pause() }
+            // sceneView.pause() только если AR реально был в resumed-состоянии.
+            // Двойной pause() → "RET_CHECK failure in scheduler.cc" в ARCore.
+            runCatching {
+                sceneView.pause()
+                Log.d("Lifecycle", "sceneView.pause() OK")
+            }.onFailure { e ->
+                Log.e("Lifecycle", "sceneView.pause() failed: ${e.message}", e)
+            }
             arResumed = false
         }
     }
