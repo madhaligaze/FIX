@@ -196,6 +196,7 @@ class MainActivity : AppCompatActivity() {
     private var tvFieldDiag: TextView? = null
 
     private lateinit var viewGridOverlay: View
+    private lateinit var smartReticle: SmartReticleView
 
     // Scan-mode animation targets
     private lateinit var llHudMetrics: LinearLayout
@@ -544,6 +545,7 @@ class MainActivity : AppCompatActivity() {
         fabEyeOfAI = findViewById(R.id.fab_eye_of_ai)
         voxelLegend = findViewById(R.id.voxel_legend)
         viewGridOverlay = findViewById(R.id.view_grid_overlay)
+        smartReticle = findViewById(R.id.smart_reticle)
         llHudMetrics = findViewById(R.id.ll_hud_metrics)
         llCoordsPanel = findViewById(R.id.ll_coords_panel)
         llStatusPanel = findViewById(R.id.ll_status_panel)
@@ -687,19 +689,60 @@ class MainActivity : AppCompatActivity() {
                 lightingSetup = true
             }
 
-            if (::arRuler.isInitialized) {
-                val frame = sceneView.arFrame ?: return@addOnUpdateListener
-                val camera = frame.camera
-                val hits = frame.hitTest(sceneView.width / 2f, sceneView.height / 2f)
-                val hit = hits.firstOrNull { hr ->
-                    val t = hr.trackable
-                    when (t) {
-                        is Plane -> t.trackingState == TrackingState.TRACKING && t.isPoseInPolygon(hr.hitPose)
-                        is Point -> t.trackingState == TrackingState.TRACKING
-                        else -> false
+            val frame = sceneView.arFrame ?: return@addOnUpdateListener
+            val camera = frame.camera
+
+            val centerHits = frame.hitTest(sceneView.width / 2f, sceneView.height / 2f)
+            val planeHit = centerHits.firstOrNull { hr ->
+                val t = hr.trackable
+                t is Plane && t.trackingState == TrackingState.TRACKING && t.isPoseInPolygon(hr.hitPose)
+            }
+            val pointHit = centerHits.firstOrNull { hr ->
+                val t = hr.trackable
+                t is Point && t.trackingState == TrackingState.TRACKING
+            }
+            val bestHit = planeHit ?: pointHit
+
+            if (::smartReticle.isInitialized) {
+                val reticleState: SmartReticleView.State
+                val label: String
+                val planeType: SmartReticleView.PlaneType
+
+                if (camera.trackingState != TrackingState.TRACKING) {
+                    reticleState = SmartReticleView.State.SEARCHING
+                    label = "ПОИСК..."
+                    planeType = SmartReticleView.PlaneType.UNKNOWN
+                } else if (planeHit != null) {
+                    val plane = planeHit.trackable as Plane
+                    planeType = when (plane.type) {
+                        Plane.Type.HORIZONTAL_UPWARD_FACING,
+                        Plane.Type.HORIZONTAL_DOWNWARD_FACING -> SmartReticleView.PlaneType.FLOOR
+                        Plane.Type.VERTICAL -> SmartReticleView.PlaneType.WALL
+                        else -> SmartReticleView.PlaneType.UNKNOWN
                     }
+                    label = when (planeType) {
+                        SmartReticleView.PlaneType.FLOOR -> "ПОЛ"
+                        SmartReticleView.PlaneType.WALL -> "СТЕНА"
+                        else -> "ПЛОСКОСТЬ"
+                    }
+                    reticleState = SmartReticleView.State.READY_PLANE
+                } else if (pointHit != null) {
+                    reticleState = SmartReticleView.State.READY_POINT
+                    label = "FEATURE"
+                    planeType = SmartReticleView.PlaneType.UNKNOWN
+                } else {
+                    reticleState = SmartReticleView.State.NO_SURFACE
+                    label = "НЕТ ПОВЕРХНОСТИ"
+                    planeType = SmartReticleView.PlaneType.UNKNOWN
                 }
-                arRuler.updateCameraState(camera, hit)
+
+                runOnUiThread {
+                    smartReticle.updateState(reticleState, label, planeType)
+                }
+            }
+
+            if (::arRuler.isInitialized) {
+                arRuler.updateCameraState(camera, bestHit)
             }
         }
 
@@ -724,6 +767,7 @@ class MainActivity : AppCompatActivity() {
 
         // Основные действия
         btnStart.setOnClickListener { onStartClicked() }
+        smartReticle.setOnClickListener { onReticleTapped() }
         btnAddPoint.setOnClickListener { onAddSupportClicked() }
         btnAddWaypoint.setOnClickListener { onAddWaypointClicked() }
         btnAddPoint.setOnLongClickListener {
@@ -846,6 +890,35 @@ class MainActivity : AppCompatActivity() {
         transitionTo(AppState.CONNECTING)
 
         scope.launch { doStartSession() }
+    }
+
+
+    /**
+     * Умное размещение якоря по нажатию на прицел.
+     * Если опор ещё нет — ставит опору (support), иначе — точку (point).
+     * Работает только в состоянии SCANNING.
+     */
+    private fun onReticleTapped() {
+        if (appState != AppState.SCANNING) {
+            if (appState == AppState.IDLE) {
+                showHint("ℹ️ Нажмите СТАРТ чтобы начать сканирование")
+            }
+            return
+        }
+        val currentState = smartReticle.state
+        if (currentState == SmartReticleView.State.SEARCHING) {
+            showHint("⏳ Подождите — AR ищет поверхности")
+            return
+        }
+        if (currentState == SmartReticleView.State.NO_SURFACE) {
+            showHint("⚠️ Наведите прицел на поверхность (пол, стену)")
+            vibrate(80)
+            return
+        }
+
+        val supportCount = userMarkers.count { it.kind == "support" }
+        val kind = if (supportCount < MAX_SUPPORTS) "support" else "point"
+        placeAnchor(kind = kind)
     }
 
     private fun onAddSupportClicked() {
@@ -1824,6 +1897,7 @@ class MainActivity : AppCompatActivity() {
                 showControls(btnAddPoint, btnAddWaypoint, btnAnalyze)
                 hideControls(btnStart, btnScan)
                 variantPanel.visibility = View.GONE
+                if (::smartReticle.isInitialized) smartReticle.visibility = View.VISIBLE
 
                 messageCenter.setHud(getString(R.string.state_preview))
                 updateModeStatus("ПРЕВЬЮ")
@@ -1908,6 +1982,9 @@ class MainActivity : AppCompatActivity() {
                 .alpha(1f)
                 .setDuration(dur / 2)
                 .start()
+        }
+        if (::smartReticle.isInitialized) {
+            smartReticle.visibility = if (scanning) View.VISIBLE else View.INVISIBLE
         }
     }
 
@@ -3295,6 +3372,7 @@ class MainActivity : AppCompatActivity() {
         updatePointsCount()
         btnAnalyze.isEnabled = userMarkers.count { it.kind == "support" } >= 1
         vibrate(35)
+        if (::smartReticle.isInitialized) smartReticle.flashPlacement()
 
         // Синхронизируем anchors фоном
         scope.launch {
