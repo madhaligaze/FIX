@@ -85,6 +85,9 @@ import com.example.aibrain.depth.DepthPolicy
 import com.example.aibrain.depth.ReadinessProfile
 import com.example.aibrain.visualization.VoxelData
 import com.example.aibrain.visualization.VoxelVisualizer
+import com.example.aibrain.scaffold.ScaffoldCylinderRenderer
+import com.example.aibrain.ai.YoloInferenceEngine
+import com.example.aibrain.ai.AIVisionController
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -137,7 +140,6 @@ class MainActivity : AppCompatActivity() {
         private const val STREAM_INTERVAL_MS = 1_000L
         private const val AUTO_RELOAD_COOLDOWN_MS: Long = 12_000L
         private const val MAX_POINTS = 20
-        private const val MAX_SUPPORTS = 3
         private const val PREFS_NAME = "app_settings"
         private const val PREF_SERVER_BASE_URL = "server_base_url"
         private const val KEY_SESSION_HISTORY = "session_history_json"
@@ -194,6 +196,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fabEyeOfAI: FloatingActionButton
     private lateinit var voxelLegend: LinearLayout
     private var tvFieldDiag: TextView? = null
+    private lateinit var aiVision: AIVisionController
+    private lateinit var scaffoldRenderer: ScaffoldCylinderRenderer
+    private var lastYoloDetections: List<YoloInferenceEngine.Detection> = emptyList()
 
     private lateinit var viewGridOverlay: View
     private lateinit var smartReticle: SmartReticleView
@@ -450,6 +455,11 @@ class MainActivity : AppCompatActivity() {
         voxelVisualizer = VoxelVisualizer(sceneView, lifecycleScope)
         // Pass shared soundManager to avoid double SoundPool instance
         physicsAnimator = PhysicsAnimator(sceneView, sceneBuilder, this, soundManager)
+
+        aiVision = AIVisionController(this, scope)
+        aiVision.onYoloResults = { dets -> applyYoloResults(dets) }
+        aiVision.onHazardDetected = { _ -> vibrate(300) }
+        scaffoldRenderer = ScaffoldCylinderRenderer(sceneView, scope)
 
         lifecycleScope.launch {
             viewModel.structureState.collect { state ->
@@ -840,6 +850,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         stopReadinessPolling()
+        if (::aiVision.isInitialized) aiVision.release()
         super.onDestroy()
         stopStreaming()
         stopHealthLoop()
@@ -917,7 +928,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val supportCount = userMarkers.count { it.kind == "support" }
-        val kind = if (supportCount < MAX_SUPPORTS) "support" else "point"
+        val kind = if (supportCount == 0) "support" else "point"
         placeAnchor(kind = kind)
     }
 
@@ -930,19 +941,23 @@ class MainActivity : AppCompatActivity() {
         }
 
         val supportCount = userMarkers.count { it.kind == "support" }
-        if (supportCount >= MAX_SUPPORTS) {
-            showHint("⚠️ Достигнут максимум опор: $MAX_SUPPORTS — используй ТОЧКА для доп. меток")
-            return
-        }
 
         if (supportCount == 0) {
             showHint(
-                "📍 Опора поставлена. Теперь обойди её полукругом (~180°) с камерой, " +
-                        "держа на расстоянии 0.5-2 м. Это даст OBS и VDIV для AI."
+                "📍 Первая опора! Теперь обойди вокруг неё (360° за 20-30 сек), " +
+                    "держа камеру на 0.5–2 м. Потом ставь остальные опоры по периметру лесов."
             )
         }
 
         placeAnchor(kind = "support")
+
+        val supports = userMarkers.filter { it.kind == "support" }
+        if (supports.size >= 2 && ::scaffoldRenderer.isInitialized) {
+            val positions = supports.map { Vector3(it.x, it.y, it.z) }
+            scaffoldRenderer.setRootParent(originAnchorNode)
+            scaffoldRenderer.buildScaffold(supports = positions, height = 3.0f, levels = 3)
+            showHint("🏗️ Превью каркаса обновлено (${supports.size} опоры)")
+        }
     }
 
     private fun onAddWaypointClicked() {
@@ -2057,29 +2072,7 @@ class MainActivity : AppCompatActivity() {
             "OBS ${obsPct}%/${minObsPct}% | VDIV ${vdiv}/${minViews} | VP ${vp}/${minVp}" +
                     (if (ready == true) " ✅ READY" else "")
 
-        val coachLine: String = when {
-            ready == true -> ""
-            obsPct < minObsPct -> buildString {
-                append("👣 Обойди опору полукругом 180° (~20-30 сек)")
-                val gap = minObsPct - obsPct
-                if (gap > 20) append(" — нужно ещё ${gap}% покрытия")
-            }
-
-            vdiv < minViews -> buildString {
-                val missing = minViews - vdiv
-                append("🔄 Обойди с ${missing + 1} стороны (разные углы, шаг 60°)")
-            }
-
-            vp < minVp -> buildString {
-                val missing = minVp - vp
-                append(
-                    "📸 Сделай ещё ${missing} позици${if (missing == 1) "ю" else "и"}" +
-                            " — шагни влево/вправо или наклони камеру"
-                )
-            }
-
-            else -> "✅ Данных достаточно — нажми АНАЛИЗ"
-        }
+        val coachLine: String = if (ready == true) "" else buildReadinessScanHint(metrics)
 
         val netSuffix = when (currentConnStatus) {
             ConnectionStatus.OFFLINE -> " | NET OFFLINE"
@@ -2114,6 +2107,34 @@ class MainActivity : AppCompatActivity() {
 
         if (ready != true && s0 >= 0.5 && s0 < 0.9 && coachLine.isNotEmpty()) {
             showHint(coachLine)
+        }
+    }
+
+    private fun buildReadinessScanHint(metrics: ReadinessMetrics?): String {
+        if (metrics == null) return "📡 Сканируй медленно, держи камеру на уровне пояса"
+        val obs = ((metrics.observed_ratio) * 100.0).toInt()
+        val vdiv = metrics.view_diversity
+        val vp = metrics.viewpoints
+        val minObs = ((metrics.min_observed_ratio) * 100.0).toInt()
+        val minVdiv = metrics.min_views_per_anchor
+        val minVp = metrics.min_viewpoints
+        return buildString {
+            if (obs < minObs) append("👣 Обойди опору полукругом (OBS $obs%→$minObs% нужно)\n")
+            if (vdiv < minVdiv) append("🔄 Нужно ещё ${minVdiv - vdiv} ракурсов (60°+ шаг)\n")
+            if (vp < minVp) append("📸 Ещё ${minVp - vp} позиций — шагни в сторону")
+        }.trim().ifEmpty { "✅ Данных достаточно — нажми АНАЛИЗ" }
+    }
+
+    private fun applyYoloResults(detections: List<YoloInferenceEngine.Detection>) {
+        lastYoloDetections = detections
+        val hazards = detections.filter { it.isHazard }
+        if (hazards.isNotEmpty()) {
+            vibrate(200)
+            showHint("⚠️ ОПАСНОСТЬ: ${hazards.joinToString { it.label.uppercase() }} обнаружен!")
+        }
+        if (detections.isNotEmpty()) {
+            val summary = detections.groupBy { it.label }.entries.joinToString(" | ") { "${it.key}×${it.value.size}" }
+            tvFieldDiag?.text = "YOLO: $summary"
         }
     }
 
@@ -2357,12 +2378,7 @@ class MainActivity : AppCompatActivity() {
     private fun updatePointsCount() {
         val sup = userMarkers.count { it.kind == "support" }
         val pts = userMarkers.size
-        val supLeft = MAX_SUPPORTS - sup
-        tvPointsCount.text = buildString {
-            append("ОПОР:$sup/$MAX_SUPPORTS")
-            if (supLeft > 0) append(" (ещё ${supLeft} можно)")
-            append(" | ТОЧЕК:${pts - sup}")
-        }
+        tvPointsCount.text = "ОПОР:$sup | ТОЧЕК:${pts - sup}"
     }
 
     private fun updateCameraCoordinates() {
@@ -2967,6 +2983,10 @@ class MainActivity : AppCompatActivity() {
                     basePayload["manual_measurements"] = manualMeasurements
                 }
 
+                if (lastYoloDetections.isNotEmpty()) {
+                    basePayload["yolo_detections"] = aiVision.detectionsToServerPayload(lastYoloDetections)
+                }
+
                 val dp = depthPolicy
                 val shouldSendDepth = dp?.shouldAttemptDepth() == true
                 if (shouldSendDepth) {
@@ -3016,6 +3036,7 @@ class MainActivity : AppCompatActivity() {
                 HeavyOps.withPermit {
                     val nv21 = ImageUtils.yuvCopyToNv21(packet.yuv, swapUv = packet.swapUv)
                     this["rgb_base64"] = ImageUtils.nv21ToJpegBase64(nv21.data, nv21.width, nv21.height, jpegQuality)
+                    if (::aiVision.isInitialized) aiVision.processFrame(this["rgb_base64"] as String)
                     val acquired = packet.depth
                     if (acquired != null) {
                         try {
@@ -3240,7 +3261,7 @@ class MainActivity : AppCompatActivity() {
                 reason.startsWith("LOW_OBSERVED_RATIO") -> {
                     val obs = ((metrics?.observed_ratio ?: 0.0) * 100.0).toInt()
                     val minObs = ((metrics?.min_observed_ratio ?: 0.0) * 100.0).toInt()
-                    "👣 Обойди опору полукругом 180° (OBS ${obs}%→${minObs}% нужно)"
+                    "👣 Обойди опору полукругом (OBS ${obs}%→${minObs}% нужно)"
                 }
 
                 reason.startsWith("LOW_VIEW_DIVERSITY") -> {
