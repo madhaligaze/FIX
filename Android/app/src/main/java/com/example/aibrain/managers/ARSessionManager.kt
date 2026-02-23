@@ -239,7 +239,7 @@ class ARSessionManager(
             Plane.Type.VERTICAL -> SurfaceType.WALL
             else -> {
                 val pose = planeHit.hitPose
-                val yAxis = FloatArray(3).also { pose.getYAxis(it) }
+                val yAxis = pose.getYAxis()
                 when {
                     abs(yAxis[1]) > 0.7f && yAxis[1] > 0f -> SurfaceType.FLOOR
                     abs(yAxis[1]) > 0.7f && yAxis[1] < 0f -> SurfaceType.CEILING
